@@ -28,6 +28,16 @@ use crate::stats::{CellKindWrapper, ColumnStats, Histogram};
 /// function [`Engine::materialize`] makes this table.
 const MAT_TABLE: &str = "__peruse_indexed";
 
+/// The deepest level that the reader of a JSON file examines.
+///
+/// The reader is a C++ function that calls itself one time for each level. A
+/// file that nests deeper than the stack of the thread allows therefore stops
+/// the program, and Rust cannot catch that fault.
+///
+/// A real file of data nests some levels, and not a thousand. This limit is
+/// far above each such file, and far below the level that fills the stack.
+const MAX_JSON_DEPTH: u32 = 128;
+
 /// The options that control how the engine opens a file.
 #[derive(Clone, Debug, Default)]
 pub struct OpenOptions {
@@ -166,6 +176,21 @@ impl Engine {
                  python -c \"import pyarrow.feather as f, pyarrow.parquet as q; \
                  q.write_table(f.read_table('{}'), 'out.parquet')\"",
                 src.label,
+                src.label
+            );
+        }
+
+        // A JSON file that nests very deep stops the program. The reader of
+        // DuckDB is a C++ function that calls itself one time for each
+        // level, and a stack that is full is not a fault that Rust can
+        // catch. Peruse therefore counts the levels with a loop of its own
+        // before it gives the file to that reader.
+        if src.format == Format::Json
+            && source::json_depth_over(&src.files[0], MAX_JSON_DEPTH as usize)
+        {
+            bail!(
+                "{}: this file nests deeper than {MAX_JSON_DEPTH} levels.\n\
+                 A file that deep stops the reader of DuckDB, so Peruse does not open it.",
                 src.label
             );
         }
@@ -1002,7 +1027,17 @@ fn build_read_expr(src: &Source, opts: &OpenOptions) -> String {
         // each row, one list of objects, or one object with a list inside it.
         // A nested value stays nested, and the grid shows it as text.
         Format::Json => {
-            let mut args = vec![list];
+            // The reader of DuckDB walks a value with one call for each
+            // level, in C++. A file that nests a thousand levels deep
+            // therefore fills the stack of the thread and stops the whole
+            // program, and no Rust code can catch that.
+            //
+            // With a limit, the reader stops at that level and gives the
+            // value below it as text. A deep file then opens, and the record
+            // view shows the remainder as one JSON value. That is a poor
+            // view of a strange file, and it is much better than a program
+            // that goes away.
+            let mut args = vec![list, format!("maximum_depth = {MAX_JSON_DEPTH}")];
             if let Some(n) = opts.sample_size {
                 // The reader looks at this number of rows before it decides
                 // the types. The value -1 reads the whole file.

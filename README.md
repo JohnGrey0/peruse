@@ -855,8 +855,8 @@ Peruse gives you one promise: it does not change your data. Two layers keep
 that promise.
 
 **The structure of the connection.** The database is always in memory. Peruse
-reaches your files only through the table functions `read_parquet`, `read_csv`,
-`read_json_auto` and `read_arrow`. These functions read, and they cannot write.
+reaches your files only through the table functions `read_parquet`, `read_csv`
+and `read_json_auto`. These functions read, and they cannot write.
 Peruse never opens your files for write access, and it never installs or loads
 an extension, so it cannot reach the network.
 

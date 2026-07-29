@@ -157,6 +157,72 @@ pub fn detect(path: &Path) -> (Format, Option<char>, bool) {
     }
 }
 
+/// The number of bytes that [`json_depth_over`] examines.
+///
+/// A file that nests too deep does so at its start, because each level is a
+/// character. This limit keeps the test at a few milliseconds for a file of
+/// any size.
+const JSON_SCAN_BYTES: u64 = 8 * 1024 * 1024;
+
+/// Gives `true` when a JSON file nests deeper than `limit`.
+///
+/// The reader of DuckDB is a C++ function that calls itself one time for each
+/// level. A file that nests a thousand levels deep therefore fills the stack
+/// of the thread and stops the whole program. A stack that is full is not a
+/// fault that Rust can catch, so Peruse has to see such a file before it
+/// gives the file to the reader.
+///
+/// This function counts the levels with a loop and a number, so it can never
+/// fill the stack itself. It stops at the first level above the limit, so a
+/// file that is made to be deep costs almost nothing to refuse.
+///
+/// A brace inside a value in quotation marks is a character of that value,
+/// and not a level. The function therefore follows the quotation marks.
+pub fn json_depth_over(path: &Path, limit: usize) -> bool {
+    use std::io::Read;
+    let Ok(file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut reader = std::io::BufReader::new(file.take(JSON_SCAN_BYTES));
+    let mut buf = [0u8; 64 * 1024];
+
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    loop {
+        let n = match reader.read(&mut buf) {
+            Ok(0) => return false,
+            Ok(n) => n,
+            Err(_) => return false,
+        };
+        for &b in &buf[..n] {
+            if in_string {
+                // A backslash takes the meaning from the character after it,
+                // and a quotation mark then ends the value.
+                if escaped {
+                    escaped = false;
+                } else if b == b'\\' {
+                    escaped = true;
+                } else if b == b'"' {
+                    in_string = false;
+                }
+                continue;
+            }
+            match b {
+                b'"' => in_string = true,
+                b'{' | b'[' => {
+                    depth += 1;
+                    if depth > limit {
+                        return true;
+                    }
+                }
+                b'}' | b']' => depth = depth.saturating_sub(1),
+                _ => {}
+            }
+        }
+    }
+}
+
 /// Writes a path in a form that a settings file can hold, and that the system
 /// can open again.
 ///
@@ -291,6 +357,46 @@ mod tests {
     #[test]
     fn unknown_extension_falls_back_to_csv() {
         assert_eq!(detect(Path::new("mystery.dat")).0, Format::Csv);
+    }
+
+    #[test]
+    fn a_file_that_nests_too_deep_is_seen_before_the_reader_gets_it() {
+        let dir = std::env::temp_dir().join("peruse-depth");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // The list around the objects is one level of its own, so a file of
+        // `d` objects nests `d + 1` levels deep.
+        let nested = |d: usize| format!("[{}1{}]", "{\"a\":".repeat(d), "}".repeat(d));
+        for (d, want) in [(5, false), (100, false), (127, false), (128, true), (5000, true)] {
+            let p = dir.join(format!("d{d}.json"));
+            std::fs::write(&p, nested(d)).unwrap();
+            assert_eq!(json_depth_over(&p, 128), want, "depth {d}");
+        }
+    }
+
+    #[test]
+    fn a_brace_inside_a_value_is_not_a_level() {
+        // Without this rule, a file of text that holds braces would look
+        // deep, and Peruse would refuse a file that is correct.
+        let dir = std::env::temp_dir().join("peruse-depth-str");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let p = dir.join("braces.json");
+        let body = format!("[{{\"a\": \"{}\"}}]", "{".repeat(500));
+        std::fs::write(&p, body).unwrap();
+        assert!(!json_depth_over(&p, 128), "a brace in a value counted");
+
+        // A quotation mark that a backslash holds does not end the value.
+        let p = dir.join("escaped.json");
+        std::fs::write(&p, format!("[{{\"a\": \"\\\"{}\"}}]", "[".repeat(500))).unwrap();
+        assert!(!json_depth_over(&p, 128), "an escaped mark ended the value");
+    }
+
+    #[test]
+    fn a_file_that_is_not_there_is_not_too_deep() {
+        assert!(!json_depth_over(Path::new("/no/such/file.json"), 128));
     }
 
     #[test]
