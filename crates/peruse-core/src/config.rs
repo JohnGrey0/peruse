@@ -74,8 +74,7 @@ impl Config {
     /// The file is beside the directory of the themes, so a user finds the two
     /// in one place.
     pub fn path() -> Option<PathBuf> {
-        directories::ProjectDirs::from("", "", "peruse")
-            .map(|d| d.config_dir().join("config.toml"))
+        crate::dirs::config_dir().map(|d| d.join("config.toml"))
     }
 
     /// Reads the settings file.

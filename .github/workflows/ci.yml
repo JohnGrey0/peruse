@@ -70,6 +70,49 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+  # The oldest Rust that Peruse promises to build on. A user at work often
+  # has the Rust that their team installed a year ago, and cannot change it.
+  # A dependency that asks for a newer Rust takes that user away, and it does
+  # so quietly: the build on this machine still passes. This job is the alarm.
+  #
+  # If this job fails, do not raise `rust-version`. Find the dependency that
+  # asks for more and hold it at an older version, as the workspace does for
+  # `sysinfo`. Raise the number only when there is a reason to.
+  msrv:
+    name: build on the oldest Rust
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      # The number comes from the manifest, so it is in one place only.
+      - name: Read the oldest Rust from the manifest
+        id: msrv
+        run: |
+          v=$(grep -m1 '^rust-version' Cargo.toml | cut -d'"' -f2)
+          echo "value=$v" >> "$GITHUB_OUTPUT"
+          echo "The manifest asks for Rust $v."
+
+      - name: Install that Rust
+        run: |
+          rustup toolchain install "${{ steps.msrv.outputs.value }}" --profile minimal
+          rustup default "${{ steps.msrv.outputs.value }}"
+          rustc --version
+
+      - name: Cache the build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: msrv-${{ steps.msrv.outputs.value }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: msrv-${{ steps.msrv.outputs.value }}-
+
+      - name: Build
+        run: cargo build --workspace --all-targets
+
   # A crate that cannot package is a crate that cannot publish. This job
   # finds that out now, and not on the day of a release.
   package:

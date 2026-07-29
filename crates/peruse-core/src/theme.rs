@@ -434,7 +434,7 @@ impl Default for Theme {
 /// Gives the directory `<config>/peruse/themes`. Peruse reads the `.toml`
 /// theme files of the user from this directory.
 pub fn user_theme_dir() -> Option<PathBuf> {
-    directories::ProjectDirs::from("", "", "peruse").map(|d| d.config_dir().join("themes"))
+    crate::dirs::config_dir().map(|d| d.join("themes"))
 }
 
 /// Reads a theme file.

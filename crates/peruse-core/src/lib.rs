@@ -17,6 +17,7 @@
 
 pub mod config;
 pub mod ddl;
+pub mod dirs;
 pub mod engine;
 pub mod filter;
 pub mod meta;

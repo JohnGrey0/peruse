@@ -300,7 +300,7 @@ impl Browser {
             KeyCode::Enter | KeyCode::Char('l') | KeyCode::Right => self.open(),
             KeyCode::Char('h') | KeyCode::Left | KeyCode::Backspace => self.go_up(),
             KeyCode::Char('~') => {
-                if let Some(h) = directories::UserDirs::new().map(|d| d.home_dir().to_path_buf()) {
+                if let Some(h) = peruse_core::dirs::home_dir() {
                     self.go_to(h);
                 }
             }
@@ -339,7 +339,7 @@ fn entry_of(path: &Path, is_recent: bool) -> Entry {
 /// Writes a path in a short form, with the home directory as `~`.
 fn short_path(p: &Path) -> String {
     let full = p.to_string_lossy().replace('\\', "/");
-    if let Some(home) = directories::UserDirs::new().map(|d| d.home_dir().to_path_buf()) {
+    if let Some(home) = peruse_core::dirs::home_dir() {
         let h = home.to_string_lossy().replace('\\', "/");
         if let Some(rest) = full.strip_prefix(&h) {
             return format!("~{rest}");

@@ -11,10 +11,17 @@ categories.workspace = true
 readme = "README.md"
 description = "Engine, query and metadata layer for Peruse. Front-end agnostic."
 
+# docs.rs builds the documentation of a crate for several targets, and each
+# one compiles DuckDB from source again. That is slow enough to reach the
+# limit of the builder, and the documentation then fails for every target.
+# One target is enough: nothing here is written for a particular system.
+[package.metadata.docs.rs]
+targets = ["x86_64-unknown-linux-gnu"]
+all-features = false
+
 [dependencies]
 anyhow.workspace = true
 crossbeam-channel.workspace = true
-directories.workspace = true
 duckdb.workspace = true
 serde.workspace = true
 sysinfo.workspace = true

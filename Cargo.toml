@@ -5,7 +5,7 @@ members = ["crates/peruse-core", "crates/peruse-tui"]
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.95"
+rust-version = "1.88"
 license = "Apache-2.0"
 repository = "https://github.com/JohnGrey0/peruse"
 homepage = "https://github.com/JohnGrey0/peruse"
@@ -18,13 +18,12 @@ categories = ["command-line-utilities", "database", "visualization"]
 anyhow = "1"
 clap = { version = "4.6", features = ["derive"] }
 crossbeam-channel = "0.5"
-directories = "6"
 duckdb = { version = "1.10505", features = ["bundled", "parquet", "json"] }
 ratatui = "0.30"
 serde = { version = "1", features = ["derive"] }
 # Only the memory and the processor list. The default features also collect
 # each process of the system, and Peruse has no use for those.
-sysinfo = { version = "0.39", default-features = false, features = ["system"] }
+sysinfo = { version = "0.38", default-features = false, features = ["system"] }
 # The feature `preserve_order` keeps the fields of an object in the order that
 # the file holds them. Without it, the record view would show the columns in
 # the order of the alphabet, and not in the order of the file.

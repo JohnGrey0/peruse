@@ -29,12 +29,17 @@ pkg-fmt = "tgz"
 pkg-url = "{ repo }/releases/download/v{ version }/peruse-{ version }-{ target }.zip"
 pkg-fmt = "zip"
 
+# See the note in `peruse-core/Cargo.toml`: one target, because each one
+# compiles DuckDB again.
+[package.metadata.docs.rs]
+targets = ["x86_64-unknown-linux-gnu"]
+all-features = false
+
 [dependencies]
 peruse-core = { path = "../peruse-core", version = "0.1.0" }
 anyhow.workspace = true
 clap.workspace = true
 crossbeam-channel.workspace = true
-directories.workspace = true
 ratatui.workspace = true
 serde_json.workspace = true
 unicode-width.workspace = true
