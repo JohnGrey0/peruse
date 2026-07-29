@@ -64,34 +64,56 @@ to the file.
 
 ## Install
 
-You need a Rust toolchain (1.88 or later) and a C++ compiler. The build puts
-DuckDB inside the program file, so the result has no runtime dependency.
+The command is `peruse` however you install it.
+
+**A prebuilt program — nothing to compile.** Take the archive for your machine
+from the [releases](https://github.com/JohnGrey0/peruse/releases), unpack it,
+and put `peruse` somewhere on your `PATH`. Each archive has a `.sha256` file
+beside it.
+
+**With Rust, and no wait:**
+
+```sh
+cargo binstall peruse-tui
+```
+
+This downloads the same prebuilt program instead of building one.
+
+**With Rust, from source:**
+
+```sh
+cargo install peruse-tui
+```
+
+This compiles DuckDB into the program, so the first build takes several
+minutes and needs a C++ compiler. There is no runtime dependency afterwards —
+the result is one file.
+
+- **Windows**: the Visual Studio Build Tools, with the C++ workload.
+- **macOS**: `xcode-select --install`.
+- **Linux**: `build-essential` (Debian, Ubuntu) or `gcc-c++` (Fedora).
+
+**From a clone:**
 
 ```sh
 git clone https://github.com/JohnGrey0/peruse.git
 cd peruse
-cargo install --path crates/peruse-tui
-```
-
-The first build needs some minutes, because it compiles DuckDB. The builds
-after it do not.
-
-To build without installing:
-
-```sh
 cargo build --release
 ./target/release/peruse yourfile.parquet
-```
-
-To check that everything works:
-
-```sh
 cargo test --workspace
 ```
 
-**Windows**: install the Visual Studio Build Tools with the C++ workload.
-**macOS**: `xcode-select --install`.
-**Linux**: install `build-essential` (Debian, Ubuntu) or `gcc-c++` (Fedora).
+Peruse needs Rust 1.95 or later to build.
+
+### The two crates
+
+| Crate | What it is |
+|---|---|
+| [`peruse-tui`](https://crates.io/crates/peruse-tui) | The program. Install this one. |
+| [`peruse-core`](https://crates.io/crates/peruse-core) | The engine, as a library, with no terminal code. |
+
+The crate is `peruse-tui` because the name `peruse` on crates.io belongs to a
+parser library. The command it installs is still `peruse`.
 
 ---
 

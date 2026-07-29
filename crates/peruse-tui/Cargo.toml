@@ -4,14 +4,32 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Terminal front-end for Peruse."
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme = "../../README.md"
+description = "A fast, read-only viewer for Parquet, CSV, TSV and JSON data files."
 
 [[bin]]
 name = "peruse"
 path = "src/main.rs"
 
+# `cargo binstall peruse-tui` takes the program from a release of the project
+# and does not build it. The build compiles DuckDB from source and needs some
+# minutes, so this is the quick way in for a user who has Rust.
+#
+# The names here must agree with `.github/workflows/release.yml`.
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/peruse-{ version }-{ target }.{ archive-format }"
+bin-dir = "peruse-{ version }-{ target }/{ bin }{ binary-ext }"
+pkg-fmt = "tgz"
+
+[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
+pkg-fmt = "zip"
+
 [dependencies]
-peruse-core = { path = "../peruse-core" }
+peruse-core = { path = "../peruse-core", version = "0.1.0" }
 anyhow.workspace = true
 clap.workspace = true
 crossbeam-channel.workspace = true

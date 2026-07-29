@@ -1,0 +1,145 @@
+# Builds the program for each platform and puts it on a release.
+#
+# A user who does not have Rust can then download one file and run it, and a
+# user who does have Rust can use `cargo binstall peruse-tui` and skip the
+# build of DuckDB.
+#
+# The workflow uses actions from `actions/*` only, and the GitHub command line
+# tool that the runner holds already. A security team therefore has one
+# publisher to check.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  # A run by hand, to test the build without a tag.
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    # The build compiles DuckDB from source for each platform.
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            archive: tar.gz
+          - os: macos-13
+            target: x86_64-apple-darwin
+            archive: tar.gz
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            archive: tar.gz
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive: zip
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Add the target
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Cache the build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ matrix.target }}-release-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ matrix.target }}-release-
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }} -p peruse-tui
+
+      # The name of the version comes from the tag, and from the manifest for
+      # a run by hand.
+      - name: Find the version
+        id: version
+        shell: bash
+        run: |
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            echo "value=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Each archive holds one directory, so a user who opens it in a
+      # download folder does not spread three files into it.
+      - name: Make the archive
+        id: archive
+        shell: bash
+        run: |
+          name="peruse-${{ steps.version.outputs.value }}-${{ matrix.target }}"
+          mkdir "$name"
+          if [ "${{ matrix.archive }}" = "zip" ]; then
+            cp "target/${{ matrix.target }}/release/peruse.exe" "$name/"
+          else
+            cp "target/${{ matrix.target }}/release/peruse" "$name/"
+          fi
+          cp README.md LICENSE "$name/"
+          if [ "${{ matrix.archive }}" = "zip" ]; then
+            7z a "$name.zip" "$name" > /dev/null
+            file="$name.zip"
+          else
+            tar czf "$name.tar.gz" "$name"
+            file="$name.tar.gz"
+          fi
+          echo "file=$file" >> "$GITHUB_OUTPUT"
+
+      # A checksum lets a user, or a security team, see that the file did not
+      # change on the way.
+      - name: Write the checksum
+        shell: bash
+        run: |
+          if command -v sha256sum > /dev/null; then
+            sha256sum "${{ steps.archive.outputs.file }}" > "${{ steps.archive.outputs.file }}.sha256"
+          else
+            shasum -a 256 "${{ steps.archive.outputs.file }}" > "${{ steps.archive.outputs.file }}.sha256"
+          fi
+
+      - name: Keep the files for the next job
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: |
+            ${{ steps.archive.outputs.file }}
+            ${{ steps.archive.outputs.file }}.sha256
+          if-no-files-found: error
+
+  publish:
+    name: publish the release
+    needs: build
+    runs-on: ubuntu-latest
+    # A run by hand builds the files and stops. Only a tag makes a release.
+    if: github.ref_type == 'tag'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Take the files of each platform
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Make the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "peruse ${GITHUB_REF_NAME}" \
+            --notes "Built from ${GITHUB_SHA}. Each archive holds the program, the README and the licence. The file \`*.sha256\` beside it holds the checksum." \
+            dist/*

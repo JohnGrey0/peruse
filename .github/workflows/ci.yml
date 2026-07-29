@@ -1,0 +1,97 @@
+# The tests that run for each change.
+#
+# The workflow uses actions from `actions/*` only. Each of those is published
+# by GitHub itself. A security team that reviews this file therefore has one
+# publisher to check, and not four.
+#
+# The toolchain comes from the runner, which holds a current stable Rust
+# already. The build needs no action to install one.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# A new push to the same branch stops the run that is going now. The last
+# commit is the one that matters.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # A build that fails must say why, and not print a page of progress bars.
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  test:
+    name: test on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    # The build compiles DuckDB from source. That takes some minutes on the
+    # first run, and the cache makes the runs after it short.
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show the toolchain
+        run: |
+          rustc --version
+          cargo --version
+
+      # The build of DuckDB is the long part, and it does not change between
+      # runs. The key holds the lock file, so a change to a dependency makes
+      # a new cache and nothing else does.
+      - name: Cache the build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Build
+        run: cargo build --workspace --all-targets
+
+      - name: Test
+        run: cargo test --workspace
+
+      # Clippy is clean today, so a new warning is a change that a reader
+      # must see before it lands.
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  # A crate that cannot package is a crate that cannot publish. This job
+  # finds that out now, and not on the day of a release.
+  package:
+    name: package
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache the build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ubuntu-package-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ubuntu-package-
+
+      # The front end names the engine by its version, and that version is on
+      # crates.io only after the engine is published. The check therefore
+      # runs on the engine alone.
+      - name: Check that the engine packages
+        run: cargo package -p peruse-core --no-verify
