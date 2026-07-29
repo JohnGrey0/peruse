@@ -1,0 +1,36 @@
+[workspace]
+resolver = "3"
+members = ["crates/peruse-core", "crates/peruse-tui"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "Apache-2.0"
+repository = "https://github.com/JohnGrey0/peruse"
+description = "A fast, read-only viewer for Parquet, CSV, TSV and JSON data files."
+
+[workspace.dependencies]
+anyhow = "1"
+clap = { version = "4.6", features = ["derive"] }
+crossbeam-channel = "0.5"
+directories = "6"
+duckdb = { version = "1.10505", features = ["bundled", "parquet", "json"] }
+ratatui = "0.30"
+serde = { version = "1", features = ["derive"] }
+toml = "1"
+unicode-width = "0.2"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
+
+# The bundled DuckDB C++ amalgamation is enormous and never changes between our
+# builds. Always optimise it, even in debug, or dev builds are unusably slow.
+[profile.dev.package.libduckdb-sys]
+opt-level = 3
+
+[profile.dev.package."*"]
+opt-level = 2

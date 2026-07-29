@@ -1,0 +1,19 @@
+[package]
+name = "peruse-tui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Terminal front-end for Peruse."
+
+[[bin]]
+name = "peruse"
+path = "src/main.rs"
+
+[dependencies]
+peruse-core = { path = "../peruse-core" }
+anyhow.workspace = true
+clap.workspace = true
+crossbeam-channel.workspace = true
+ratatui.workspace = true
+unicode-width.workspace = true
