@@ -16,4 +16,5 @@ anyhow.workspace = true
 clap.workspace = true
 crossbeam-channel.workspace = true
 ratatui.workspace = true
+serde_json.workspace = true
 unicode-width.workspace = true

@@ -17,6 +17,7 @@ mod panels;
 mod render_test;
 mod sqlhl;
 mod text;
+mod tree;
 mod ui;
 
 use anyhow::{Context, Result};

@@ -37,6 +37,7 @@ The crate `peruse-tui` holds these modules:
 | `ui.rs` | The layout of the frame, the title bar, the status line and the footer |
 | `commands.rs` | The one table of commands, keys and descriptions |
 | `input.rs` | The editor of one line for the prompt |
+| `tree.rs` | The row as a tree, for a value that holds other values |
 | `text.rs` | The text functions that know the width of a character |
 | `colors.rs`, `paint.rs` | The change from a theme color to a terminal style |
 | `sqlhl.rs` | The colors of the SQL prompt |

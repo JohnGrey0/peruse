@@ -256,6 +256,19 @@ impl Engine {
         }
     }
 
+    /// Reads one complete row as JSON, for the record view.
+    ///
+    /// The function gives `None` when the view holds no row at that offset.
+    pub fn row_json(&self, view: &View, schema: &Schema, row: u64) -> Result<Option<String>> {
+        let sql = view.row_json_sql(schema, row);
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut rows = stmt.query([])?;
+        match rows.next()? {
+            Some(r) => Ok(r.get::<_, Option<String>>(0)?),
+            None => Ok(None),
+        }
+    }
+
     /// Finds the rows that contain `needle` in one column or more.
     ///
     /// The scan starts at the row `from_row` and examines `scan_rows` rows.

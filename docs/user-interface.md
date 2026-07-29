@@ -143,42 +143,82 @@ palette is older than that rule, and `ui.rs` repeats its calculation.
 
 ### The record view
 
-The grid reads a row from the left to the right. A file with 300 columns
-therefore needs 300 presses of a key to read one row. The record view puts the
-columns under each other instead.
+The grid reads a row from the left to the right, and it shows a value that
+holds other values as one long text. A file with 300 columns therefore needs
+300 presses of a key to read one row, and a JSON file gives a wall of text in
+one cell:
 
-The values come from the page that the grid holds already, through
-`App::record_value`. The view therefore costs no query and opens immediately.
+```text
+{'id': 665991, 'login': petroav, 'gravatar_id': '', 'url': 'https://api.git…
+```
+
+The record view puts the fields under each other instead, and a field that
+holds other values opens:
+
+```text
+┌ record 1 of 11,351 ──────────────────────────────────────────┐
+│   id                VARCHAR   2489651045                     │
+│   type              VARCHAR   CreateEvent                    │
+│ ▾ actor             struct    {5 fields}                     │
+│     id              number    665991                         │
+│     login           text      petroav                        │
+│     gravatar_id     text      (empty)                        │
+│ ▸ repo              struct    {3 fields}                     │
+│ ▸ payload           struct    {5 of 20 fields}               │
+│   org               null      NULL                           │
+└ field 3/9 · l open · h close · / find · z shows the empty ───┘
+```
+
+The module `tree.rs` builds the tree, and the document
+[nested-values.md](nested-values.md) describes it.
 
 | Key | Action |
 |---|---|
-| `j` `k`, `↑` `↓` | Move to another field. |
-| `PgUp` `PgDn`, `g` `G` | Move by ten fields, or to the ends. |
-| `n` `p`, `→` `←` | The next row, the previous row. The selected field stays. |
-| `/` | Find a field by name. |
-| `Enter` | Show the complete value in the cell inspector. |
-| `y` `Y` | Copy the value, or the complete record. |
+| `j` `k`, `↑` `↓` | Move to another line. |
+| `PgUp` `PgDn`, `g` `G` | Move by ten lines, or to the ends. |
+| `l` `→`, `h` `←` | Open a line, close a line. |
+| `Space` | Open a line, or close it. |
+| `Enter` | Open a line, or show one value in the cell inspector. |
+| `a` `c` | Open each level, close each level. |
+| `z` | Show the fields that hold no value, or hide them. |
+| `n` `p` | The next row, the previous row. The lines that are open stay open. |
+| `/` | Find a field by name or by value, at any level. |
+| `y` `Y` | Copy the value, or the complete record as JSON. |
+| `P` | Copy the path, such as `"payload"."commits"[1]."sha"`. |
 | `=` `!` | Keep, or remove, the rows with this value. |
 | `Esc` `q` `r` | Close. |
 
-Three rules control what the view shows:
+Five rules control what the view shows:
 
 - A column that the grid hides is still in the view, in a dim color. The user
   opens this view to see the complete row, and a hidden column is exactly the
   column that the user cannot see in the grid.
-- Three cases look the same in a plain grid, and they are not the same. The
+- Four cases look the same in a plain grid, and they are not the same. The
   view writes `NULL` for a missing value, `(empty)` for a text with no
-  character, and `…` for a value that the engine has not read yet.
-- The width of the name column comes from each column of the file, and not
-  from the columns that the find box keeps. The list therefore does not move
-  sideways while the user types.
+  character, `{n fields}` for a structure, and `…` for a row that the engine
+  has not read yet.
+- A column of the row always shows, even when it holds NULL. The schema
+  declares that column, so the NULL is a value that the row does not have. A
+  field inside a structure is a different case: see
+  [nested-values.md](nested-values.md).
+- The type column shows the type of the file for a plain column, and the
+  family of the value for a field inside a structure. The type of a structure
+  can be some thousand characters long, and a cut of it says nothing that the
+  word `struct` does not say.
+- The line that holds the cursor decides the keys along the bottom edge. A
+  line that opens offers `l` and `h`, and a line that holds one value offers
+  `Enter`.
 
-When the view closes, the cursor of the grid moves to the field that the view
-was on. The user does not lose the place. A hidden column is the one exception:
-the cursor must always be on a column that the user can see.
+When the view closes, the cursor of the grid moves to the column that holds
+the selected line. A line three levels down still belongs to one column. The
+user does not lose the place. A hidden column is the one exception: the cursor
+must always be on a column that the user can see.
 
 The cell inspector can come from the record view. The value `cell_from_record`
 holds that fact, so the key `Esc` goes back to the record and not to the grid.
+A value inside a structure has no column of its own, so the engine cannot read
+it again. The tree holds the complete value already, and the inspector takes
+it as it is.
 
 ### The filter builder
 

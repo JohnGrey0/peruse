@@ -11,7 +11,7 @@
 //! back to the caller. The caller therefore needs no second calculation of the
 //! layout.
 
-use peruse_core::model::Align;
+use peruse_core::model::{Align, CellKind};
 use peruse_core::source::human_count;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Position, Rect};
@@ -21,6 +21,7 @@ use crate::app::{App, Build};
 use crate::commands::{self, Cmd, BINDINGS, GROUPS};
 use crate::paint::Paint;
 use crate::text;
+use crate::tree::Family;
 
 /// Gives an area in the middle of the screen, as a percentage of the screen.
 fn centered(area: Rect, w_pct: u16, h_pct: u16, max_w: u16) -> Rect {
@@ -376,13 +377,14 @@ fn hints(buf: &mut Buffer, outer: Rect, app: &App, p: &Paint, text: &str) {
 
 /// Draws the record view: one row of the grid, from the top to the bottom.
 ///
-/// The grid shows a row from the left to the right. A file with 300 columns
-/// therefore needs 300 presses of a key to read one row. This view puts the
-/// columns under each other instead, so the whole row fits on some screens,
-/// and the find box goes to one column by its name.
+/// The grid shows a row from the left to the right, and it shows a value that
+/// holds other values as one long text. A file with 300 columns therefore
+/// needs 300 presses of a key to read one row, and a JSON file gives a wall of
+/// text in one cell.
 ///
-/// The values come from the page that the grid holds already. The view
-/// therefore costs no query, and it opens immediately.
+/// This view puts the fields under each other instead, and a field that holds
+/// other values opens. The tree comes from the row as JSON, so a structure and
+/// a list both open in the same way. See [`crate::tree`].
 pub fn draw_record(buf: &mut Buffer, area: Rect, app: &App, p: &Paint) -> Option<Position> {
     let outer = centered(area, 90, 92, 120);
     let position = match app.total.value() {
@@ -438,12 +440,35 @@ pub fn draw_record(buf: &mut Buffer, area: Rect, app: &App, p: &Paint) -> Option
         return cursor;
     }
 
-    let fields = app.record_fields();
-    if fields.is_empty() {
+    // A row that the engine has not sent yet, and a row that this program
+    // could not read, both need a word instead of an empty box.
+    if app.record_tree.is_empty() {
+        let (msg, style) = match &app.record_tree.error {
+            Some(e) => (format!("cannot read this row: {e}"), p.on(t.error, t.bg_alt)),
+            None => ("reading…".to_string(), p.on(t.dim, t.bg_alt)),
+        };
         buf.set_stringn(
             inner.x,
             top,
-            format!("no column name holds {:?}", app.record_find),
+            text::truncate(&msg, inner.width as usize),
+            inner.width as usize,
+            style,
+        );
+        hints(buf, outer, app, p, " Esc closes ");
+        return cursor;
+    }
+
+    let lines = app.record_lines();
+    if lines.is_empty() {
+        let msg = if app.record_find.trim().is_empty() {
+            "this row holds no field".to_string()
+        } else {
+            format!("no field holds {:?}", app.record_find)
+        };
+        buf.set_stringn(
+            inner.x,
+            top,
+            text::truncate(&msg, inner.width as usize),
             inner.width as usize,
             p.on(t.dim, t.bg_alt),
         );
@@ -451,28 +476,17 @@ pub fn draw_record(buf: &mut Buffer, area: Rect, app: &App, p: &Paint) -> Option
         return cursor;
     }
 
-    // The width of the name column comes from each column of the file, and
-    // not from the columns that the find box keeps. The list therefore does
-    // not move sideways while the user types in the find box.
-    let widest = app
-        .schema
-        .columns
-        .iter()
-        .map(|c| text::width(&c.name))
-        .max()
-        .unwrap_or(8);
-    let name_w = widest.clamp(6, ((inner.width as usize) * 2 / 5).max(6));
-    let type_w = if (inner.width as usize) > name_w + 32 { 12 } else { 0 };
-    let gap = if type_w > 0 { 2 } else { 1 };
-    let value_x = inner.x + (name_w + 1 + type_w) as u16 + (gap - 1) as u16;
-    let value_w = (inner.width as usize).saturating_sub(name_w + 1 + type_w + gap - 1);
+    let name_w = ((inner.width as usize) * 2 / 5).clamp(8, 44);
+    let type_w = if (inner.width as usize) > name_w + 32 { 11 } else { 0 };
+    let value_x = inner.x + (name_w + 1 + type_w) as u16 + if type_w > 0 { 1 } else { 0 };
+    let value_w =
+        (inner.width as usize).saturating_sub(name_w + 1 + type_w + if type_w > 0 { 1 } else { 0 });
 
-    let sel = app.record_sel.min(fields.len() - 1);
+    let sel = app.record_sel.min(lines.len() - 1);
     let start = sel.saturating_sub(list_h.saturating_sub(1));
 
-    for (i, col) in fields.iter().skip(start).take(list_h).enumerate() {
+    for (i, line) in lines.iter().skip(start).take(list_h).enumerate() {
         let y = top + i as u16;
-        let column = &app.schema.columns[*col];
         let selected = start + i == sel;
         let bg = if selected { t.cursor_row } else { t.bg_alt };
         buf.set_stringn(
@@ -483,67 +497,122 @@ pub fn draw_record(buf: &mut Buffer, area: Rect, app: &App, p: &Paint) -> Option
             p.bg(bg),
         );
 
-        // A column that the grid hides is still in the record. The user opens
-        // this view to see the complete row.
-        let name_style = if app.hidden[*col] {
+        // The mark shows the level and says whether the line can open. A
+        // level costs two screen columns, so a deep tree still fits.
+        let mark = if !line.kind.opens() {
+            "  "
+        } else if line.open {
+            "▾ "
+        } else {
+            "▸ "
+        };
+        let name = format!("{}{mark}{}", "  ".repeat(line.depth), line.label);
+
+        // A column of the file that the grid hides is still in the record.
+        let hidden = line.depth == 0
+            && app
+                .schema
+                .index_of(&line.label)
+                .is_some_and(|c| app.hidden[c]);
+        let name_style = if hidden {
             p.on(t.dim, bg)
         } else if selected {
             p.bold(p.on(t.accent, bg))
-        } else {
+        } else if line.depth == 0 {
             p.on(t.fg, bg)
+        } else {
+            p.on(t.ident, bg)
         };
         buf.set_stringn(
             inner.x,
             y,
-            text::fit(&column.name, name_w, Align::Left),
+            text::fit(&name, name_w, Align::Left),
             name_w,
             name_style,
         );
+
         if type_w > 0 {
+            // A column of the file shows the type that the file gives. Two
+            // cases show the family of the value instead:
+            //
+            // * A field inside a structure has no type of its own.
+            // * The type of a structure can be some thousand characters
+            //   long. A cut of it, such as `STRUCT(id …`, says nothing that
+            //   the word `struct` does not say.
+            let type_text = match (line.depth, app.schema.index_of(&line.label)) {
+                (0, Some(c)) if app.schema.columns[c].kind != CellKind::Nested => {
+                    app.schema.columns[c].short_type()
+                }
+                _ => family_word(line).to_string(),
+            };
             buf.set_stringn(
                 inner.x + name_w as u16 + 1,
                 y,
-                text::fit(&column.short_type(), type_w, Align::Left),
+                text::fit(&type_text, type_w, Align::Left),
                 type_w,
                 p.on(t.dim, bg),
             );
         }
 
-        // Three cases look the same in a plain grid, and they are not the
-        // same: a value that is missing, a text with no character, and a
-        // value that the engine has not read yet.
-        let (shown, style) = match app.record_value(*col) {
-            None => ("…".to_string(), p.on(t.dim, bg)),
-            Some(None) => ("NULL".to_string(), p.on(t.null, bg)),
-            Some(Some("")) => ("(empty)".to_string(), p.on(t.dim, bg)),
-            Some(Some(v)) => (
-                text::sanitize(v),
-                p.on(crate::grid::kind_color(t, column.kind), bg),
-            ),
+        let style = match line.family {
+            Family::Null => p.on(t.null, bg),
+            Family::Empty => p.on(t.dim, bg),
+            Family::Number => p.on(t.number, bg),
+            Family::Bool => p.on(t.boolean, bg),
+            Family::Nested => p.on(t.nested, bg),
+            Family::Text => p.on(t.string, bg),
         };
         buf.set_stringn(
             value_x,
             y,
-            text::truncate(&shown, value_w),
+            text::truncate(&text::sanitize(&line.value), value_w),
             value_w,
             style,
         );
     }
 
-    let hidden = if app.hidden[fields[sel]] { " · hidden in the grid" } else { "" };
+    // The keys change with the line. A line that opens needs `l` and `h`, and
+    // a line that holds one value needs `Enter`.
+    let open_hint = if lines[sel].kind.opens() {
+        "l open · h close · "
+    } else {
+        "Enter full value · "
+    };
+    let empty_hint = if app.record_tree.hide_empty {
+        "z shows the empty fields · "
+    } else {
+        "z hides the empty fields · "
+    };
     hints(
         buf,
         outer,
         app,
         p,
         &format!(
-            " field {}/{} · j/k move · n/p record · / find · Enter full value · y copy · = filter · Esc close{hidden} ",
+            " field {}/{} · j/k move · {open_hint}n/p record · / find · {empty_hint}y copy · = filter · Esc close ",
             sel + 1,
-            fields.len()
+            lines.len()
         ),
     );
     cursor
 }
+
+/// Gives the word for the family of a value, for the type column.
+fn family_word(line: &crate::tree::Line) -> &'static str {
+    use crate::tree::NodeKind;
+    match line.kind {
+        NodeKind::Object(_) => "struct",
+        NodeKind::Array(_) => "list",
+        NodeKind::Leaf => match line.family {
+            Family::Null => "null",
+            Family::Empty | Family::Text => "text",
+            Family::Number => "number",
+            Family::Bool => "boolean",
+            Family::Nested => "struct",
+        },
+    }
+}
+
 
 /// Draws the filter builder.
 ///

@@ -671,6 +671,8 @@ fn closing_the_record_view_moves_the_grid_to_the_field_that_was_selected() {
     let (mut app, mut term) = open(&p);
     settle(&mut app, &mut term);
     app.run(Cmd::Record);
+    // The engine sends the row, and the tree needs it before it has lines.
+    settle(&mut app, &mut term);
     press_char(&mut app, 'j');
     press_char(&mut app, 'j'); // the field `amount`
     press(&mut app, ratatui::crossterm::event::KeyCode::Esc);
@@ -848,4 +850,88 @@ fn tiny_terminals_still_draw_without_panicking() {
         app.mode = Mode::Normal;
         app.panel = Panel::None;
     }
+}
+
+#[test]
+fn drilling_into_a_json_file_of_nested_objects() {
+    // A JSON file holds a list of objects, and an object holds other
+    // objects. This is the shape that the grid cannot show.
+    let body = "[{\"id\":\"249\",\"actor\":{\"id\":665991,\"login\":\"petroav\"},\
+                 \"payload\":{\"ref\":\"master\",\"push_id\":null,\
+                 \"commits\":[{\"sha\":\"aa\",\"message\":\"one\"},\
+                 {\"sha\":\"bb\",\"message\":\"two\"}]}},\
+                {\"id\":\"250\",\"actor\":{\"id\":3854017,\"login\":\"rspt\"},\
+                 \"payload\":{\"ref\":null,\"push_id\":536,\"commits\":null}}]";
+    let p = write_sample("json-drill", body, "json");
+    let (mut app, mut term) = open(&p);
+    settle(&mut app, &mut term);
+
+    // The grid shows a nested value as one long text, and that is the
+    // problem this view exists for.
+    assert!(screen(&term).contains("{'id':"), "{}", screen(&term));
+
+    app.run(Cmd::Record);
+    settle(&mut app, &mut term);
+    let s = screen(&term);
+    assert!(s.contains("actor"), "no fields\n{s}");
+    assert!(s.contains("2 fields"), "no short form for a structure\n{s}");
+
+    // Open `payload`, then `commits`, then read one commit.
+    press_char(&mut app, 'j'); // actor
+    press_char(&mut app, 'j'); // payload
+    press_char(&mut app, 'l');
+    settle(&mut app, &mut term);
+    let s = screen(&term);
+    assert!(s.contains("master"), "payload did not open\n{s}");
+    // The field `push_id` holds no value in this row, so it is hidden.
+    assert!(!s.contains("push_id"), "an empty field is shown\n{s}");
+
+    press_char(&mut app, 'j'); // ref
+    press_char(&mut app, 'j'); // commits
+    press_char(&mut app, 'l');
+    press_char(&mut app, 'j'); // [0]
+    press_char(&mut app, 'l');
+    settle(&mut app, &mut term);
+    let s = screen(&term);
+    assert!(s.contains("sha"), "the list did not open\n{s}");
+    assert!(s.contains("aa"), "the value of a commit is missing\n{s}");
+}
+
+#[test]
+fn the_record_view_finds_a_field_that_is_three_levels_down() {
+    let body = "[{\"a\":{\"b\":{\"c\":{\"target\":\"found me\"}}}}]";
+    let p = write_sample("json-find", body, "json");
+    let (mut app, mut term) = open(&p);
+    settle(&mut app, &mut term);
+    app.run(Cmd::Record);
+    settle(&mut app, &mut term);
+
+    press_char(&mut app, '/');
+    type_text(&mut app, "target");
+    settle(&mut app, &mut term);
+    let s = screen(&term);
+    // The find box opens the way to the match, so the user sees it at once.
+    assert!(s.contains("target"), "the match is missing\n{s}");
+    assert!(s.contains("found me"), "the value is missing\n{s}");
+}
+
+#[test]
+fn a_filter_on_a_value_inside_a_structure_uses_its_path() {
+    let body = "[{\"id\":1,\"actor\":{\"login\":\"alice\"}},\
+                {\"id\":2,\"actor\":{\"login\":\"bob\"}},\
+                {\"id\":3,\"actor\":{\"login\":\"alice\"}}]";
+    let p = write_sample("json-filter", body, "json");
+    let (mut app, mut term) = open(&p);
+    settle(&mut app, &mut term);
+    app.run(Cmd::Record);
+    settle(&mut app, &mut term);
+
+    press_char(&mut app, 'j'); // actor
+    press_char(&mut app, 'l'); // open it
+    press_char(&mut app, 'j'); // login
+    press_char(&mut app, '='); // keep the rows with this value
+    settle(&mut app, &mut term);
+
+    assert_eq!(app.view.filter.as_deref(), Some("(\"actor\".\"login\" = 'alice')"));
+    assert!(screen(&term).contains("2 × 2"), "{}", screen(&term));
 }

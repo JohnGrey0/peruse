@@ -19,6 +19,60 @@ pub fn quote_ident(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
 
+/// One step in a path to a value inside a nested column.
+///
+/// The record view drills into a structure and into a list. A path such as
+/// `payload.commits[0].sha` is a list of these steps. Peruse needs the path in
+/// two forms: the text that it shows to the user, and the SQL that reads that
+/// value.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Step {
+    /// A field of a structure, by its name.
+    Field(String),
+    /// An item of a list, by its position from 0.
+    Index(usize),
+}
+
+/// Writes a path in the form that a person reads, such as
+/// `payload.commits[0].sha`.
+pub fn path_text(steps: &[Step]) -> String {
+    let mut out = String::new();
+    for s in steps {
+        match s {
+            Step::Field(n) => {
+                if !out.is_empty() {
+                    out.push('.');
+                }
+                out.push_str(n);
+            }
+            Step::Index(i) => out.push_str(&format!("[{i}]")),
+        }
+    }
+    out
+}
+
+/// Writes a path in the form that a statement needs, such as
+/// `"payload"."commits"[1]."sha"`.
+///
+/// Each name goes in quotation marks, so a field with a full stop in its name
+/// still works. DuckDB counts the items of a list from 1. Peruse counts each
+/// position from 0, as it does everywhere else, so this function adds the one.
+pub fn quote_path(steps: &[Step]) -> String {
+    let mut out = String::new();
+    for s in steps {
+        match s {
+            Step::Field(n) => {
+                if !out.is_empty() {
+                    out.push('.');
+                }
+                out.push_str(&quote_ident(n));
+            }
+            Step::Index(i) => out.push_str(&format!("[{}]", i + 1)),
+        }
+    }
+    out
+}
+
 /// Puts a value in single quotation marks, for a generated statement. A single
 /// quotation mark in the value becomes two single quotation marks.
 pub fn quote_str(s: &str) -> String {
@@ -169,6 +223,46 @@ impl View {
     pub fn page_sql(&self, schema: &Schema, limit: u32, offset: u64) -> String {
         let projection = display_projection(schema);
         format!("{}\nLIMIT {limit} OFFSET {offset}", self.select(&projection))
+    }
+
+    /// Builds the statement that reads one complete row as JSON.
+    ///
+    /// The record view drills into a structure and into a list. The text of a
+    /// structure that DuckDB writes, such as `{'id': 1, 'login': a}`, cannot
+    /// carry that job: it has no reliable rule for a value that holds a
+    /// quotation mark, and Peruse would have to write a parser for it. JSON
+    /// has one rule, and the database writes it.
+    ///
+    /// One row of the usual file is some hundred bytes, so one statement for
+    /// the complete row costs less than one statement for each field.
+    ///
+    /// Two families of values do not go into the JSON as they are:
+    ///
+    /// * A BLOB becomes its size, as it does in the grid. A value of 10 MB
+    ///   must not move to the user interface.
+    /// * A long text stops at [`MAX_CELL_CHARS`], as it does in the grid.
+    pub fn row_json_sql(&self, schema: &Schema, offset: u64) -> String {
+        if schema.is_empty() {
+            return "SELECT NULL WHERE false".to_string();
+        }
+        let fields: Vec<String> = schema
+            .columns
+            .iter()
+            .map(|c| {
+                let id = quote_ident(&c.name);
+                let value = match c.kind {
+                    CellKind::Binary => format!("('blob ' || octet_length({id}) || ' B')"),
+                    CellKind::Text => format!("substr({id}, 1, {MAX_CELL_CHARS})"),
+                    _ => id,
+                };
+                format!("{}: {value}", quote_str(&c.name))
+            })
+            .collect();
+        format!(
+            "SELECT CAST(to_json({{{}}}) AS VARCHAR) FROM ({}) AS t\nLIMIT 1 OFFSET {offset}",
+            fields.join(", "),
+            self.select("*")
+        )
     }
 
     /// Builds the statement that counts the rows in the view.

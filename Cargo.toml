@@ -18,6 +18,10 @@ directories = "6"
 duckdb = { version = "1.10505", features = ["bundled", "parquet", "json"] }
 ratatui = "0.30"
 serde = { version = "1", features = ["derive"] }
+# The feature `preserve_order` keeps the fields of an object in the order that
+# the file holds them. Without it, the record view would show the columns in
+# the order of the alphabet, and not in the order of the file.
+serde_json = { version = "1", features = ["preserve_order"] }
 toml = "1"
 unicode-width = "0.2"
 

@@ -57,6 +57,13 @@ pub enum Request {
         column: String,
         row: u64,
     },
+    /// Read one complete row as JSON, for the record view.
+    RowJson {
+        epoch: u64,
+        view: View,
+        schema: Schema,
+        row: u64,
+    },
     /// Find the rows that hold a value.
     Search {
         epoch: u64,
@@ -92,6 +99,7 @@ impl Request {
             | Request::Page { epoch, .. }
             | Request::Stats { epoch, .. }
             | Request::Cell { epoch, .. }
+            | Request::RowJson { epoch, .. }
             | Request::Search { epoch, .. }
             | Request::Meta { epoch }
             | Request::Index { epoch } => *epoch,
@@ -110,7 +118,8 @@ impl Request {
             Request::Search { .. } => 4,
             Request::Meta { .. } => 5,
             Request::Index { .. } => 6,
-            Request::Shutdown => 7,
+            Request::RowJson { .. } => 7,
+            Request::Shutdown => 8,
         }
     }
 }
@@ -129,6 +138,8 @@ pub enum Response {
     Stats { epoch: u64, stats: Box<ColumnStats> },
     /// The complete value of one cell.
     Cell { epoch: u64, row: u64, column: String, value: Option<String> },
+    /// One complete row as JSON.
+    RowJson { epoch: u64, row: u64, json: Option<String> },
     /// The offsets of the rows that match, and the part of the view that the
     /// worker examined.
     Search { epoch: u64, hits: Vec<u64>, from: u64, scan: u64 },
@@ -369,6 +380,14 @@ fn handle(engine: &mut Engine, req: Request, tx: &Sender<Response>) -> Result<()
             }
         }
 
+        Request::RowJson { epoch, view, schema, row } => {
+            match engine.row_json(&view, &schema, row) {
+                Ok(json) => tx
+                    .send(Response::RowJson { epoch, row, json })
+                    .map_err(|_| ()),
+                Err(e) => fail(tx, epoch, "record", e),
+            }
+        }
         Request::Cell { epoch, view, column, row } => match engine.cell(&view, &column, row) {
             Ok(value) => tx
                 .send(Response::Cell { epoch, row, column, value })

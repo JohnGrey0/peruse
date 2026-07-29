@@ -155,24 +155,79 @@ under each other instead:
 └ field 6/62 · j/k move · n/p record · / find ──────┘
 ```
 
+A field that holds other values opens, so you can drill into a JSON object or
+a Parquet structure:
+
+```
+┌ record 1 of 11,351 ──────────────────────────────────────────┐
+│   id                VARCHAR   2489651045                     │
+│   type              VARCHAR   CreateEvent                    │
+│ ▾ actor             struct    {5 fields}                     │
+│     id              number    665991                         │
+│     login           text      petroav                        │
+│     gravatar_id     text      (empty)                        │
+│ ▸ repo              struct    {3 fields}                     │
+│ ▸ payload           struct    {5 of 20 fields}               │
+│   org               null      NULL                           │
+└ field 3/9 · l open · h close · / find · z shows the empty ───┘
+```
+
 Inside the record view:
 
 | Key | Action |
 |---|---|
-| `j` `k`, `↑` `↓` | move to another field |
-| `PgUp` `PgDn`, `g` `G` | move by ten fields, or to the ends |
-| `n` `p`, `→` `←` | the next record, the previous record. The selected field stays, so you can follow one column over some rows |
-| `/` | find a field by name. This is the way to one column among hundreds |
-| `Enter` | show the complete value in the cell inspector |
+| `j` `k`, `↑` `↓` | move to another line |
+| `PgUp` `PgDn`, `g` `G` | move by ten lines, or to the ends |
+| `l` `→`, `h` `←` | open a field, close a field |
+| `Space` | open a field, or close it |
+| `Enter` | open a field, or show one value in full |
+| `a` `c` | open every level, close every level |
+| `z` | show the fields that hold no value, or hide them |
+| `n` `p` | the next record, the previous record. What you opened stays open, so you can follow one field over some rows |
+| `/` | find a field by name or by value, at any level |
 | `y` | copy this value |
-| `Y` | copy the whole record, one line for each field |
-| `=` `!` | keep, or remove, the rows with this value |
-| `Esc` `q` `r` | close. The cursor of the grid moves to the field that you were on |
+| `Y` | copy the whole record as JSON |
+| `P` | copy the path, such as `"payload"."commits"[1]."sha"` |
+| `=` `!` | keep, or remove, the rows with this value. This works on a value inside a structure too |
+| `Esc` `q` `r` | close. The cursor of the grid moves to the column you were in |
 
-The values come from the page that the grid holds already, so the record view
-costs no query and opens immediately. It shows a hidden column too, in a dim
-colour: you open this view to see the complete row, and a column that the grid
-hides is exactly the column that you cannot see in the grid.
+It shows a hidden column too, in a dim colour: you open this view to see the
+complete row, and a column that the grid hides is exactly the column that you
+cannot see in the grid.
+
+### Nested data
+
+A JSON file usually holds a list of objects, and an object holds other objects.
+The grid can only show such a value as one long text:
+
+```
+{'id': 665991, 'login': petroav, 'gravatar_id': '', 'url': 'https://api.git…
+```
+
+The record view is the way into it. Press `r`, then `l` on any field with a
+`▸` mark.
+
+**About the fields that hold no value.** DuckDB gives one type to a column, so
+for a JSON file it joins the fields of every row into one structure. The
+`payload` of a file of GitHub events therefore holds 20 fields, and one row
+holds a value in five of them. Those 15 NULLs are the absence of a field in
+that row, not 15 missing values, so the record view hides them and says how
+many: `{5 of 20 fields}`. The key `z` shows them.
+
+A column of the row is different. The schema declares it, so a NULL there is a
+real missing value, and the view always shows it.
+
+**Filtering on a nested value.** Move to a field at any depth and press `=`.
+Peruse builds the condition from the path:
+
+```sql
+WHERE ("actor"."login" = 'petroav')
+```
+
+Press `P` to copy that path, which is what you need to write your own SQL
+against the file.
+
+For more, see [`docs/nested-values.md`](docs/nested-values.md).
 
 ### The filter builder
 

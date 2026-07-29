@@ -13,6 +13,7 @@ starts with a summary of one paragraph, and then gives short sections. Read
 | [query-generation.md](query-generation.md) | How the view becomes SQL, and each statement that Peruse builds |
 | [filter.md](filter.md) | The list of conditions, the operators, and how the list becomes one expression |
 | [ddl.md](ddl.md) | How Peruse measures a file and writes a `CREATE TABLE` statement for another database |
+| [nested-values.md](nested-values.md) | A value that holds other values, and the tree that drills into it |
 | [read-only-guard.md](read-only-guard.md) | The two layers that stop a write, and the statements that pass |
 | [worker-and-concurrency.md](worker-and-concurrency.md) | The worker thread, the combination of requests, the epoch and the cancellation |
 | [user-interface.md](user-interface.md) | The layout, the grid, the panels, the overlays and the prompt |
@@ -75,7 +76,13 @@ the code. The right column gives the words that these documents do not use.
 | panel | The metadata panel or the column statistics panel | sidebar, pane |
 | overlay | A box that covers the grid: the help, the palette, the theme picker, the cell inspector, the record view or the filter builder | popup, dialog, modal |
 | record view | The overlay that shows one row from the top to the bottom | transpose, detail view |
-| field | One column of the row in the record view | attribute, property |
+| field | One value in the record view, at any level | attribute, property |
+| structure | A value that holds named values, from the SQL type `STRUCT` | object, record, map |
+| list | A value that holds values in order, from the SQL type `LIST` | array, vector |
+| tree | The lines of the record view, with their levels | hierarchy, outline |
+| path | The way from the row to one value, such as `payload.commits[1].sha` | selector, key, pointer |
+| open | To show the values that a line holds | expand, unfold, drill down |
+| close | To hide the values that a line holds | collapse, fold |
 | prompt | The editor of one line at the bottom of the screen | input bar, command line |
 | key | One key of the keyboard | shortcut, binding, chord |
 | command | One operation that a key or the palette starts | action, function |

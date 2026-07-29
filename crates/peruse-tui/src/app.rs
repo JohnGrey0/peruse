@@ -9,6 +9,7 @@
 //! function discards the response instead.
 
 use peruse_core::filter::{FilterSet, Op, Term};
+use peruse_core::query::{quote_str, Step};
 use peruse_core::meta::FileMeta;
 use peruse_core::model::RowCount;
 use peruse_core::query::{Base, SortDir, SortKey};
@@ -20,6 +21,7 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent};
 use crate::clip;
 use crate::commands::{self, Cmd};
 use crate::input::{Action, LineInput};
+use crate::tree::{Family, Line, Tree};
 
 /// The number of rows that Peruse reads before the first row of the viewport
 /// and after the last row. A usual scroll therefore does not wait for the
@@ -274,15 +276,23 @@ pub struct App {
     /// `true` when the record view opened the cell inspector. The key `Esc`
     /// then goes back to the record view, and not to the grid.
     cell_from_record: bool,
+    /// The title of the cell inspector, when the value comes from a path
+    /// inside a structure and not from a column.
+    pub cell_title: Option<String>,
 
-    /// The selected field in the record view, as a position in the list from
-    /// [`App::record_fields`].
+    /// The selected line of the record view, as a position in the list from
+    /// [`App::record_lines`].
     pub record_sel: usize,
-    /// The text that selects the fields of the record view by name. An empty
-    /// text shows each field.
+    /// The text that selects the lines of the record view. An empty text
+    /// shows each line.
     pub record_find: String,
     /// `true` while the user types in the find box of the record view.
     pub record_finding: bool,
+    /// The row of the record view, as a tree that opens and closes.
+    pub record_tree: Tree,
+    /// The row that the tree holds. The record view asks the engine again
+    /// when the cursor moves to another row.
+    record_row: Option<u64>,
 
     /// The filter, as a list of conditions. It is the source of the text in
     /// [`View::filter`], and the filter builder edits it.
@@ -377,10 +387,13 @@ impl App {
             cell_value: None,
             cell_scroll: 0,
             cell_from_record: false,
+            cell_title: None,
 
             record_sel: 0,
             record_find: String::new(),
             record_finding: false,
+            record_tree: Tree::default(),
+            record_row: None,
 
             fset: FilterSet::default(),
             fset_saved: FilterSet::default(),
@@ -624,6 +637,7 @@ impl App {
             | Response::Count { epoch, .. }
             | Response::Stats { epoch, .. }
             | Response::Cell { epoch, .. }
+            | Response::RowJson { epoch, .. }
             | Response::Search { epoch, .. }
             | Response::Meta { epoch, .. }
             | Response::Indexed { epoch }
@@ -676,13 +690,31 @@ impl App {
                 }
             }
             Response::Stats { stats, .. } => self.stats = Some(*stats),
+            Response::RowJson { row, json, .. } => {
+                // The user can move to another row while this answer is on
+                // its way. The epoch cannot see that, because the view did
+                // not change, so the row itself is the test.
+                if Some(row) != self.record_row {
+                    return;
+                }
+                match json {
+                    // The lines that are open, and the rule about the empty
+                    // fields, both follow the user to the new row.
+                    Some(j) => {
+                        let old = std::mem::take(&mut self.record_tree);
+                        self.record_tree = old.with_row(&j);
+                    }
+                    None => self.record_tree = Tree::default(),
+                }
+                let n = self.record_lines().len();
+                self.record_sel = self.record_sel.min(n.saturating_sub(1));
+            }
             Response::Cell { value, .. } => {
                 self.cell_value = Some(value.unwrap_or_else(|| "NULL".into()));
                 self.cell_scroll = 0;
             }
             Response::Search { hits, .. } => self.apply_search(hits),
-            // The two responses above handle these, before the test of the
-            // epoch.
+            // The code above handles these two, before the test of the epoch.
             Response::Indexed { .. } | Response::Meta { .. } => {}
             Response::Error { context, message, .. } => {
                 self.indexing = false;
@@ -1213,38 +1245,51 @@ impl App {
         (r < self.page.nrows).then_some(r)
     }
 
-    /// Gives the position in the schema of each field that the record view
-    /// draws.
+    /// Gives the lines that the record view draws.
     ///
-    /// The find box of the record view removes each field with a name that
-    /// does not hold the text. A file with 400 columns is the reason for that
-    /// box: without it, the user scrolls to find one column.
+    /// The find box removes each line whose name and value do not hold the
+    /// text. A file with 400 columns is one reason for that box, and a value
+    /// that holds other values is the second: a match can be three levels
+    /// down, and the user must see the way to it.
     ///
     /// The record view shows a hidden column too. The user opens this view to
     /// see the complete row, and a column that the grid hides is exactly the
     /// column that the user cannot see in the grid.
-    pub fn record_fields(&self) -> Vec<usize> {
-        let q = self.record_find.trim().to_lowercase();
-        (0..self.schema.len())
-            .filter(|i| q.is_empty() || self.schema.columns[*i].name.to_lowercase().contains(&q))
-            .collect()
+    pub fn record_lines(&self) -> Vec<Line> {
+        self.record_tree.lines(&self.record_find)
     }
 
-    /// Gives the value of one field of the row under the cursor.
-    ///
-    /// The outer `None` shows that the page does not hold the row yet. The
-    /// inner `None` is the SQL value NULL.
-    pub fn record_value(&self, col: usize) -> Option<Option<&str>> {
-        let r = self.page_row()?;
-        if col >= self.page.ncols {
-            return None;
-        }
-        Some(self.page.cell(r, col))
+    /// Gives the selected line of the record view.
+    pub fn record_line(&self) -> Option<Line> {
+        self.record_lines().into_iter().nth(self.record_sel)
     }
 
-    /// Gives the position in the schema of the selected field.
+    /// Gives the position in the schema of the column that holds the selected
+    /// line. A line that is three levels down still belongs to one column.
     pub fn record_column(&self) -> Option<usize> {
-        self.record_fields().get(self.record_sel).copied()
+        let line = self.record_line()?;
+        match line.path.first()? {
+            Step::Field(name) => self.schema.index_of(name),
+            Step::Index(_) => None,
+        }
+    }
+
+    /// Asks the engine for the row that the record view shows.
+    ///
+    /// The engine gives the row as JSON. A value that holds other values then
+    /// has one form that this program can read, and the record view can open
+    /// it. See [`crate::tree`].
+    fn request_record(&mut self) {
+        if self.schema.is_empty() {
+            return;
+        }
+        self.record_row = Some(self.cursor_row);
+        self.worker.send(Request::RowJson {
+            epoch: self.epoch,
+            view: self.view.clone(),
+            schema: self.schema.clone(),
+            row: self.cursor_row,
+        });
     }
 
     /// Opens the record view on the row under the cursor.
@@ -1259,10 +1304,12 @@ impl App {
         }
         self.record_find.clear();
         self.record_finding = false;
+        self.record_tree = Tree::default();
         // Start on the column under the cursor. The user then sees the value
         // that the cursor was on, with each other value of the same row.
         self.record_sel = self.cursor_col.min(self.schema.len() - 1);
         self.mode = Mode::Record;
+        self.request_record();
     }
 
     /// Closes the record view and moves the cursor of the grid to the field
@@ -1280,7 +1327,7 @@ impl App {
 
     /// Moves the selection in the record view.
     fn record_move(&mut self, delta: i64) {
-        let n = self.record_fields().len();
+        let n = self.record_lines().len();
         if n == 0 {
             return;
         }
@@ -1315,80 +1362,194 @@ impl App {
             KeyCode::PageUp => self.record_move(-10),
             KeyCode::Char('g') | KeyCode::Home => self.record_sel = 0,
             KeyCode::Char('G') | KeyCode::End => {
-                self.record_sel = self.record_fields().len().saturating_sub(1);
+                self.record_sel = self.record_lines().len().saturating_sub(1);
             }
-            // The next row and the previous row. The selected field stays, so
-            // the user can follow one column over some rows.
-            KeyCode::Char('n') | KeyCode::Right => self.step_record(1),
-            KeyCode::Char('p') | KeyCode::Left => self.step_record(-1),
+            // The next row and the previous row. The position in the list
+            // stays, so the user can follow one field over some rows.
+            KeyCode::Char('n') => self.step_record(1),
+            KeyCode::Char('p') => self.step_record(-1),
             KeyCode::Char('/') => {
                 self.record_finding = true;
                 self.input.set(&self.record_find.clone());
             }
-            KeyCode::Enter => {
-                // The record view cuts a long value at the right edge. The
-                // cell inspector shows it in full.
-                if let Some(c) = self.record_column() {
-                    self.cursor_col = c;
-                    self.cell_from_record = true;
-                    self.run(Cmd::InspectCell);
+
+            // Open a value that holds other values, and close it again.
+            KeyCode::Right | KeyCode::Char('l') => self.record_open(),
+            KeyCode::Left | KeyCode::Char('h') => self.record_close(),
+            KeyCode::Char(' ') => {
+                if let Some(l) = self.record_line()
+                    && l.kind.opens()
+                {
+                    self.record_tree.toggle(&l.path);
                 }
             }
+            KeyCode::Enter => {
+                // A value that holds other values opens. A value that holds
+                // one value goes to the cell inspector, which shows it in
+                // full: the record view cuts a long value at the right edge.
+                match self.record_line() {
+                    Some(l) if l.kind.opens() => self.record_open(),
+                    Some(l) => self.inspect_record_value(&l),
+                    None => {}
+                }
+            }
+            KeyCode::Char('a') => {
+                self.record_tree.expand_all();
+                self.ok("each level is open");
+            }
+            KeyCode::Char('c') => {
+                self.record_tree.collapse_all();
+                self.record_sel = 0;
+                self.ok("each level is closed");
+            }
+            // Show the fields that hold no value, and hide them again.
+            KeyCode::Char('z') => {
+                self.record_tree.hide_empty = !self.record_tree.hide_empty;
+                self.record_sel = 0;
+                if self.record_tree.hide_empty {
+                    self.ok("the fields with no value are hidden");
+                } else {
+                    self.ok("each field is shown");
+                }
+            }
+
             KeyCode::Char('y') => {
-                let v = self
-                    .record_column()
-                    .and_then(|c| self.record_value(c))
-                    .map(|v| v.unwrap_or("NULL").to_string());
-                match v {
+                match self
+                    .record_line()
+                    .and_then(|l| self.record_tree.value_at(&l.path))
+                {
                     Some(v) => self.copy(&v, "value"),
                     None => self.error("no value here yet"),
                 }
             }
-            KeyCode::Char('Y') => {
-                let text = self.record_as_text();
-                self.copy(&text, "record");
-            }
-            KeyCode::Char('=') => {
-                if let Some(c) = self.record_column() {
-                    self.cursor_col = c;
-                    self.close_record();
-                    self.filter_this_value(true);
+            KeyCode::Char('Y') => match self.record_tree.as_json() {
+                Some(j) => self.copy(&j, "record as JSON"),
+                None => self.error("no row here yet"),
+            },
+            // The path is what a user needs to write a statement about a
+            // value that is three levels down.
+            KeyCode::Char('P') => match self.record_line() {
+                Some(l) => {
+                    let p = peruse_core::query::quote_path(&l.path);
+                    self.copy(&p, "path")
                 }
-            }
-            KeyCode::Char('!') => {
-                if let Some(c) = self.record_column() {
-                    self.cursor_col = c;
-                    self.close_record();
-                    self.filter_this_value(false);
-                }
-            }
+                None => self.error("no field here"),
+            },
+
+            KeyCode::Char('=') => self.filter_record_value(true),
+            KeyCode::Char('!') => self.filter_record_value(false),
             _ => {}
         }
     }
 
+    /// Opens the selected line of the record view.
+    fn record_open(&mut self) {
+        if let Some(l) = self.record_line()
+            && l.kind.opens()
+        {
+            self.record_tree.open_path(&l.path);
+        }
+    }
+
+    /// Closes the selected line, or moves to the line that holds it.
+    ///
+    /// A line that is closed already has nothing to close. The user then
+    /// wants to leave that level, so the selection moves to the line above it
+    /// at the smaller depth.
+    fn record_close(&mut self) {
+        let Some(l) = self.record_line() else { return };
+        if l.kind.opens() && l.open {
+            self.record_tree.close_path(&l.path);
+            return;
+        }
+        if l.depth == 0 {
+            return;
+        }
+        let lines = self.record_lines();
+        if let Some(parent) = (0..self.record_sel)
+            .rev()
+            .find(|i| lines[*i].depth < l.depth)
+        {
+            self.record_sel = parent;
+        }
+    }
+
+    /// Opens the cell inspector on a value of the record view.
+    fn inspect_record_value(&mut self, line: &Line) {
+        let Some(v) = self.record_tree.value_at(&line.path) else {
+            return;
+        };
+        // A value that is inside a structure has no column of its own, so the
+        // engine cannot read it again. The tree holds the complete value
+        // already, and the inspector takes it as it is.
+        self.cell_value = Some(v);
+        self.cell_scroll = 0;
+        self.cell_from_record = true;
+        self.cell_title = Some(line.path_text());
+        self.mode = Mode::Cell;
+    }
+
+    /// Adds a condition on the selected value of the record view.
+    fn filter_record_value(&mut self, keep: bool) {
+        let Some(line) = self.record_line() else {
+            return;
+        };
+        // A column of the row is a column of the view. The builder can hold
+        // it as a condition that the user can edit later.
+        if line.path.len() == 1
+            && let Some(c) = self.record_column()
+        {
+            self.cursor_col = c;
+            self.close_record();
+            self.filter_this_value(keep);
+            return;
+        }
+        // A value inside a structure has no column. DuckDB reads it by its
+        // path, so the condition holds that path as an expression.
+        if line.kind.opens() {
+            self.error("cannot filter on a value that holds other values");
+            return;
+        }
+        let path = peruse_core::query::quote_path(&line.path);
+        let sql = match (line.family, keep) {
+            (Family::Null, true) => format!("{path} IS NULL"),
+            (Family::Null, false) => format!("{path} IS NOT NULL"),
+            (Family::Number | Family::Bool, true) => format!("{path} = {}", line.value),
+            (Family::Number | Family::Bool, false) => format!("{path} <> {}", line.value),
+            (_, true) => format!("{path} = {}", quote_str(&self.record_text(&line))),
+            (_, false) => format!("{path} <> {}", quote_str(&self.record_text(&line))),
+        };
+        if let Err(e) = sql_guard::ensure_safe_predicate(&sql) {
+            self.error(format!("cannot filter on this value: {e}"));
+            return;
+        }
+        self.close_record();
+        self.fset.push(Term::Raw(sql));
+        self.apply_fset();
+        self.ok(format!("filter: {}", line.path_text()));
+    }
+
+    /// Gives the true text of a value, and not the short form that the record
+    /// view draws. The short form `(empty)` is not the value.
+    fn record_text(&self, line: &Line) -> String {
+        self.record_tree
+            .value_at(&line.path)
+            .unwrap_or_else(|| line.value.clone())
+    }
+
     /// Moves the record view to the next row or to the previous row.
+    ///
+    /// The lines that are open stay open. The user moves through the rows to
+    /// compare one field, and a tree that closes at each row would make that
+    /// impossible.
     fn step_record(&mut self, delta: i64) {
         let before = self.cursor_row;
         self.move_rows(delta);
         if self.cursor_row == before {
             self.info(if delta > 0 { "last row" } else { "first row" });
+            return;
         }
-    }
-
-    /// Writes the record as one line for each field, with a tab between the
-    /// name and the value.
-    fn record_as_text(&self) -> String {
-        self.record_fields()
-            .iter()
-            .map(|c| {
-                let name = &self.schema.columns[*c].name;
-                // A missing value copies as the word NULL, as it does in the
-                // grid and in the cell inspector.
-                let v = self.record_value(*c).flatten().unwrap_or("NULL");
-                format!("{name}\t{v}")
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
+        self.request_record();
     }
 
     // ------------------------------------------------- the filter builder
@@ -1906,6 +2067,7 @@ impl App {
                 };
                 self.cell_value = self.current_cell_text();
                 self.cell_scroll = 0;
+                self.cell_title = None;
                 self.mode = Mode::Cell;
                 // Ask the engine for the complete value. The copy in the
                 // grid stops at the limit, in the middle of the value.
