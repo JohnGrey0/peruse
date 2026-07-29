@@ -38,6 +38,15 @@ const MAT_TABLE: &str = "__peruse_indexed";
 /// far above each such file, and far below the level that fills the stack.
 const MAX_JSON_DEPTH: u32 = 128;
 
+/// The number of rows above which the statistics leave out the most frequent
+/// values of a column where almost each value is different.
+///
+/// That query groups every row of the view, and it is the slow part of the
+/// panel: on ten million rows it costs 300 milliseconds, and each other query
+/// of the panel costs 30. Below this number of rows the query costs nothing,
+/// and the list is still worth a look.
+const TOP_VALUES_MIN_ROWS: u64 = 100_000;
+
 /// The options that control how the engine opens a file.
 #[derive(Clone, Debug, Default)]
 pub struct OpenOptions {
@@ -74,6 +83,18 @@ pub struct Engine {
     read_expr: String,
     /// True after the engine copies a CSV file into a table.
     pub indexed: bool,
+    /// The name and the type of each column of the whole file.
+    ///
+    /// Each statement against a file of text makes DuckDB read the file with
+    /// its sniffer again, and that sniffer is the slow part of an open. On a
+    /// file of 1000 columns one `DESCRIBE` costs four seconds. The open
+    /// operation reads the schema one time and keeps it here, so a caller
+    /// that asks for the schema of the whole file waits for nothing.
+    ///
+    /// A filter and a sort do not change the columns, so this value serves
+    /// each view that reads the file itself. A view that holds a statement
+    /// of the user has its own columns, and it reads them each time.
+    base_schema: Schema,
 }
 
 /// Changes each backslash in a path to a forward slash.
@@ -199,18 +220,25 @@ impl Engine {
         conn.execute_batch(&format!("CREATE OR REPLACE VIEW src AS SELECT * FROM {read_expr}"))
             .with_context(|| format!("opening {}", src.input))?;
 
-        let engine = Engine {
+        let mut engine = Engine {
             conn,
             source: src,
             read_expr,
             indexed: false,
+            base_schema: Schema::default(),
         };
-        // Read the schema now. An error message here is more useful to the
-        // user than an error message at the first scroll.
-        engine
-            .describe(&View::default())
+        // Read the schema now, and keep it. An error message here is more
+        // useful to the user than an error message at the first scroll, and
+        // each later caller then needs no second read of the file.
+        engine.base_schema = engine
+            .read_schema(&View::default())
             .with_context(|| format!("reading schema of {}", engine.source.input))?;
         Ok(engine)
+    }
+
+    /// Gives the name and the type of each column of the whole file.
+    pub fn base_schema(&self) -> &Schema {
+        &self.base_schema
     }
 
     /// Gives a handle that stops the query that runs now.
@@ -221,7 +249,21 @@ impl Engine {
     }
 
     /// Gives the name and the type of each column. This function reads no rows.
+    ///
+    /// A view that reads the file itself gets the schema that the open
+    /// operation found. A filter and a sort remove rows, and they do not
+    /// change the columns, so that schema is the right one for each of them.
+    /// This saves a read of the file, and on a file of text that read runs
+    /// the sniffer of DuckDB again.
     pub fn describe(&self, view: &View) -> Result<Schema> {
+        if view.is_source() && !self.base_schema.is_empty() {
+            return Ok(self.base_schema.clone());
+        }
+        self.read_schema(view)
+    }
+
+    /// Reads the name and the type of each column from the database.
+    fn read_schema(&self, view: &View) -> Result<Schema> {
         let sql = view.describe_sql();
         let mut stmt = self.conn.prepare(&sql)?;
         let mut rows = stmt.query([])?;
@@ -392,7 +434,21 @@ impl Engine {
         // more distinct values than it has rows that are not NULL.
         stats.n_distinct = stats.n_distinct.min(stats.n_present);
 
-        if top_k > 0 {
+        // The most frequent values of a column of keys say nothing: each
+        // value occurs one time. That query is also the slow part of the
+        // panel, because it groups every row of the view. On ten million
+        // rows it costs 300 milliseconds, and each other query of the panel
+        // costs 30. A column where almost each value is different therefore
+        // does not get it.
+        //
+        // The panel already writes "every sampled value occurs once" for a
+        // list of counts of one, and an empty list reads the same way.
+        //
+        // A small view keeps the list. The query costs nothing there, and a
+        // user who looks at a hundred rows still wants to see them.
+        let nearly_unique = stats.n_present >= TOP_VALUES_MIN_ROWS
+            && stats.n_distinct * 4 > stats.n_present * 3;
+        if top_k > 0 && !nearly_unique {
             stats.top = self.top_values(view, &column.name, top_k)?;
         }
         if column.kind == CellKind::Number {

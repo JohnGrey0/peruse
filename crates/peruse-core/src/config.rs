@@ -359,7 +359,20 @@ impl Resources {
     /// user would then see a different limit each time.
     pub fn default_memory_gb(&self) -> Option<u32> {
         let total = self.total_memory?;
-        let gb = total / 2 / (1024 * 1024 * 1024);
+        let gib = total / (1024 * 1024 * 1024);
+        // A small machine gets a smaller part. The limit is the point where
+        // DuckDB starts to write to the disk, and that is the graceful way
+        // to run out of memory. A limit near the size of the machine takes
+        // that way away: the operating system starts to write to the disk
+        // instead, and that is much slower.
+        //
+        // A measurement of an index of a file of 1.36 GB shows the trade: a
+        // limit of 1 GiB made the work 17 percent slower, and it halved the
+        // memory that the program held. On a machine of 8 GB, where a
+        // browser and an editor hold half of the memory already, that trade
+        // is a good one.
+        let part = if gib <= 8 { total * 3 / 10 } else { total / 2 };
+        let gb = part / (1024 * 1024 * 1024);
         Some((gb as u32).max(1))
     }
 
@@ -506,7 +519,7 @@ mod tests {
     }
 
     #[test]
-    fn the_built_in_limit_is_one_half_of_the_machine() {
+    fn the_built_in_limit_leaves_room_for_the_other_programs() {
         let r = Resources {
             cores: 8,
             cpu: None,
@@ -516,6 +529,15 @@ mod tests {
         };
         assert_eq!(r.default_memory_gb(), Some(32));
         assert_eq!(r.default_memory_text().as_deref(), Some("32GiB"));
+
+        // A machine of 8 GB gets a smaller part, so that DuckDB writes to
+        // its own temporary directory before the operating system starts to
+        // write to the disk.
+        let laptop = Resources {
+            total_memory: Some(8 * 1024 * 1024 * 1024),
+            ..r.clone()
+        };
+        assert_eq!(laptop.default_memory_gb(), Some(2));
 
         // A small machine still gives DuckDB something to work with.
         let small = Resources {

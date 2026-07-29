@@ -209,17 +209,14 @@ impl Worker {
                         return;
                     }
                 };
-                let opened = match engine.describe(&View::default()) {
-                    Ok(schema) => Opened {
-                        schema,
-                        source: engine.source.clone(),
-                        seekable: engine.is_seekable(),
-                        read_expr: engine.read_expr().to_string(),
-                    },
-                    Err(e) => {
-                        let _ = ready_tx.send(Err(e));
-                        return;
-                    }
+                // The open operation read the schema already. A second read
+                // would run the sniffer of DuckDB again, and on a file of
+                // text that is the slow part of an open.
+                let opened = Opened {
+                    schema: engine.base_schema().clone(),
+                    source: engine.source.clone(),
+                    seekable: engine.is_seekable(),
+                    read_expr: engine.read_expr().to_string(),
                 };
                 if ready_tx.send(Ok((opened, engine.interrupt_handle()))).is_err() {
                     return;

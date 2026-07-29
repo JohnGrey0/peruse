@@ -28,21 +28,48 @@ use crate::tree::{Family, Line, Tree};
 /// and after the last row. A usual scroll therefore does not wait for the
 /// engine.
 const PREFETCH: u64 = 250;
-/// The number of rows that the worker examines in one search request.
+/// The number of rows that the worker examines in the first search request.
 ///
-/// The number is small, so a match near the cursor comes back immediately, and
-/// the user can stop a search that finds nothing. The number is also large, so
-/// a search of a full file does not need thousands of requests.
+/// The number is small, so a match near the cursor comes back immediately,
+/// and the user can stop a search that finds nothing.
 const SEARCH_CHUNK: u64 = 250_000;
+
+/// The largest number of rows that one search request examines.
+///
+/// Each request reads the view from its start and then skips to its part, so
+/// a request that starts late costs more than a request that starts early. A
+/// search of ten million rows in parts of 250,000 therefore reads the file
+/// forty times, and the cost grows with the square of the size.
+///
+/// The parts double in size instead. The first one stays small, so a match
+/// near the cursor is still immediate, and the number of parts falls from
+/// forty to about six.
+const SEARCH_CHUNK_MAX: u64 = 4_000_000;
 /// The largest number of match offsets that one search request gives.
 const SEARCH_HITS: u32 = 500;
-/// The largest size of a CSV file that Peruse indexes when it opens the file.
+/// The largest size of a file of text that Peruse indexes when it opens it.
 ///
 /// A scan of this size is quick, and the user does not notice it. A jump to
 /// the last row then costs almost no time. For a larger file, Peruse waits for
 /// the key `I`. The user therefore never waits for a scan that the user did
 /// not ask for.
-const AUTO_INDEX_BYTES: u64 = 256 * 1024 * 1024;
+///
+/// The index holds the file in memory, and it takes about one and a third
+/// times the size of the file. This limit therefore also limits what Peruse
+/// spends without asking: about 85 MB, which is one percent of a machine with
+/// 8 GB. A limit of 256 MB would spend 340 MB of that machine, and on a disk
+/// that turns it would read for some seconds before the user could do
+/// anything.
+const AUTO_INDEX_BYTES: u64 = 64 * 1024 * 1024;
+
+/// The largest number of columns of a file that Peruse indexes when it opens
+/// it.
+///
+/// The size in bytes is the wrong measure by itself. A file of 170 MB with
+/// 10,000 columns is below the limit above, and the index of it costs 21
+/// seconds and 2.7 GB. The number of columns is what makes that file slow,
+/// so the number of columns needs its own limit.
+const AUTO_INDEX_COLUMNS: usize = 256;
 
 /// The smallest width of a column, in screen columns.
 const MIN_COL_WIDTH: u16 = 3;
@@ -303,6 +330,8 @@ struct Scan {
     examined: u64,
     /// The number of rows in the view.
     total: u64,
+    /// The number of rows that the next part covers.
+    chunk: u64,
 }
 
 /// One view that the user had, for the keys that go back and forward.
@@ -604,7 +633,11 @@ impl App {
             quit: false,
         };
         app.reload(true);
-        if auto_index && !app.seekable && app.source.bytes < AUTO_INDEX_BYTES {
+        if auto_index
+            && !app.seekable
+            && app.source.bytes < AUTO_INDEX_BYTES
+            && app.schema.len() <= AUTO_INDEX_COLUMNS
+        {
             app.indexing = true;
             app.worker.send(Request::Index { epoch: app.epoch });
         }
@@ -1074,25 +1107,32 @@ impl App {
             next: from,
             examined: 0,
             total,
+            chunk: SEARCH_CHUNK,
         });
         self.request_scan_chunk();
     }
 
     /// Asks the worker to examine the next part of the view.
     ///
-    /// Each call covers [`SEARCH_CHUNK`] rows at the most. The worker
-    /// therefore answers quickly, the user interface stays live, and the key
-    /// `Esc` can stop the search.
+    /// The first call covers [`SEARCH_CHUNK`] rows, and each call after it
+    /// covers two times the rows of the one before, up to
+    /// [`SEARCH_CHUNK_MAX`]. The first answer therefore arrives at once, and
+    /// a search of a large file does not read that file forty times.
+    ///
+    /// The user interface stays live through each part, and the key `Esc`
+    /// stops the search inside one.
     fn request_scan_chunk(&mut self) {
         let Some(s) = self.scan.as_mut() else { return };
+        let chunk = s.chunk;
+        s.chunk = (s.chunk * 2).min(SEARCH_CHUNK_MAX);
         let (from, len) = if s.forward {
             let from = if s.next >= s.total { 0 } else { s.next };
-            let len = SEARCH_CHUNK.min(s.total.saturating_sub(from)).max(1);
+            let len = chunk.min(s.total.saturating_sub(from)).max(1);
             s.next = from + len;
             (from, len)
         } else {
             let end = if s.next == 0 { s.total } else { s.next };
-            let from = end.saturating_sub(SEARCH_CHUNK);
+            let from = end.saturating_sub(chunk);
             s.next = from;
             (from, end - from)
         };
