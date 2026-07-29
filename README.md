@@ -64,7 +64,23 @@ to the file.
 
 ## Install
 
-The command is `peruse` however you install it.
+The command is `peruse` however you install it. Nothing below needs Rust
+except the last two.
+
+**With the tool you use already:**
+
+```powershell
+scoop bucket add peruse https://github.com/JohnGrey0/scoop-peruse
+scoop install peruse          # Windows
+
+winget install JohnGrey0.Peruse   # Windows
+choco install peruse              # Windows
+```
+
+```sh
+brew tap JohnGrey0/peruse
+brew install peruse           # macOS, Linux
+```
 
 **A prebuilt program — nothing to compile.** Take the archive for your machine
 from the [releases](https://github.com/JohnGrey0/peruse/releases), unpack it,
@@ -103,7 +119,20 @@ cargo build --release
 cargo test --workspace
 ```
 
-Peruse needs Rust 1.95 or later to build.
+Peruse needs Rust 1.88 or later to build. A job in CI builds on exactly that
+version, so the number is true and not a guess.
+
+### Licences
+
+Peruse is Apache-2.0. The program also holds DuckDB and the 26 C and C++
+libraries inside it, and every one of those carries a permissive licence.
+[THIRD-PARTY-LICENSES.md](THIRD-PARTY-LICENSES.md) names each one, and it
+ships beside the program in every release archive.
+
+If a tool at your work reports the GPL, a TLS library or a copyleft licence
+in Peruse, read the
+[notes for a licence scan](THIRD-PARTY-LICENSES.md#notes-for-a-licence-scan).
+All three of those reports are false, and that section says why.
 
 ### The two crates
 

@@ -6,6 +6,35 @@ settings. Each such change is in this file.
 
 ## Unreleased
 
+### Installing
+
+- Manifests for Scoop, Homebrew, WinGet and Chocolatey, so a user can install
+  Peruse without Rust and without a build of DuckDB. `packaging/render.sh`
+  fills them from a release, and `packaging/README.md` says where each one
+  goes.
+
+### Licences
+
+- `THIRD-PARTY-LICENSES.md` names DuckDB, the 26 C and C++ libraries inside
+  it, and the licence and copyright of each. `libduckdb-sys` ships none of
+  those files, so this one supplies them. It goes in every release archive
+  and in both crates.
+- It also answers the three reports that a licence tool gives for Peruse and
+  that are all false: the GPL header in libpg_query, which Bison wrote and
+  which carries an exception; mbedtls and httplib, which belong to an
+  extension that Peruse does not build; and the word "GPL" in two libraries
+  that offer a choice of licence, where Peruse takes the other side.
+- Dropped `directories`, which reached `option-ext` under the Mozilla Public
+  Licence. `dirs.rs` reads the same environment variables and gives the same
+  paths, so the settings of a user do not move. No copyleft crate is left.
+
+### Building
+
+- The oldest Rust is now 1.88, and was 1.95. One crate asked for 1.95, and
+  Peruse used it for a memory total and a processor name. A job in CI builds
+  on exactly the version in the manifest, so a dependency cannot raise it in
+  silence.
+
 ## 0.1.0
 
 The first release.
