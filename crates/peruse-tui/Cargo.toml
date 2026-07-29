@@ -21,11 +21,12 @@ path = "src/main.rs"
 #
 # The names here must agree with `.github/workflows/release.yml`.
 [package.metadata.binstall]
-pkg-url = "{ repo }/releases/download/v{ version }/peruse-{ version }-{ target }.{ archive-format }"
+pkg-url = "{ repo }/releases/download/v{ version }/peruse-{ version }-{ target }.tar.gz"
 bin-dir = "peruse-{ version }-{ target }/{ bin }{ binary-ext }"
 pkg-fmt = "tgz"
 
 [package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
+pkg-url = "{ repo }/releases/download/v{ version }/peruse-{ version }-{ target }.zip"
 pkg-fmt = "zip"
 
 [dependencies]

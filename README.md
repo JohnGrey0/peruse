@@ -82,7 +82,7 @@ This downloads the same prebuilt program instead of building one.
 **With Rust, from source:**
 
 ```sh
-cargo install peruse-tui
+cargo install --locked peruse-tui
 ```
 
 This compiles DuckDB into the program, so the first build takes several
@@ -164,10 +164,14 @@ With no file, Peruse shows you what is around instead of a page of help:
 
 Files you have opened before come first. `/` filters as you type, `h` goes up
 a directory, `~` goes home, and `a` shows every file — not just the ones Peruse
-recognises. See [`docs/chooser.md`](docs/chooser.md).
+recognises. See [`docs/chooser.md`](https://github.com/JohnGrey0/peruse/blob/main/docs/chooser.md).
 
-`peruse --help` still prints the help, and so does `peruse` in a pipeline,
-where there is no terminal to draw on.
+`peruse --help` still prints the help, and so does a bare `peruse` in a
+pipeline, where there is no terminal to draw on.
+
+Peruse draws a full screen, so it needs a terminal. `peruse data.csv > out.txt`
+tells you that plainly instead of writing escape sequences into your file. To
+get text out of Peruse, use [`--ddl`](#generate-a-table).
 
 ---
 
@@ -295,7 +299,7 @@ WHERE ("actor"."login" = 'petroav')
 Press `P` to copy that path, which is what you need to write your own SQL
 against the file.
 
-For more, see [`docs/nested-values.md`](docs/nested-values.md).
+For more, see [`docs/nested-values.md`](https://github.com/JohnGrey0/peruse/blob/main/docs/nested-values.md).
 
 ### The filter builder
 
@@ -943,7 +947,7 @@ statement from one `View` value: the relation, the filter and the sort. A
 filter from the builder and a sort from the key `s` therefore work together,
 and the code needs no special case for them.
 
-The directory [`docs/`](docs/README.md) holds one document for each part of the
+The directory [`docs/`](https://github.com/JohnGrey0/peruse/blob/main/docs/README.md) holds one document for each part of the
 system: the architecture, the engine, the query generation, the read-only
 guard, the worker and the concurrency, the user interface, the keys and the
 commands, the themes, and the performance.
@@ -986,4 +990,4 @@ It is almost always the C++ toolchain. See [Install](#install).
 
 ---
 
-Licensed under the Apache License 2.0. See [LICENSE](LICENSE).
+Licensed under the Apache License 2.0. See [LICENSE](https://github.com/JohnGrey0/peruse/blob/main/LICENSE).

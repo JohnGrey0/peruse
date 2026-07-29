@@ -157,6 +157,47 @@ pub fn detect(path: &Path) -> (Format, Option<char>, bool) {
     }
 }
 
+/// Writes a path in a form that a settings file can hold, and that the system
+/// can open again.
+///
+/// On Windows, `std::fs::canonicalize` gives a verbatim path, which starts
+/// with `\\?\`. Windows gives such a path to its own calls with no change, and
+/// it does not read a forward slash inside one. A change of the separators
+/// would therefore give `//?/C:/…`, and that path never opens again.
+///
+/// The function removes that start first, and then changes the separators.
+/// A path with no verbatim start accepts a forward slash on Windows.
+///
+/// On each other system, a backslash is an ordinary character of a name. The
+/// function changes nothing there: `/data/back\slash.csv` is one file, and
+/// `/data/back/slash.csv` is a different one.
+pub fn tidy_path(p: &Path) -> String {
+    let text = p.to_string_lossy();
+    if !cfg!(windows) {
+        return text.into_owned();
+    }
+    let plain = text
+        .strip_prefix(r"\\?\UNC\")
+        .map(|rest| format!(r"\\{rest}"))
+        .unwrap_or_else(|| text.strip_prefix(r"\\?\").unwrap_or(&text).to_string());
+    plain.replace('\\', "/")
+}
+
+/// Reads a path that a settings file holds.
+///
+/// A version of Peruse before this one wrote a verbatim path with its
+/// separators changed, such as `//?/C:/data/a.csv`. Windows cannot open that
+/// path, so each such entry would go away in silence. The function repairs
+/// it, and a user keeps the list that they built.
+pub fn untidy_path(text: &str) -> PathBuf {
+    if cfg!(windows)
+        && let Some(rest) = text.strip_prefix("//?/")
+    {
+        return PathBuf::from(rest);
+    }
+    PathBuf::from(text)
+}
+
 /// Gives `true` when the text is a glob pattern. Peruse must then expand the
 /// pattern, and it must not open the text as one path.
 pub fn looks_like_glob(s: &str) -> bool {
@@ -250,6 +291,52 @@ mod tests {
     #[test]
     fn unknown_extension_falls_back_to_csv() {
         assert_eq!(detect(Path::new("mystery.dat")).0, Format::Csv);
+    }
+
+    #[test]
+    fn a_path_for_the_settings_file_opens_again() {
+        // On Windows, `canonicalize` gives a verbatim path. A change of the
+        // separators inside one gives `//?/C:/…`, and Windows cannot open
+        // that. The list of the files that the user opened was therefore
+        // always empty on Windows.
+        if cfg!(windows) {
+            assert_eq!(tidy_path(Path::new(r"\\?\C:\data\a.csv")), "C:/data/a.csv");
+            assert_eq!(tidy_path(Path::new(r"C:\data\a.csv")), "C:/data/a.csv");
+            // A path on another machine keeps its two first separators.
+            assert_eq!(
+                tidy_path(Path::new(r"\\?\UNC\host\share\a.csv")),
+                "//host/share/a.csv"
+            );
+        } else {
+            // A backslash is an ordinary character of a name here, and the
+            // function must not make one file into two.
+            assert_eq!(
+                tidy_path(Path::new(r"/data/back\slash.csv")),
+                r"/data/back\slash.csv"
+            );
+        }
+    }
+
+    #[test]
+    fn a_path_from_an_older_settings_file_still_opens() {
+        // A version before this one wrote `//?/C:/…`. A user keeps the list
+        // of files that they built.
+        if cfg!(windows) {
+            assert_eq!(
+                untidy_path("//?/C:/data/a.csv"),
+                PathBuf::from("C:/data/a.csv")
+            );
+            assert_eq!(untidy_path("C:/data/a.csv"), PathBuf::from("C:/data/a.csv"));
+        }
+        assert_eq!(untidy_path("/data/a.csv"), PathBuf::from("/data/a.csv"));
+    }
+
+    #[test]
+    fn a_path_goes_out_and_comes_back_the_same() {
+        for p in ["/data/a.csv", "C:/data/a.csv"] {
+            let out = tidy_path(Path::new(p));
+            assert_eq!(untidy_path(&out), PathBuf::from(p), "path {p}");
+        }
     }
 
     #[test]

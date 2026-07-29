@@ -84,7 +84,7 @@ impl Browser {
         let recent = config
             .recent
             .iter()
-            .map(PathBuf::from)
+            .map(|r| peruse_core::source::untidy_path(r))
             // A file that the user moved or deleted must not stay on the
             // screen. The list would then offer a file that cannot open.
             .filter(|p| p.is_file())

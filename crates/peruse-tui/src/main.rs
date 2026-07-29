@@ -180,12 +180,19 @@ fn main() -> Result<()> {
     // a chooser, so a call inside a pipeline must not wait for a key. The
     // option `--ddl` writes to the standard output, and it needs a file that
     // the caller names.
+    // The grid and the chooser both draw on a terminal. Without one there is
+    // nothing to draw on, and the escape sequences of a full screen would go
+    // into the pipe or into the file.
+    let interactive = std::io::IsTerminal::is_terminal(&std::io::stdout());
+
     let file = match cli.file.clone() {
         Some(f) => f,
         None if cli.ddl.is_some() => {
             anyhow::bail!("--ddl needs a file. Give the path of the file to read.")
         }
-        None if !std::io::IsTerminal::is_terminal(&std::io::stdout()) => {
+        // A call with no file and no terminal is a call from a script that
+        // wants to know what this program is.
+        None if !interactive => {
             Cli::command().print_help()?;
             println!();
             return Ok(());
@@ -231,6 +238,17 @@ fn main() -> Result<()> {
         return print_ddl(&file, &opts, name, cli.table.clone(), cli.query.clone(), cli.filter.clone());
     }
 
+    // The option --ddl writes text and needs no terminal, and it has left
+    // this function already. Each other way through the program draws a
+    // screen. A screen that goes into a pipe is a page of escape sequences,
+    // and the program would then wait for a key that never arrives.
+    if !interactive {
+        anyhow::bail!(
+            "peruse draws on a terminal, and this one has none.\n\
+             To write to a file or to a pipe, use --ddl <dialect> instead."
+        );
+    }
+
     let (worker, opened) = Worker::spawn(&file, opts)?;
 
     // Remember the file, so that the chooser can offer it at the next start.
@@ -240,7 +258,7 @@ fn main() -> Result<()> {
     if !peruse_core::source::looks_like_glob(&file)
         && let Ok(full) = std::fs::canonicalize(&file)
     {
-        config.remember_file(&full.to_string_lossy().replace('\\', "/"));
+        config.remember_file(&peruse_core::source::tidy_path(&full));
         if let Some(p) = Config::path() {
             // A list that Peruse cannot write is not a reason to stop. The
             // user came here to look at a file.

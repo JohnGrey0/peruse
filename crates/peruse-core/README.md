@@ -24,13 +24,12 @@ graphical user interface can use the same API.
 **If you want the tool, install [`peruse-tui`](https://crates.io/crates/peruse-tui)
 instead.** This crate is the library it is built on.
 
-```rust,no_run
+```rust
 use peruse_core::{OpenOptions, Request, View, Worker};
 
 let (worker, opened) = Worker::spawn("trips.parquet", OpenOptions::default())?;
 println!("{} columns", opened.schema.len());
 worker.send(Request::SetView { epoch: 1, view: View::default(), limit: 50 });
-# Ok::<(), anyhow::Error>(())
 ```
 
 ## Reading only

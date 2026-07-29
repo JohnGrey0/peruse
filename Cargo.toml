@@ -9,6 +9,7 @@ rust-version = "1.95"
 license = "Apache-2.0"
 repository = "https://github.com/JohnGrey0/peruse"
 homepage = "https://github.com/JohnGrey0/peruse"
+documentation = "https://github.com/JohnGrey0/peruse#readme"
 description = "A fast, read-only viewer for Parquet, CSV, TSV and JSON data files."
 keywords = ["parquet", "csv", "json", "tui", "duckdb"]
 categories = ["command-line-utilities", "database", "visualization"]
