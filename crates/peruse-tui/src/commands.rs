@@ -46,6 +46,7 @@ pub enum Cmd {
     // The commands that open a panel or an overlay.
     ToggleMeta,
     ToggleStats,
+    CyclePanels,
     InspectCell,
     Record,
     // The commands that change the columns.
@@ -275,6 +276,13 @@ pub static BINDINGS: &[Binding] = &[
         keys: &[(KeyCode::Char('i'), N)],
         label: "i",
         desc: "statistics for this column",
+        group: "Inspect",
+    },
+    Binding {
+        cmd: Cmd::CyclePanels,
+        keys: &[(KeyCode::Char('M'), N)],
+        label: "M",
+        desc: "cycle the side panels: none, metadata, statistics, both",
         group: "Inspect",
     },
     Binding {

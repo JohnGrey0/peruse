@@ -190,7 +190,7 @@ fn main() -> Result<()> {
         sql_guard::ensure_safe_predicate(f).map_err(|e| anyhow::anyhow!("--filter: {e}"))?;
     }
 
-    // With no setting, Peruse gives DuckDB a quarter of the memory of the
+    // With no setting, Peruse gives DuckDB one half of the memory of the
     // machine. Without a limit, DuckDB takes 80 percent of it, and a viewer
     // of data is not the only program that the user runs.
     let resources = peruse_core::config::Resources::read();
@@ -218,6 +218,11 @@ fn main() -> Result<()> {
     let auto_index = !(cli.no_index || config.no_index.unwrap_or(false));
     let mut application = App::new(worker, opened, theme, auto_index);
     application.config = config;
+    // The user asked for these panels in an earlier session. Put them on the
+    // screen, and ask for what they need.
+    if let Some(name) = application.config.panels.clone() {
+        application.set_panel_from_setting(&name);
+    }
     if let Some(e) = config_error {
         application.error(format!("settings: {e}"));
     }

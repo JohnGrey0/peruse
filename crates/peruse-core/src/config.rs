@@ -52,6 +52,8 @@ pub struct Config {
     pub sample_size: Option<i64>,
     /// `true` to never index a file of text when Peruse opens it.
     pub no_index: Option<bool>,
+    /// The panels that stay on the screen: `none`, `meta`, `stats` or `both`.
+    pub panels: Option<String>,
 }
 
 impl Config {
@@ -188,6 +190,10 @@ impl Config {
 
         s.push_str("\n# Set this to true to never index a file of text at the start.\n");
         push_opt(&mut s, "no_index", self.no_index.map(|v| v.to_string()));
+
+        s.push_str("\n# The panels that stay at the side of the grid:\n");
+        s.push_str("# none, meta, stats or both.\n");
+        push_opt(&mut s, "panels", self.panels.as_deref().map(quote));
         s
     }
 }
@@ -306,9 +312,9 @@ impl Resources {
     /// Gives the memory limit that Peruse uses when the user sets none, in
     /// whole gigabytes.
     ///
-    /// The value is a quarter of the memory of the machine. DuckDB takes 80
+    /// The value is one half of the memory of the machine. DuckDB takes 80
     /// percent of the memory for itself if nobody tells it otherwise, and a
-    /// viewer of data is not the only program that a user runs. A quarter
+    /// viewer of data is not the only program that a user runs. One half
     /// leaves room for the editor, the browser and the rest.
     ///
     /// The value is never below one gigabyte. DuckDB needs some memory to
@@ -319,7 +325,7 @@ impl Resources {
     /// user would then see a different limit each time.
     pub fn default_memory_gb(&self) -> Option<u32> {
         let total = self.total_memory?;
-        let gb = total / 4 / (1024 * 1024 * 1024);
+        let gb = total / 2 / (1024 * 1024 * 1024);
         Some((gb as u32).max(1))
     }
 
@@ -368,6 +374,7 @@ mod tests {
             memory_limit_gb: Some(4),
             sample_size: Some(-1),
             no_index: Some(true),
+            panels: Some("both".into()),
         };
         let back: Config = toml::from_str(&c.to_toml()).unwrap();
         assert_eq!(back, c);
@@ -444,7 +451,7 @@ mod tests {
     }
 
     #[test]
-    fn the_built_in_limit_is_a_quarter_of_the_machine() {
+    fn the_built_in_limit_is_one_half_of_the_machine() {
         let r = Resources {
             cores: 8,
             cpu: None,
@@ -452,8 +459,8 @@ mod tests {
             free_memory: None,
             temp_dir: PathBuf::from("/tmp"),
         };
-        assert_eq!(r.default_memory_gb(), Some(16));
-        assert_eq!(r.default_memory_text().as_deref(), Some("16GiB"));
+        assert_eq!(r.default_memory_gb(), Some(32));
+        assert_eq!(r.default_memory_text().as_deref(), Some("32GiB"));
 
         // A small machine still gives DuckDB something to work with.
         let small = Resources {

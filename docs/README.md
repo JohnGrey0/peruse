@@ -18,6 +18,7 @@ starts with a summary of one paragraph, and then gives short sections. Read
 | [worker-and-concurrency.md](worker-and-concurrency.md) | The worker thread, the combination of requests, the epoch and the cancellation |
 | [user-interface.md](user-interface.md) | The layout, the grid, the panels, the overlays and the prompt |
 | [keys-and-commands.md](keys-and-commands.md) | The table of commands, and the help and the palette that come from it |
+| [settings.md](settings.md) | The settings that Peruse keeps, the settings page, and what the machine gives |
 | [themes.md](themes.md) | The model of the colors, the built-in themes, and how to write a theme file |
 | [performance.md](performance.md) | The measured times, and the decisions that give them |
 
@@ -74,6 +75,8 @@ the code. The right column gives the words that these documents do not use.
 | request | A message to the worker | job, task, message |
 | response | An answer from the worker | reply, result, event |
 | panel | The metadata panel or the column statistics panel | sidebar, pane |
+| side pane | The area at the side of the grid that holds the panels | sidebar, dock |
+| setting | One value that Peruse keeps between sessions | option, preference, config |
 | overlay | A box that covers the grid: the help, the palette, the theme picker, the cell inspector, the record view or the filter builder | popup, dialog, modal |
 | record view | The overlay that shows one row from the top to the bottom | transpose, detail view |
 | field | One value in the record view, at any level | attribute, property |

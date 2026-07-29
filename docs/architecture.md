@@ -17,6 +17,7 @@ The crate `peruse-core` holds these modules:
 | `query.rs` | The code that builds SQL from the view |
 | `filter.rs` | The list of conditions, and the `WHERE` expression that it compiles to |
 | `ddl.rs` | The `CREATE TABLE` statement for another database, and the rules behind it |
+| `config.rs` | The settings that Peruse keeps, and the resources of the machine |
 | `sql_guard.rs` | The code that rejects a statement that can write |
 | `worker.rs` | The background thread, the combination of requests and the epoch |
 | `model.rs` | The schema, the families of values, the pages of rows and the row count |

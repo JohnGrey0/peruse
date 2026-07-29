@@ -95,11 +95,72 @@ column gets the accent color.
 
 ## The panels
 
-The key `m` opens the metadata panel. The panel shows the rows from
-`FileMeta::summary_rows`, and then a list of the columns. The list follows the
-cursor of the grid, so the keys `h` and `l` scroll the panel and the grid
-together. For a Parquet file, each column shows its percentage of NULL values.
-For a CSV file, each column shows its type instead.
+Peruse has two panels and four states. The key `m` adds the metadata or
+removes it, the key `i` does the same for the column statistics, and the key
+`M` moves through the four states in order.
+
+| State | The side pane holds |
+|---|---|
+| `none` | nothing. The grid takes the full width. |
+| `meta` | the metadata |
+| `stats` | the statistics of the column under the cursor |
+| `both` | the metadata above, the statistics below |
+
+The setting `panels` keeps the choice between sessions, so a user who wants
+the two panels always gets them at the next start. See
+[settings.md](settings.md).
+
+### The stacked view
+
+In the state `both`, the metadata goes on top and the statistics below it. The
+order never changes, so the eye finds each of them in the same place.
+
+The statistics take a fixed height, and the metadata takes the room that is
+left. The statistics of a column have an end: some rows of numbers, a chart of
+one row, and the most frequent values. The list of columns in the metadata has
+no end, so it takes the remainder.
+
+A side pane that is shorter than 14 rows holds one panel only. Two panels with
+one row of text each are of no use. Peruse then draws the statistics and writes
+the reason along the bottom edge, because a panel that goes away with no word
+looks like a fault.
+
+The metadata panel goes into a short form in this view: it writes four rows of
+the summary and no read expression. The list of columns is the part that the
+user reads at each move of the cursor.
+
+### The metadata panel
+
+The panel shows the rows from `FileMeta::summary_rows`, and then a list of the
+columns. The list follows the cursor of the grid, so the keys `h` and `l`
+scroll the panel and the grid together. The list holds the column under the
+cursor in the middle, and it says how many columns are above and below it. A
+file with 400 columns therefore needs no keys of its own.
+
+For a Parquet file, each column shows its percentage of NULL values. For a CSV
+file and a JSON file, each column shows its type instead. The footer of a
+Parquet file holds the exact count, and it costs almost no time. A count for a
+file of text would need a scan, and the panel does not show an estimate.
+
+**A column that holds a structure opens.** The column under the cursor also
+shows its fields, one level deep and moved to the right:
+
+```text
+actor                     STRUCT(id BIGINT,…
+  id                                  BIGINT
+  login                              VARCHAR
+  gravatar_id                        VARCHAR
+repo                      STRUCT(id BIGINT,…
+```
+
+The fields come from the type of the column, through
+`model::struct_fields`. That text is the one source that each format gives: a
+Parquet footer names the leaves, and a CSV file and a JSON file name nothing.
+For a Parquet file, each field also finds its own count of NULL values,
+because the footer names a leaf by its path, such as `actor.login`.
+
+Only the column under the cursor opens. A file can hold hundreds of columns,
+and a list that opened each of them would be too long to read.
 
 At the end, the panel shows the `read_parquet` call or the `read_csv` call that
 reads the same rows outside Peruse. The user can look at the data and then copy
@@ -119,6 +180,25 @@ The key `i` opens the column statistics panel. The panel shows these parts:
 In a column of keys, each frequent value has the count 1. The panel then shows
 a short text instead of the bars, because a row of full bars would show a
 frequency that the data does not have.
+
+### The cost of the statistics
+
+The statistics of one column need a scan of the view: a count, a count of the
+different values, the smallest value, the largest value and the most frequent
+values. On a file of ten million rows that scan needs some hundred
+milliseconds.
+
+Two rules keep the panel quick, and they are the reason that the state `both`
+is usable at all:
+
+- **Peruse keeps each answer.** The value `stats_cache` holds the statistics of
+  each column that the engine measured for this view. A move back to a column
+  therefore needs no second scan. A change of the view empties the cache,
+  because the numbers describe the rows of one view.
+- **Peruse asks one time for each frame.** The function `App::ensure_stats`
+  runs after each frame, and not at each press of a key. A user who holds the
+  key `l` down moves across many columns between two frames, and each of those
+  columns would otherwise start a scan that nobody reads.
 
 ## The overlays
 

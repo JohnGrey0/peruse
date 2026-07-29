@@ -69,8 +69,83 @@ fn section(buf: &mut Buffer, area: Rect, y: u16, title: &str, p: &Paint, app: &A
     );
 }
 
+/// Writes a short text along the bottom edge of a panel.
+pub fn note(buf: &mut Buffer, area: Rect, app: &App, p: &Paint, text: &str) {
+    if area.height < 2 || area.width < 6 {
+        return;
+    }
+    let t = &app.theme;
+    let w = area.width.saturating_sub(4) as usize;
+    buf.set_stringn(
+        area.x + 2,
+        area.bottom().saturating_sub(1),
+        crate::text::truncate(text, w),
+        w,
+        p.on(t.warn, t.bg),
+    );
+}
+
+/// One line of the list of columns in the metadata panel.
+struct ColRow {
+    /// The level: 0 for a column of the file, 1 for a field of a structure.
+    depth: usize,
+    /// The name that the line shows.
+    name: String,
+    /// The name that the footer of a Parquet file uses for this value. For a
+    /// field of a structure, that name is the path, such as `actor.login`.
+    path: String,
+    /// The family of values, for the color.
+    kind: peruse_core::CellKind,
+    /// The short form of the type.
+    short_type: String,
+}
+
+/// Builds the list of columns that the metadata panel draws, and gives the
+/// position of the column under the cursor in that list.
+///
+/// The column under the cursor also shows its fields, when it holds a
+/// structure. A file of JSON events holds a column `actor` with five fields
+/// inside it, and the panel would say nothing about them.
+///
+/// Only the column under the cursor opens. A file can hold hundreds of
+/// columns, and a list that opened each of them would be too long to read.
+/// The user looks at one column at a time.
+fn column_rows(app: &App) -> (Vec<ColRow>, usize) {
+    let mut rows = Vec::with_capacity(app.schema.len() + 8);
+    let mut at = 0;
+    for (i, col) in app.schema.columns.iter().enumerate() {
+        if i == app.cursor_col {
+            at = rows.len();
+        }
+        rows.push(ColRow {
+            depth: 0,
+            name: col.name.clone(),
+            path: col.name.clone(),
+            kind: col.kind,
+            short_type: col.short_type(),
+        });
+        if i == app.cursor_col {
+            for f in peruse_core::model::struct_fields(&col.sql_type) {
+                rows.push(ColRow {
+                    depth: 1,
+                    name: f.name.clone(),
+                    // A Parquet footer names a leaf by its path.
+                    path: format!("{}.{}", col.name, f.name),
+                    kind: f.kind,
+                    short_type: f.short_type(),
+                });
+            }
+        }
+    }
+    (rows, at)
+}
+
 /// Draws the metadata panel.
-pub fn draw_meta(buf: &mut Buffer, area: Rect, app: &App, p: &Paint) {
+///
+/// With `compact`, the panel gives its room to the list of columns: it writes
+/// fewer rows of the summary and no read expression. The stacked view uses
+/// that form, because the statistics take the lower half of the side pane.
+pub fn draw_meta(buf: &mut Buffer, area: Rect, app: &App, p: &Paint, compact: bool) {
     let inner = frame(buf, area, "metadata", app, p);
     let t = &app.theme;
     let mut y = inner.y;
@@ -80,7 +155,11 @@ pub fn draw_meta(buf: &mut Buffer, area: Rect, app: &App, p: &Paint) {
         return;
     };
 
-    for (k, v) in meta.summary_rows() {
+    // A short panel shows the first rows of the summary only. The list of
+    // columns is the part that the user reads at each move of the cursor.
+    let summary = meta.summary_rows();
+    let take = if compact { 4.min(summary.len()) } else { summary.len() };
+    for (k, v) in summary.into_iter().take(take) {
         kv(buf, inner, y, &k, &v, p, app);
         y += 1;
     }
@@ -91,20 +170,22 @@ pub fn draw_meta(buf: &mut Buffer, area: Rect, app: &App, p: &Paint) {
 
     // The list follows the cursor of the grid. The panel therefore needs no
     // keys of its own: the keys h and l scroll the panel and the grid.
-    let rows_left = inner.bottom().saturating_sub(y) as usize;
-    let n = app.schema.len();
+    //
+    // The read expression takes the last rows, so the list stops above it.
+    let reserve = if compact { 0 } else { 2 };
+    let bottom = inner.bottom().saturating_sub(reserve);
+    let (rows, at) = column_rows(app);
+    let rows_left = bottom.saturating_sub(y) as usize;
+    let n = rows.len();
     let window = rows_left.min(n);
-    let start = app
-        .cursor_col
-        .saturating_sub(window / 2)
-        .min(n.saturating_sub(window));
+    let start = at.saturating_sub(window / 2).min(n.saturating_sub(window));
 
-    for i in start..(start + window).min(n) {
-        if y >= inner.bottom() {
+    let num_rows = meta.parquet.as_ref().map(|pq| pq.num_rows).unwrap_or(0);
+    for row in rows.iter().skip(start).take(window) {
+        if y >= bottom {
             break;
         }
-        let col = &app.schema.columns[i];
-        let focused = i == app.cursor_col;
+        let focused = row.depth == 0 && row.path == rows[at].path;
         let bg = if focused { t.cursor_row } else { t.bg };
         buf.set_stringn(
             inner.x,
@@ -115,33 +196,38 @@ pub fn draw_meta(buf: &mut Buffer, area: Rect, app: &App, p: &Paint) {
         );
 
         let name_w = (inner.width as usize).saturating_sub(20).max(6);
-        let style = crate::grid::kind_color(t, col.kind);
+        let style = crate::grid::kind_color(t, row.kind);
         let name_style = if focused {
             p.bold(p.on(style, bg))
         } else {
             p.on(style, bg)
         };
+        // A field of a structure moves to the right, so the eye sees that it
+        // belongs to the column above it.
+        let label = format!("{}{}", "  ".repeat(row.depth), row.name);
         buf.set_stringn(
             inner.x,
             y,
-            text::fit(&col.name, name_w, Align::Left),
+            text::fit(&label, name_w, Align::Left),
             name_w,
             name_style,
         );
 
         // For a Parquet file, the NULL count from the footer is exact and
-        // costs almost no time. For a CSV file, the panel shows the type
-        // instead. It does not show an estimate.
+        // costs almost no time. The footer names a field of a structure by
+        // its path, so a field finds its own count.
+        //
+        // For a CSV file and a JSON file, the footer holds nothing. The panel
+        // shows the type instead, and it does not show an estimate.
         let nulls = meta
             .columns
             .iter()
-            .find(|c| c.name == col.name)
+            .find(|c| c.name == row.path)
             .and_then(|c| c.null_count)
-            .zip(meta.parquet.as_ref().map(|pq| pq.num_rows))
-            .filter(|(_, rows)| *rows > 0)
-            .map(|(nulls, rows)| format!("{:.0}% null", nulls as f64 * 100.0 / rows as f64));
+            .filter(|_| num_rows > 0)
+            .map(|nulls| format!("{:.0}% null", nulls as f64 * 100.0 / num_rows as f64));
 
-        let right = nulls.unwrap_or_else(|| col.short_type());
+        let right = nulls.unwrap_or_else(|| row.short_type.clone());
         let rw = (inner.width as usize).saturating_sub(name_w + 1);
         buf.set_stringn(
             inner.x + name_w as u16 + 1,
@@ -153,27 +239,35 @@ pub fn draw_meta(buf: &mut Buffer, area: Rect, app: &App, p: &Paint) {
         y += 1;
     }
 
-    if start + window < n {
-        let more = format!("… {} more (l / h to scroll)", n - (start + window));
-        if y < inner.bottom() {
-            buf.set_stringn(inner.x, y, &more, inner.width as usize, p.on(t.dim, t.bg));
-        }
+    // Say how many columns are outside the window. A file with 400 columns
+    // shows about fifteen of them, and the user must know that.
+    if window < n && y < bottom {
+        let above = start;
+        let below = n - (start + window);
+        let more = match (above, below) {
+            (0, b) => format!("… {b} more below"),
+            (a, 0) => format!("… {a} more above"),
+            (a, b) => format!("… {a} above, {b} below"),
+        };
+        buf.set_stringn(inner.x, y, &more, inner.width as usize, p.on(t.dim, t.bg));
         y += 1;
     }
 
     // The call that reads the same rows outside Peruse. The user can look at
     // the data and then write a script with these options. The user does not
     // need to find the options of the sniffer again.
-    y += 1;
-    if y + 1 < inner.bottom() {
-        section(buf, inner, y, "reads as", p, app);
+    if !compact {
         y += 1;
-        for line in text::wrap(&app.read_expr, inner.width as usize) {
-            if y >= inner.bottom() {
-                break;
-            }
-            buf.set_stringn(inner.x, y, &line, inner.width as usize, p.on(t.lit, t.bg));
+        if y + 1 < inner.bottom() {
+            section(buf, inner, y, "reads as", p, app);
             y += 1;
+            for line in text::wrap(&app.read_expr, inner.width as usize) {
+                if y >= inner.bottom() {
+                    break;
+                }
+                buf.set_stringn(inner.x, y, &line, inner.width as usize, p.on(t.lit, t.bg));
+                y += 1;
+            }
         }
     }
 }
@@ -190,14 +284,10 @@ pub fn draw_stats(buf: &mut Buffer, area: Rect, app: &App, p: &Paint) {
     let t = &app.theme;
     let mut y = inner.y;
 
-    let Some(s) = &app.stats else {
+    let Some(s) = app.stats() else {
         buf.set_stringn(inner.x, y, "computing…", inner.width as usize, p.on(t.dim, t.bg));
         return;
     };
-    if s.column != title {
-        buf.set_stringn(inner.x, y, "computing…", inner.width as usize, p.on(t.dim, t.bg));
-        return;
-    }
 
     for (k, v) in s.rows() {
         kv(buf, inner, y, &k, &v, p, app);

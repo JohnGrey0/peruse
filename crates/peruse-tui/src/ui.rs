@@ -105,11 +105,42 @@ pub fn draw(f: &mut Frame, app: &mut App, depth: Depth) {
     let _ = t;
 }
 
-/// Draws the panel that is open.
+/// The smallest height that holds the two panels, one above the other.
+///
+/// Below this, each of the two would have one row of text inside its border.
+/// One panel with room to say something is more use than two with none.
+const BOTH_PANELS_MIN_HEIGHT: u16 = 14;
+/// The rows that the statistics take in the stacked view.
+///
+/// The statistics of a column have an end: some rows of numbers, a chart of
+/// one row, and the most frequent values. The metadata holds the list of
+/// columns, which has no end, so the metadata takes the room that is left.
+const STATS_HEIGHT: u16 = 18;
+
+/// Draws the panel that is open, or the two panels one above the other.
 fn draw_panel(f: &mut Frame, area: Rect, app: &App, p: &Paint) {
     match app.panel {
-        Panel::Meta => panels::draw_meta(f.buffer_mut(), area, app, p),
+        Panel::Meta => panels::draw_meta(f.buffer_mut(), area, app, p, false),
         Panel::Stats => panels::draw_stats(f.buffer_mut(), area, app, p),
+        Panel::Both => {
+            if area.height < BOTH_PANELS_MIN_HEIGHT {
+                // Say why the second panel is not there. A panel that goes
+                // away with no word looks like a fault.
+                panels::draw_stats(f.buffer_mut(), area, app, p);
+                panels::note(f.buffer_mut(), area, app, p, " screen too short for both ");
+                return;
+            }
+            // The metadata goes on top, and the statistics below it. The
+            // order never changes, so the eye finds each of them in the same
+            // place.
+            let stats_h = STATS_HEIGHT.min(area.height / 2).max(8);
+            let parts = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Min(6), Constraint::Length(stats_h)])
+                .split(area);
+            panels::draw_meta(f.buffer_mut(), parts[0], app, p, true);
+            panels::draw_stats(f.buffer_mut(), parts[1], app, p);
+        }
         Panel::None => {}
     }
 }

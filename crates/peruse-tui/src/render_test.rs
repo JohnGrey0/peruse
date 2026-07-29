@@ -1222,7 +1222,7 @@ fn the_memory_limit_takes_whole_gigabytes_only() {
 }
 
 #[test]
-fn with_no_setting_duckdb_gets_a_quarter_of_the_machine() {
+fn with_no_setting_duckdb_gets_half_of_the_machine() {
     // Without a limit DuckDB takes 80 percent of the memory for itself, and
     // a viewer of data is not the only program that the user runs.
     let r = peruse_core::config::Resources::read();
@@ -1230,4 +1230,128 @@ fn with_no_setting_duckdb_gets_a_quarter_of_the_machine() {
         assert!(gb >= 1);
         assert_eq!(r.default_memory_text(), Some(format!("{gb}GiB")));
     }
+}
+
+#[test]
+fn both_panels_stack_with_metadata_above_the_statistics() {
+    let p = write_sample("panels-both", SAMPLE, "csv");
+    let (mut app, mut term) = open(&p);
+    settle(&mut app, &mut term);
+
+    app.run(Cmd::CyclePanels); // meta
+    app.run(Cmd::CyclePanels); // stats
+    app.run(Cmd::CyclePanels); // both
+    assert_eq!(app.panel, Panel::Both);
+    settle(&mut app, &mut term);
+
+    let rows = lines(&term);
+    let meta_at = rows.iter().position(|l| l.contains("metadata"));
+    let stats_at = rows.iter().position(|l| l.contains("stddev"));
+    assert!(meta_at.is_some(), "no metadata panel\n{}", screen(&term));
+    assert!(stats_at.is_some(), "no statistics panel\n{}", screen(&term));
+    // The order never changes, so the eye finds each of them in one place.
+    assert!(
+        meta_at < stats_at,
+        "the metadata must be above the statistics\n{}",
+        screen(&term)
+    );
+}
+
+#[test]
+fn the_two_panel_keys_add_and_remove_one_panel_each() {
+    let p = write_sample("panels-keys", SAMPLE, "csv");
+    let (mut app, mut term) = open(&p);
+    settle(&mut app, &mut term);
+
+    app.run(Cmd::ToggleMeta);
+    assert_eq!(app.panel, Panel::Meta);
+    // The second key adds its panel and keeps the first one.
+    app.run(Cmd::ToggleStats);
+    assert_eq!(app.panel, Panel::Both);
+    // Each key then removes its own panel only.
+    app.run(Cmd::ToggleMeta);
+    assert_eq!(app.panel, Panel::Stats);
+    app.run(Cmd::ToggleStats);
+    assert_eq!(app.panel, Panel::None);
+}
+
+#[test]
+fn the_panels_of_the_settings_file_are_on_the_screen_at_the_start() {
+    let p = write_sample("panels-setting", SAMPLE, "csv");
+    let (mut app, mut term) = open(&p);
+    app.set_panel_from_setting("both");
+    settle(&mut app, &mut term);
+    assert_eq!(app.panel, Panel::Both);
+    assert!(screen(&term).contains("metadata"), "{}", screen(&term));
+
+    // A name that Peruse does not know leaves the screen with no panel, and
+    // it says so. A setting must not stop the program.
+    app.set_panel_from_setting("nonsense");
+    settle(&mut app, &mut term);
+    assert!(screen(&term).contains("is not a panel"), "{}", screen(&term));
+}
+
+#[test]
+fn the_metadata_panel_opens_the_fields_of_a_structure() {
+    // A JSON file holds a column that holds other values. The panel said
+    // nothing about those fields before.
+    let body = "[{\"id\":1,\"actor\":{\"login\":\"alice\",\"site_admin\":false}}]";
+    let p = write_sample("panels-struct", body, "json");
+    let (mut app, mut term) = open(&p);
+    settle(&mut app, &mut term);
+
+    // A line of the panel holds the name of the field and its type. The grid
+    // also writes the text of the structure, so the name by itself is not a
+    // test of the panel.
+    fn field_line(term: &Terminal<TestBackend>, name: &str, ty: &str) -> bool {
+        lines(term).iter().any(|l| l.contains(name) && l.contains(ty))
+    }
+
+    app.run(Cmd::ToggleMeta);
+    settle(&mut app, &mut term);
+    // The cursor is on `id`, so the panel opens no structure.
+    assert!(
+        !field_line(&term, "site_admin", "BOOLEAN"),
+        "a structure opened before the cursor reached it\n{}",
+        screen(&term)
+    );
+
+    app.run(Cmd::ColRight); // actor
+    settle(&mut app, &mut term);
+    assert!(
+        field_line(&term, "login", "VARCHAR"),
+        "no field of the structure\n{}",
+        screen(&term)
+    );
+    assert!(
+        field_line(&term, "site_admin", "BOOLEAN"),
+        "no field of the structure\n{}",
+        screen(&term)
+    );
+}
+
+#[test]
+fn moving_across_the_columns_asks_for_each_column_one_time() {
+    let p = write_sample("panels-cache", SAMPLE, "csv");
+    let (mut app, mut term) = open(&p);
+    settle(&mut app, &mut term);
+    app.run(Cmd::ToggleStats);
+    settle(&mut app, &mut term);
+
+    // Move to the end and back again. The statistics of a column cost a
+    // scan, so the second visit must read the answer that Peruse kept.
+    for _ in 0..3 {
+        app.run(Cmd::ColRight);
+        settle(&mut app, &mut term);
+    }
+    for _ in 0..3 {
+        app.run(Cmd::ColLeft);
+    }
+    // No settle: the answer is there already, so the panel needs no wait.
+    app.ensure_rows();
+    assert!(
+        app.stats().is_some(),
+        "the statistics of a column were not kept"
+    );
+    assert_eq!(app.stats().map(|s| s.column.as_str()), Some("id"));
 }

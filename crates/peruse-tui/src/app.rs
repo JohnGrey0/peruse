@@ -113,6 +113,8 @@ pub enum Setting {
     SampleSize,
     /// Whether Peruse indexes a file of text when it opens the file.
     NoIndex,
+    /// The panels that stay at the side of the grid.
+    Panels,
 }
 
 impl Setting {
@@ -123,6 +125,7 @@ impl Setting {
         Setting::MemoryLimit,
         Setting::SampleSize,
         Setting::NoIndex,
+        Setting::Panels,
     ];
 
     /// The name that the page shows.
@@ -133,6 +136,7 @@ impl Setting {
             Setting::MemoryLimit => "memory limit",
             Setting::SampleSize => "sample size",
             Setting::NoIndex => "index at open",
+            Setting::Panels => "panels",
         }
     }
 
@@ -144,6 +148,7 @@ impl Setting {
             Setting::MemoryLimit => "such as 4GB, before DuckDB writes to the disk",
             Setting::SampleSize => "rows the sniffer reads. -1 reads the whole file",
             Setting::NoIndex => "index a file of text at the start, for instant jumps",
+            Setting::Panels => "keep at the side: none, meta, stats or both",
         }
     }
 
@@ -207,14 +212,59 @@ impl Default for Draft {
 }
 
 /// The panel at the side of the grid, or below it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Panel {
     /// No panel is open.
+    #[default]
     None,
     /// The metadata panel is open.
     Meta,
     /// The column statistics panel is open.
     Stats,
+    /// Both panels are open, one above the other.
+    Both,
+}
+
+impl Panel {
+    /// Gives `true` when the metadata is on the screen.
+    pub fn has_meta(self) -> bool {
+        matches!(self, Panel::Meta | Panel::Both)
+    }
+    /// Gives `true` when the statistics of the column are on the screen.
+    pub fn has_stats(self) -> bool {
+        matches!(self, Panel::Stats | Panel::Both)
+    }
+
+    /// Reads a panel from the name that the settings file holds.
+    pub fn parse(s: &str) -> Option<Panel> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "none" | "" => Some(Panel::None),
+            "meta" | "metadata" => Some(Panel::Meta),
+            "stats" | "statistics" => Some(Panel::Stats),
+            "both" => Some(Panel::Both),
+            _ => None,
+        }
+    }
+
+    /// Gives the name that the settings file holds.
+    pub fn name(self) -> &'static str {
+        match self {
+            Panel::None => "none",
+            Panel::Meta => "meta",
+            Panel::Stats => "stats",
+            Panel::Both => "both",
+        }
+    }
+
+    /// Gives the next panel, for a key that moves through the four.
+    pub fn next(self) -> Panel {
+        match self {
+            Panel::None => Panel::Meta,
+            Panel::Meta => Panel::Stats,
+            Panel::Stats => Panel::Both,
+            Panel::Both => Panel::None,
+        }
+    }
 }
 
 /// The kind of a message on the status line.
@@ -360,8 +410,16 @@ pub struct App {
     /// `true` while the worker has work to do.
     pub busy: bool,
 
-    /// The statistics of the column under the cursor.
-    pub stats: Option<ColumnStats>,
+    /// The statistics of each column that the engine measured for this view.
+    ///
+    /// The statistics of a column cost a scan, so Peruse keeps each answer
+    /// until the view changes. Without this, a move across the columns with
+    /// the statistics on the screen would ask for the same numbers again at
+    /// each step back.
+    stats_cache: std::collections::HashMap<String, ColumnStats>,
+    /// The column that the engine measures now. It stops Peruse from asking
+    /// for the same column two times.
+    stats_pending: Option<String>,
     /// The metadata of the file.
     pub meta: Option<FileMeta>,
     /// The complete value in the cell inspector.
@@ -503,7 +561,8 @@ impl App {
             status: None,
             busy: false,
 
-            stats: None,
+            stats_cache: std::collections::HashMap::new(),
+            stats_pending: None,
             meta: None,
             cell_value: None,
             cell_scroll: 0,
@@ -623,7 +682,10 @@ impl App {
         self.page = RowPage::default();
         self.page_limit = 0;
         self.requested = None;
-        self.stats = None;
+        // The statistics describe the rows of one view. A new view therefore
+        // makes each answer wrong.
+        self.stats_cache.clear();
+        self.stats_pending = None;
         // A match offset has no meaning in a different view.
         self.hits.clear();
         self.hits_complete = false;
@@ -655,6 +717,7 @@ impl App {
     /// Peruse calls this function after each frame, because the true height of
     /// the viewport is known only then.
     pub fn ensure_rows(&mut self) {
+        self.ensure_stats();
         if self.schema.is_empty() {
             return;
         }
@@ -711,17 +774,60 @@ impl App {
         let at = vis.iter().position(|c| *c == self.cursor_col).unwrap_or(0);
         let next = (at as i64 + delta).clamp(0, vis.len() as i64 - 1) as usize;
         self.cursor_col = vis[next];
-        self.stats = None;
-        if self.panel == Panel::Stats {
-            self.request_stats();
+    }
+
+    /// Puts the panels of the settings file on the screen at the start.
+    ///
+    /// A name that Peruse does not know leaves the screen with no panel. A
+    /// setting is not a reason to refuse to open a file.
+    pub fn set_panel_from_setting(&mut self, name: &str) {
+        match Panel::parse(name) {
+            Some(p) => {
+                self.panel = p;
+                self.after_panel_change();
+            }
+            None => self.error(format!("settings: {name:?} is not a panel")),
         }
     }
 
-    /// Asks the worker for the statistics of the column under the cursor.
-    fn request_stats(&mut self) {
+    /// Asks for what a new panel needs.
+    ///
+    /// The statistics come at the next frame, through
+    /// [`App::ensure_stats`]. The metadata needs one request, and it needs it
+    /// one time for the file.
+    fn after_panel_change(&mut self) {
+        if self.panel.has_meta() && self.meta.is_none() {
+            self.worker.send(Request::Meta { epoch: self.epoch });
+        }
+    }
+
+    /// Gives the statistics of the column under the cursor, when the engine
+    /// measured them already.
+    pub fn stats(&self) -> Option<&ColumnStats> {
+        let name = &self.schema.columns.get(self.cursor_col)?.name;
+        self.stats_cache.get(name)
+    }
+
+    /// Asks the worker for the statistics of the column under the cursor,
+    /// when the screen needs them and the cache does not hold them.
+    ///
+    /// The caller runs this one time for each frame, and not one time for
+    /// each press of a key. A user who holds a key down moves across many
+    /// columns between two frames, and each of those columns would otherwise
+    /// start a scan that nobody reads.
+    fn ensure_stats(&mut self) {
+        if !self.panel.has_stats() {
+            return;
+        }
         let Some(col) = self.schema.columns.get(self.cursor_col).cloned() else {
             return;
         };
+        if self.stats_cache.contains_key(&col.name)
+            || self.stats_pending.as_deref() == Some(col.name.as_str())
+        {
+            return;
+        }
+        self.stats_pending = Some(col.name.clone());
         self.worker.send(Request::Stats {
             epoch: self.epoch,
             view: self.view.clone(),
@@ -839,7 +945,12 @@ impl App {
                     self.follow_cursor();
                 }
             }
-            Response::Stats { stats, .. } => self.stats = Some(*stats),
+            Response::Stats { stats, .. } => {
+                if self.stats_pending.as_deref() == Some(stats.column.as_str()) {
+                    self.stats_pending = None;
+                }
+                self.stats_cache.insert(stats.column.clone(), *stats);
+            }
             Response::RowJson { row, json, .. } => {
                 // The user can move to another row while this answer is on
                 // its way. The epoch cannot see that, because the view did
@@ -1731,6 +1842,7 @@ impl App {
                 Some(false) => "yes".into(),
                 None => String::new(),
             },
+            Setting::Panels => self.config.panels.clone().unwrap_or_default(),
         }
     }
 
@@ -1742,10 +1854,11 @@ impl App {
             Setting::MemoryLimit => self
                 .resources
                 .default_memory_gb()
-                .map(|gb| format!("{gb} GB (a quarter of this machine)"))
+                .map(|gb| format!("{gb} GB (half of this machine)"))
                 .unwrap_or_else(|| "the rule of DuckDB".into()),
             Setting::SampleSize => "20,480 rows".into(),
             Setting::NoIndex => "yes, below 256 MB".into(),
+            Setting::Panels => "none".into(),
         }
     }
 
@@ -1881,6 +1994,26 @@ impl App {
                     }
                 }
             }
+            Setting::Panels => {
+                if empty {
+                    self.config.panels = None;
+                    self.panel = Panel::None;
+                } else {
+                    match Panel::parse(t) {
+                        Some(pan) => {
+                            self.panel = pan;
+                            self.config.panels = Some(pan.name().to_string());
+                            self.after_panel_change();
+                        }
+                        None => {
+                            self.error(format!(
+                                "panels: write none, meta, stats or both (got {t:?})"
+                            ));
+                            return;
+                        }
+                    }
+                }
+            }
             Setting::NoIndex => {
                 self.config.no_index = match t.to_ascii_lowercase().as_str() {
                     "" => None,
@@ -1966,7 +2099,7 @@ impl App {
                     Setting::MemoryLimit => match self.resources.default_memory_gb() {
                         Some(gb) => {
                             self.commit_setting(s, &gb.to_string());
-                            self.ok(format!("memory limit: {gb} GB, a quarter of this machine"));
+                            self.ok(format!("memory limit: {gb} GB, half of this machine"));
                         }
                         None => self.error("this system does not report its memory"),
                     },
@@ -2545,17 +2678,39 @@ impl App {
             Cmd::SearchNext => self.search(true),
             Cmd::SearchPrev => self.search(false),
 
+            // The key adds the panel to the screen, or removes it. It keeps
+            // the other panel, so the two keys together give the view with
+            // both of them.
             Cmd::ToggleMeta => {
-                self.panel = if self.panel == Panel::Meta { Panel::None } else { Panel::Meta };
-                if self.panel == Panel::Meta && self.meta.is_none() {
-                    self.worker.send(Request::Meta { epoch: self.epoch });
-                }
+                self.panel = match self.panel {
+                    Panel::Meta => Panel::None,
+                    Panel::Both => Panel::Stats,
+                    Panel::Stats => Panel::Both,
+                    Panel::None => Panel::Meta,
+                };
+                self.after_panel_change();
             }
             Cmd::ToggleStats => {
-                self.panel = if self.panel == Panel::Stats { Panel::None } else { Panel::Stats };
-                if self.panel == Panel::Stats {
-                    self.request_stats();
-                }
+                self.panel = match self.panel {
+                    Panel::Stats => Panel::None,
+                    Panel::Both => Panel::Meta,
+                    Panel::Meta => Panel::Both,
+                    Panel::None => Panel::Stats,
+                };
+                self.after_panel_change();
+            }
+            // One key moves through the four states, for a user who does not
+            // want to remember which key adds which panel.
+            Cmd::CyclePanels => {
+                self.panel = self.panel.next();
+                self.after_panel_change();
+                let name = match self.panel {
+                    Panel::None => "no panel",
+                    Panel::Meta => "metadata",
+                    Panel::Stats => "column statistics",
+                    Panel::Both => "metadata and statistics",
+                };
+                self.ok(name);
             }
             Cmd::Record => self.open_record(),
             Cmd::InspectCell => {

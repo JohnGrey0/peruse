@@ -158,6 +158,87 @@ impl Column {
     }
 }
 
+/// Reads the fields of a `STRUCT` type, one level deep.
+///
+/// DuckDB writes the type of a structure as text:
+///
+/// ```text
+/// STRUCT(id BIGINT, "login" VARCHAR, tags VARCHAR[], inner STRUCT(a INTEGER))
+/// ```
+///
+/// The metadata panel shows those fields, so a user can see what a column
+/// holds without opening a row. The text is the one source that each format
+/// gives: a Parquet footer names the leaves, and a CSV file and a JSON file
+/// name nothing at all.
+///
+/// The function gives an empty list for a type that is not a structure.
+///
+/// A field of a list of structures, such as `STRUCT(a INTEGER)[]`, is not a
+/// structure at this level. The function gives an empty list for it, and the
+/// record view is the place that opens such a value.
+pub fn struct_fields(sql_type: &str) -> Vec<Column> {
+    let t = sql_type.trim();
+    if !t.to_ascii_uppercase().starts_with("STRUCT(") || !t.ends_with(')') {
+        return Vec::new();
+    }
+    let inner = &t["STRUCT(".len()..t.len() - 1];
+
+    let mut out = Vec::new();
+    let mut depth = 0i32;
+    let mut quoted = false;
+    let mut part = String::new();
+    for c in inner.chars() {
+        match c {
+            // Two quotation marks inside a name are one quotation mark. The
+            // state therefore turns off and on again, which is correct.
+            '"' => {
+                quoted = !quoted;
+                part.push(c);
+            }
+            '(' | '[' if !quoted => {
+                depth += 1;
+                part.push(c);
+            }
+            ')' | ']' if !quoted => {
+                depth -= 1;
+                part.push(c);
+            }
+            ',' if !quoted && depth == 0 => {
+                push_field(&mut out, &part);
+                part.clear();
+            }
+            _ => part.push(c),
+        }
+    }
+    push_field(&mut out, &part);
+    out
+}
+
+/// Reads one `name type` pair from the text of a structure type.
+fn push_field(out: &mut Vec<Column>, part: &str) {
+    let s = part.trim();
+    if s.is_empty() {
+        return;
+    }
+    // The name comes first. A name in quotation marks can hold a space, so
+    // the split must respect the marks.
+    let (name, ty) = if let Some(rest) = s.strip_prefix('"') {
+        match rest.find('"') {
+            Some(end) => (rest[..end].replace("\"\"", "\""), rest[end + 1..].trim()),
+            None => return,
+        }
+    } else {
+        match s.find(' ') {
+            Some(i) => (s[..i].to_string(), s[i + 1..].trim()),
+            None => return,
+        }
+    };
+    if name.is_empty() || ty.is_empty() {
+        return;
+    }
+    out.push(Column::new(name, ty, true));
+}
+
 /// The columns of the view, in the order that the grid shows them.
 #[derive(Clone, Debug, Default)]
 pub struct Schema {
@@ -355,6 +436,64 @@ mod tests {
         assert_eq!(page.abs_row(1), 101);
         assert!(page.contains(101));
         assert!(!page.contains(102));
+    }
+
+    #[test]
+    fn the_fields_of_a_structure_come_from_its_type() {
+        let f = struct_fields("STRUCT(id BIGINT, login VARCHAR, avatar_url VARCHAR)");
+        let names: Vec<&str> = f.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["id", "login", "avatar_url"]);
+        assert_eq!(f[0].sql_type, "BIGINT");
+        assert_eq!(f[0].kind, CellKind::Number);
+        assert_eq!(f[1].kind, CellKind::Text);
+    }
+
+    #[test]
+    fn a_structure_inside_a_structure_stays_one_field() {
+        // The comma inside the inner structure does not break the outer one.
+        let f = struct_fields("STRUCT(a INTEGER, b STRUCT(c INTEGER, d VARCHAR), e DATE)");
+        let names: Vec<&str> = f.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["a", "b", "e"]);
+        assert_eq!(f[1].sql_type, "STRUCT(c INTEGER, d VARCHAR)");
+        assert_eq!(f[1].kind, CellKind::Nested);
+        // The inner structure opens in the same way.
+        let inner = struct_fields(&f[1].sql_type);
+        assert_eq!(inner.len(), 2);
+        assert_eq!(inner[1].name, "d");
+    }
+
+    #[test]
+    fn a_list_inside_a_structure_stays_one_field() {
+        let f = struct_fields("STRUCT(tags VARCHAR[], commits STRUCT(sha VARCHAR)[])");
+        let names: Vec<&str> = f.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["tags", "commits"]);
+        assert_eq!(f[0].kind, CellKind::Nested);
+        assert_eq!(f[1].sql_type, "STRUCT(sha VARCHAR)[]");
+    }
+
+    #[test]
+    fn a_field_name_in_quotation_marks_keeps_its_spaces() {
+        let f = struct_fields("STRUCT(\"first name\" VARCHAR, \"a,b\" INTEGER, plain DATE)");
+        let names: Vec<&str> = f.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["first name", "a,b", "plain"]);
+        assert_eq!(f[1].sql_type, "INTEGER");
+    }
+
+    #[test]
+    fn a_type_that_is_not_a_structure_gives_no_field() {
+        for ty in ["VARCHAR", "BIGINT", "INTEGER[]", "STRUCT(a INTEGER)[]", "", "MAP(VARCHAR, INTEGER)"] {
+            assert!(struct_fields(ty).is_empty(), "type {ty:?} gave fields");
+        }
+    }
+
+    #[test]
+    fn a_type_that_is_cut_short_does_not_stop_the_program() {
+        // A type of some thousand characters can arrive cut short. The
+        // function must give what it can read, and must not panic.
+        let full = "STRUCT(a INTEGER, b VARCHAR, c DATE)";
+        for n in 1..full.len() {
+            let _ = struct_fields(&full[..n]);
+        }
     }
 
     #[test]
