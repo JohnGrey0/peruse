@@ -17,9 +17,10 @@ use duckdb::{Connection, InterruptHandle};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use crate::ddl::{ColumnProfile, TableProfile};
 use crate::meta::{ColumnFooterStats, CsvMeta, FileEntry, FileMeta, ParquetMeta};
 use crate::model::{CellKind, Column, RowPage, Schema};
-use crate::query::{quote_str, View};
+use crate::query::{quote_ident, quote_str, View};
 use crate::source::{self, Format, Source};
 use crate::stats::{CellKindWrapper, ColumnStats, Histogram};
 
@@ -622,6 +623,211 @@ impl Engine {
         matches!(self.source.format, Format::Parquet | Format::Arrow) || self.indexed
     }
 
+    /// Measures the file, so that [`crate::ddl`] can write a `CREATE TABLE`
+    /// statement for another database.
+    ///
+    /// The function makes two queries at the most:
+    ///
+    /// 1. One query that measures each column. It holds four aggregates for
+    ///    each column, and it reads the file one time.
+    /// 2. One query that looks for a key of two columns, and only when no
+    ///    single column is unique.
+    ///
+    /// The count of the different values is close, and not exact.
+    /// `approx_count_distinct` reads the file one time and uses little
+    /// memory. An exact count of each column of a large file needs much more
+    /// of both. The function counts the key exactly at the end, because a key
+    /// that is wrong is worse than a key that arrives slowly.
+    pub fn profile(&self, view: &View, table: &str) -> Result<TableProfile> {
+        let schema = self.describe(view)?;
+        let rows = self.count(view)?;
+        if schema.is_empty() {
+            return Ok(TableProfile {
+                table: table.to_string(),
+                rows,
+                columns: Vec::new(),
+                key: Vec::new(),
+                key_is_exact: true,
+            });
+        }
+
+        let mut parts: Vec<String> = Vec::new();
+        for c in &schema.columns {
+            let id = quote_ident(&c.name);
+            parts.push(format!("count({id})"));
+            parts.push(format!("approx_count_distinct({id})"));
+            // The length has a meaning for a column of text only. A cast of
+            // a large column of numbers would cost time and give nothing.
+            if matches!(c.kind, CellKind::Text | CellKind::Nested) {
+                parts.push(format!("max(length(CAST({id} AS VARCHAR)))"));
+            } else {
+                parts.push("NULL".to_string());
+            }
+        }
+        let sql = format!(
+            "SELECT {} {}",
+            parts.join(", "),
+            view.scan_from()
+        );
+
+        let mut columns: Vec<ColumnProfile> = Vec::new();
+        self.conn.query_row(&sql, [], |r| {
+            for (i, c) in schema.columns.iter().enumerate() {
+                let present = r.get::<_, Value>(i * 3).ok().and_then(|v| to_u64(&v)).unwrap_or(0);
+                let distinct = r
+                    .get::<_, Value>(i * 3 + 1)
+                    .ok()
+                    .and_then(|v| to_u64(&v))
+                    .unwrap_or(0);
+                let max_len = r.get::<_, Value>(i * 3 + 2).ok().and_then(|v| to_u64(&v));
+                columns.push(ColumnProfile {
+                    name: c.name.clone(),
+                    sql_type: c.sql_type.clone(),
+                    kind: c.kind,
+                    nulls: rows.saturating_sub(present),
+                    // The count is close. It can give one more value than
+                    // the file holds, and a count above the number of rows
+                    // would confuse the reader.
+                    distinct: distinct.min(rows),
+                    max_len,
+                });
+            }
+            Ok(())
+        })?;
+
+        let (key, key_is_exact) = self.find_key(view, &schema, &columns, rows)?;
+        Ok(TableProfile {
+            table: table.to_string(),
+            rows,
+            columns,
+            key,
+            key_is_exact,
+        })
+    }
+
+    /// Looks for a group of columns that is unique over each row.
+    ///
+    /// The function tries one column first. If no column is unique, it tries
+    /// each pair of the columns that come nearest to unique. A key of three
+    /// columns or more is rare, and the search for one costs much more, so
+    /// the function stops at two.
+    fn find_key(
+        &self,
+        view: &View,
+        schema: &Schema,
+        cols: &[ColumnProfile],
+        rows: u64,
+    ) -> Result<(Vec<usize>, bool)> {
+        // A file with no row has no key to find.
+        if rows == 0 {
+            return Ok((Vec::new(), true));
+        }
+        let usable = |i: usize| -> bool {
+            // A key holds no NULL, and no value that the database cannot
+            // compare in an index. A measure is also not a key: a price or a
+            // count can be unique by accident, and it is still the wrong
+            // column to identify a row by.
+            cols[i].nulls == 0
+                && !matches!(cols[i].kind, CellKind::Binary | CellKind::Nested)
+                && !crate::ddl::is_measure(&cols[i].sql_type)
+        };
+
+        // Try the columns that look like a key first, and then the columns
+        // from the left. Each true key holds one different value for each
+        // row, so the count of the values cannot put one candidate in front
+        // of another. The name and the position can.
+        let mut singles: Vec<usize> = (0..cols.len()).filter(|i| usable(*i)).collect();
+        singles.sort_by_key(|i| (!crate::ddl::is_key_name(&cols[*i].name), *i));
+
+        // The count of the values is close, so test each candidate exactly
+        // before Peruse writes it into a statement.
+        let mut tried = 0;
+        for &i in &singles {
+            // A column that is far from unique cannot become unique.
+            if cols[i].distinct * 100 < rows * 99 {
+                continue;
+            }
+            if self.exact_distinct(view, &[&schema.columns[i].name])? == rows {
+                return Ok((vec![i], true));
+            }
+            tried += 1;
+            if tried >= 4 {
+                break;
+            }
+        }
+
+        // Two columns. A pair is unique only when its two columns hold many
+        // values between them, so the columns with the most values are the
+        // candidates here. One query measures each pair, so the file is read
+        // one time and not one time for each pair.
+        singles.sort_by_key(|i| std::cmp::Reverse(cols[*i].distinct));
+        let cand: Vec<usize> = singles.into_iter().take(6).collect();
+        if cand.len() < 2 {
+            return Ok((Vec::new(), true));
+        }
+        let pairs: Vec<(usize, usize)> = (0..cand.len())
+            .flat_map(|a| (a + 1..cand.len()).map(move |b| (a, b)))
+            .map(|(a, b)| (cand[a], cand[b]))
+            .collect();
+        let parts: Vec<String> = pairs
+            .iter()
+            .map(|(a, b)| {
+                // Join the two values with a character that no value holds,
+                // so that the pair ("ab", "c") and the pair ("a", "bc") do
+                // not look the same.
+                format!(
+                    "approx_count_distinct(concat_ws(chr(31), CAST({} AS VARCHAR), CAST({} AS VARCHAR)))",
+                    quote_ident(&schema.columns[*a].name),
+                    quote_ident(&schema.columns[*b].name)
+                )
+            })
+            .collect();
+        let sql = format!(
+            "SELECT {} {}",
+            parts.join(", "),
+            view.scan_from()
+        );
+        let mut best: Option<(usize, usize)> = None;
+        let mut best_n = 0u64;
+        self.conn.query_row(&sql, [], |r| {
+            for (i, pair) in pairs.iter().enumerate() {
+                let n = r.get::<_, Value>(i).ok().and_then(|v| to_u64(&v)).unwrap_or(0);
+                if n > best_n {
+                    best_n = n;
+                    best = Some(*pair);
+                }
+            }
+            Ok(())
+        })?;
+
+        // The count is close, so a pair that is truly unique can come back a
+        // little below the number of rows. Test the best pair exactly.
+        if let Some((a, b)) = best
+            && best_n * 100 >= rows * 99
+        {
+            let names = [
+                schema.columns[a].name.as_str(),
+                schema.columns[b].name.as_str(),
+            ];
+            if self.exact_distinct(view, &names)? == rows {
+                return Ok((vec![a, b], true));
+            }
+        }
+        Ok((Vec::new(), true))
+    }
+
+    /// Counts the different values of one group of columns, exactly.
+    fn exact_distinct(&self, view: &View, names: &[&str]) -> Result<u64> {
+        let list: Vec<String> = names.iter().map(|n| quote_ident(n)).collect();
+        let sql = format!(
+            "SELECT count(*) FROM (SELECT DISTINCT {} {})",
+            list.join(", "),
+            view.scan_from()
+        );
+        let n: i64 = self.conn.query_row(&sql, [], |r| r.get(0))?;
+        Ok(n.max(0) as u64)
+    }
+
     /// Gives the `read_parquet` call or `read_csv` call that reads this file.
     ///
     /// The metadata panel shows this text. The user can copy the text into a
@@ -783,6 +989,92 @@ mod tests {
                           1,alice,10.5,2024-01-01\n\
                           2,bob,,2024-01-02\n\
                           3,carol,30.25,2024-01-03\n";
+
+    #[test]
+    fn the_profile_measures_each_column() {
+        let d = tmpdir("profile");
+        let p = write_csv(&d, "orders.csv", SAMPLE);
+        let e = Engine::open(p.to_str().unwrap(), &OpenOptions::default()).unwrap();
+        let prof = e.profile(&View::default(), "orders").unwrap();
+
+        assert_eq!(prof.rows, 3);
+        assert_eq!(prof.columns.len(), 4);
+        let by = |n: &str| prof.columns.iter().find(|c| c.name == n).unwrap().clone();
+        assert_eq!(by("id").nulls, 0);
+        assert_eq!(by("id").distinct, 3);
+        // The third row of the sample holds no amount.
+        assert_eq!(by("amount").nulls, 1);
+        // A length has a meaning for a column of text only.
+        assert_eq!(by("name").max_len, Some(5));
+        assert_eq!(by("id").max_len, None);
+    }
+
+    #[test]
+    fn the_profile_finds_a_key_of_one_column() {
+        let d = tmpdir("profile-key");
+        let p = write_csv(&d, "t.csv", SAMPLE);
+        let e = Engine::open(p.to_str().unwrap(), &OpenOptions::default()).unwrap();
+        let prof = e.profile(&View::default(), "t").unwrap();
+        assert_eq!(prof.key, vec![0], "the column `id` is the key");
+        assert!(prof.key_is_exact);
+    }
+
+    #[test]
+    fn the_profile_finds_a_key_of_two_columns() {
+        // No column of this file is unique, and the pair (store, day) is.
+        let d = tmpdir("profile-composite");
+        let p = write_csv(
+            &d,
+            "sales.csv",
+            "store,day,units\n\
+             A,2024-01-01,5\n\
+             A,2024-01-02,5\n\
+             B,2024-01-01,3\n\
+             B,2024-01-02,3\n",
+        );
+        let e = Engine::open(p.to_str().unwrap(), &OpenOptions::default()).unwrap();
+        let prof = e.profile(&View::default(), "sales").unwrap();
+        assert_eq!(prof.key, vec![0, 1], "the pair (store, day) is the key");
+    }
+
+    #[test]
+    fn a_column_that_holds_a_null_is_not_a_key() {
+        // The column `amount` has three different values over three rows in
+        // the eye of a count, because a NULL counts for nothing. A key must
+        // still not hold a NULL.
+        let d = tmpdir("profile-null-key");
+        let p = write_csv(
+            &d,
+            "t.csv",
+            "a,b\n1,x\n2,\n3,z\n",
+        );
+        let e = Engine::open(p.to_str().unwrap(), &OpenOptions::default()).unwrap();
+        let prof = e.profile(&View::default(), "t").unwrap();
+        assert!(!prof.key.contains(&1), "a column with a NULL became a key");
+    }
+
+    #[test]
+    fn the_profile_follows_the_filter_of_the_view() {
+        let d = tmpdir("profile-filter");
+        let p = write_csv(&d, "t.csv", SAMPLE);
+        let e = Engine::open(p.to_str().unwrap(), &OpenOptions::default()).unwrap();
+        let view = View {
+            filter: Some("id > 1".into()),
+            ..Default::default()
+        };
+        let prof = e.profile(&view, "t").unwrap();
+        assert_eq!(prof.rows, 2, "the profile must measure the filtered rows");
+    }
+
+    #[test]
+    fn a_file_with_no_row_gives_a_profile_with_no_key() {
+        let d = tmpdir("profile-empty");
+        let p = write_csv(&d, "t.csv", "a,b\n");
+        let e = Engine::open(p.to_str().unwrap(), &OpenOptions::default()).unwrap();
+        let prof = e.profile(&View::default(), "t").unwrap();
+        assert_eq!(prof.rows, 0);
+        assert!(prof.key.is_empty());
+    }
 
     #[test]
     fn opens_json_lines_and_reads_schema_and_rows() {

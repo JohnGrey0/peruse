@@ -12,6 +12,7 @@ starts with a summary of one paragraph, and then gives short sections. Read
 | [engine.md](engine.md) | The set-up of DuckDB, the open operation, the pages, the counts and the CSV index |
 | [query-generation.md](query-generation.md) | How the view becomes SQL, and each statement that Peruse builds |
 | [filter.md](filter.md) | The list of conditions, the operators, and how the list becomes one expression |
+| [ddl.md](ddl.md) | How Peruse measures a file and writes a `CREATE TABLE` statement for another database |
 | [read-only-guard.md](read-only-guard.md) | The two layers that stop a write, and the statements that pass |
 | [worker-and-concurrency.md](worker-and-concurrency.md) | The worker thread, the combination of requests, the epoch and the cancellation |
 | [user-interface.md](user-interface.md) | The layout, the grid, the panels, the overlays and the prompt |

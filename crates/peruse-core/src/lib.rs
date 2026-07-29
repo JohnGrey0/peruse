@@ -15,6 +15,7 @@
 //! # Ok::<(), anyhow::Error>(())
 //! ```
 
+pub mod ddl;
 pub mod engine;
 pub mod filter;
 pub mod meta;
@@ -26,6 +27,7 @@ pub mod stats;
 pub mod theme;
 pub mod worker;
 
+pub use ddl::{Dialect, TableProfile};
 pub use engine::{Engine, OpenOptions};
 pub use filter::{Condition, FilterSet, Join, Op, Term};
 pub use model::{Align, CellKind, Column, RowCount, RowPage, Schema};

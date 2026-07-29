@@ -72,6 +72,16 @@ struct Cli {
     #[arg(long)]
     list_themes: bool,
 
+    /// Print a CREATE TABLE statement for this database and exit.
+    /// One of: oracle, mysql, postgres, snowflake, bigquery, sqlserver,
+    /// duckdb, dynamodb
+    #[arg(long, value_name = "DIALECT")]
+    ddl: Option<String>,
+
+    /// The table name for --ddl. The default is the name of the file.
+    #[arg(long, value_name = "NAME")]
+    table: Option<String>,
+
     /// Override the CSV delimiter (e.g. ';' or 'tab')
     #[arg(long, value_name = "CHAR")]
     delimiter: Option<String>,
@@ -169,6 +179,12 @@ fn main() -> Result<()> {
         sample_size: cli.sample_size,
     };
 
+    // The option --ddl writes to the standard output and stops. The terminal
+    // never starts, so the result goes into a file or into another program.
+    if let Some(name) = &cli.ddl {
+        return print_ddl(&file, &opts, name, cli.table.clone(), cli.query.clone(), cli.filter.clone());
+    }
+
     let (worker, opened) = Worker::spawn(&file, opts)?;
     let auto_index = !cli.no_index;
     let mut application = App::new(worker, opened, theme, auto_index);
@@ -184,6 +200,63 @@ fn main() -> Result<()> {
     }
 
     run(&mut application)
+}
+
+/// Measures the file and writes a `CREATE TABLE` statement for one database.
+///
+/// The statement follows the view, so `--query` and `--filter` also change it.
+/// A user can therefore write a table for the result of a statement, and not
+/// for the file alone.
+fn print_ddl(
+    file: &str,
+    opts: &OpenOptions,
+    dialect: &str,
+    table: Option<String>,
+    query: Option<String>,
+    filter: Option<String>,
+) -> Result<()> {
+    let Some(d) = peruse_core::ddl::Dialect::parse(dialect) else {
+        anyhow::bail!(
+            "--ddl: {dialect:?} is not a database that Peruse knows.\nTry one of: {}",
+            peruse_core::ddl::Dialect::names()
+        );
+    };
+
+    let engine = peruse_core::Engine::open(file, opts)?;
+    let view = View {
+        base: match query {
+            Some(q) => Base::Sql(q),
+            None => Base::Source,
+        },
+        filter,
+        sort: Vec::new(),
+    };
+
+    // Take the name of the file, with no directory and no extension, as the
+    // name of the table. A name that a database rejects is no use, so change
+    // each character that is not a letter, a digit or `_`.
+    let name = table.unwrap_or_else(|| {
+        let stem = std::path::Path::new(&engine.source.label)
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "data".into());
+        let clean: String = stem
+            .chars()
+            .map(|c| if c.is_alphanumeric() || c == '_' { c } else { '_' })
+            .collect();
+        // A name that starts with a digit is not legal in most databases.
+        if clean.starts_with(|c: char| c.is_ascii_digit()) {
+            format!("t_{clean}")
+        } else {
+            clean
+        }
+    });
+
+    let profile = engine
+        .profile(&view, &name)
+        .with_context(|| format!("measuring {file}"))?;
+    print!("{}", peruse_core::ddl::render(&profile, d));
+    Ok(())
 }
 
 /// Draws the frames and reads the events until the user quits.

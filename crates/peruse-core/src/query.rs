@@ -108,6 +108,16 @@ impl View {
         }
     }
 
+    /// Gives `FROM <relation> WHERE (…)`, with no `ORDER BY` part.
+    ///
+    /// A caller that builds its own list of aggregates needs the same rows
+    /// that the grid shows. The profile of a file for a `CREATE TABLE`
+    /// statement is one such caller. The part `ORDER BY` is not here, because
+    /// an aggregate does not need it and a sort of each row is slow.
+    pub fn scan_from(&self) -> String {
+        format!("FROM {}{}", self.relation(), self.where_clause())
+    }
+
     /// Gives ` WHERE (…)`, or an empty text when the view has no filter.
     fn where_clause(&self) -> String {
         match &self.filter {
