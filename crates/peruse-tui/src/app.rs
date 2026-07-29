@@ -1747,6 +1747,23 @@ impl App {
         self.request_record();
     }
 
+    /// Opens the record view with the column under the cursor already open.
+    ///
+    /// The key `Enter` on a cell that holds other values comes here. The user
+    /// asked to see one value, so the way into that value must need no second
+    /// key.
+    fn open_record_at_column(&mut self) {
+        self.open_record();
+        // The row is not there yet, and the tree holds no line. The list of
+        // the lines that are open is a list of paths, and it survives the
+        // row that arrives after it, so this works before the answer.
+        if self.mode == Mode::Record
+            && let Some(col) = self.schema.columns.get(self.cursor_col)
+        {
+            self.record_tree.open_path(&[Step::Field(col.name.clone())]);
+        }
+    }
+
     /// Closes the record view and moves the cursor of the grid to the field
     /// that the record view was on.
     fn close_record(&mut self) {
@@ -2901,6 +2918,19 @@ impl App {
                 let Some(col) = self.schema.columns.get(self.cursor_col) else {
                     return;
                 };
+                // A value that holds other values has no useful form as one
+                // piece of text. The text that DuckDB writes for a structure,
+                //
+                //   {'id': 665991, 'login': petroav, 'gravatar_id': '', …}
+                //
+                // says what the value holds and nothing more: the user cannot
+                // read one field of it, cannot copy one field, and cannot
+                // filter on one field. The record view opens such a value
+                // instead, with the column already open.
+                if col.kind == peruse_core::CellKind::Nested {
+                    self.open_record_at_column();
+                    return;
+                }
                 self.cell_value = self.current_cell_text();
                 self.cell_scroll = 0;
                 self.cell_title = None;

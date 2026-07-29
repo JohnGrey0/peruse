@@ -207,7 +207,7 @@ is usable at all:
 | The help | `?` or `F1` | Each command, in groups, with the keys of the prompt and two notes |
 | The command palette | `:` or `Ctrl-P` | A prompt and the list of the commands that match |
 | The theme picker | `T` | The themes, with a sample of the colors of each one |
-| The cell inspector | `Enter` | The complete value of one cell, on some lines |
+| The cell inspector | `Enter` | The complete value of one cell, on some lines. A cell that holds other values opens the record view instead. |
 | The record view | `r` | One row of the grid, with one column on each line |
 | The filter builder | `f` | The list of conditions, and the menus that make one |
 

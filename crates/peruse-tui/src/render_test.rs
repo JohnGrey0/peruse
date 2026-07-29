@@ -1490,3 +1490,77 @@ fn a_setting_that_takes_a_number_has_no_ghost() {
     // No part of a number says what the rest of it is.
     assert_eq!(app.ghost(), None);
 }
+
+#[test]
+fn enter_on_a_struct_cell_drills_into_it_instead_of_showing_its_text() {
+    // The text that DuckDB writes for a structure says what the value holds
+    // and nothing more. The user cannot read one field of it.
+    let body = "[{\"id\":1,\"actor\":{\"id\":665991,\"login\":\"petroav\",\"gravatar_id\":\"\"}}]";
+    let p = write_sample("enter-struct", body, "json");
+    let (mut app, mut term) = open(&p);
+    settle(&mut app, &mut term);
+
+    app.run(Cmd::ColRight); // the column `actor`
+    app.run(Cmd::InspectCell);
+    for _ in 0..10 {
+        if !app.record_tree.is_empty() {
+            break;
+        }
+        settle(&mut app, &mut term);
+    }
+    let s = screen(&term);
+
+    // The record view opens, and not the cell inspector.
+    assert_eq!(app.mode, Mode::Record);
+    // The column is open already, so the fields need no second key.
+    for field in ["login", "gravatar_id"] {
+        assert!(s.contains(field), "field {field} missing\n{s}");
+    }
+    assert!(s.contains("petroav"), "value missing\n{s}");
+    assert!(s.contains("(empty)"), "an empty text is not a raw quotation mark\n{s}");
+    // The line of the structure holds the count, and not the raw text.
+    assert!(s.contains("{3 fields}"), "no short form\n{s}");
+
+    // The cursor of the record view is on the column that the user chose.
+    assert_eq!(app.record_line().map(|l| l.label), Some("actor".into()));
+
+    // Esc goes back to the grid, on the same column.
+    press(&mut app, ratatui::crossterm::event::KeyCode::Esc);
+    settle(&mut app, &mut term);
+    assert_eq!(app.mode, Mode::Normal);
+    assert_eq!(app.schema.columns[app.cursor_col].name, "actor");
+}
+
+#[test]
+fn enter_on_a_list_cell_drills_into_it_too() {
+    let body = "[{\"id\":1,\"tags\":[\"red\",\"green\",\"blue\"]}]";
+    let p = write_sample("enter-list", body, "json");
+    let (mut app, mut term) = open(&p);
+    settle(&mut app, &mut term);
+
+    app.run(Cmd::ColRight); // the column `tags`
+    app.run(Cmd::InspectCell);
+    for _ in 0..10 {
+        if !app.record_tree.is_empty() {
+            break;
+        }
+        settle(&mut app, &mut term);
+    }
+    let s = screen(&term);
+    assert_eq!(app.mode, Mode::Record);
+    assert!(s.contains("[3 items]"), "no short form for a list\n{s}");
+    assert!(s.contains("green"), "an item of the list is missing\n{s}");
+}
+
+#[test]
+fn enter_on_a_plain_cell_still_opens_the_cell_inspector() {
+    let p = write_sample("enter-plain", SAMPLE, "csv");
+    let (mut app, mut term) = open(&p);
+    settle(&mut app, &mut term);
+
+    app.run(Cmd::ColRight); // the column `name`
+    app.run(Cmd::InspectCell);
+    settle(&mut app, &mut term);
+    assert_eq!(app.mode, Mode::Cell);
+    assert!(screen(&term).contains("alice"), "{}", screen(&term));
+}

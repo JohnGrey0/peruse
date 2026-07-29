@@ -32,6 +32,14 @@ The record view (the key `r`) draws the row as a tree. Each field is one line,
 and a line that holds other values opens and closes. The user moves through the
 levels with `l` and `h`, and the key `/` finds a field at any level.
 
+The key `Enter` on such a cell in the grid opens the same view, with that
+column already open. The cell inspector would show the text above, and that
+text is the problem and not the answer. The user asked to see one value, so the
+way into that value needs no second key.
+
+A cell that holds one value still opens the cell inspector. That view shows a
+long text on some lines, and a long text is what it is for.
+
 ## Why the row arrives as JSON
 
 The engine sends the row as JSON, and not as the text that DuckDB writes for a

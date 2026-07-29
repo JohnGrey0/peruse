@@ -237,7 +237,21 @@ The grid can only show such a value as one long text:
 ```
 
 The record view is the way into it. Press `r`, then `l` on any field with a
-`▸` mark.
+`▸` mark — or just press `Enter` on the cell in the grid, which opens the
+record view with that column already expanded:
+
+```
+┌ record 1 of 11,351 ──────────────────────────────────────────┐
+│   id                BIGINT      2489651045                   │
+│ ▾ actor             struct      {5 fields}                   │
+│     id              number      665991                       │
+│     login           text        petroav                      │
+│     gravatar_id     text        (empty)                      │
+│     url             text        https://api.github.com/user… │
+└──────────────────────────────────────────────────────────────┘
+```
+
+`Enter` on a cell that holds one value still opens the cell inspector.
 
 **About the fields that hold no value.** DuckDB gives one type to a column, so
 for a JSON file it joins the fields of every row into one structure. The
