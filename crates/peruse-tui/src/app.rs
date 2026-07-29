@@ -3006,7 +3006,7 @@ impl App {
 /// The shortest name that starts with the text is the one that the user most
 /// probably wants. A file with `amount` and `amount_tax` therefore gives
 /// `amount` for the text `am`.
-fn ghost_from(typed: &str, names: &[String]) -> Option<String> {
+pub fn ghost_from(typed: &str, names: &[String]) -> Option<String> {
     if typed.is_empty() {
         return None;
     }

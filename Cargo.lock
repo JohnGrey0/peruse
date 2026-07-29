@@ -1593,6 +1593,7 @@ dependencies = [
  "anyhow",
  "clap",
  "crossbeam-channel",
+ "directories",
  "peruse-core",
  "ratatui",
  "serde_json",

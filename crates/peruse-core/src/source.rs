@@ -113,6 +113,28 @@ fn sniff_magic(path: &Path) -> Option<Format> {
     }
 }
 
+/// Finds the format from the extension of the file, and the delimiter that
+/// the extension gives.
+///
+/// The function reads the name only, and it never opens the file. The chooser
+/// of files calls it for each entry of a directory, and a directory can hold
+/// thousands of them.
+///
+/// The function gives `None` for an extension that Peruse does not know. The
+/// full function [`detect`] then looks at the first bytes of the file.
+pub fn by_extension(path: &Path) -> Option<(Format, Option<char>)> {
+    let (ext, _) = effective_extension(path);
+    match ext.as_deref() {
+        Some("parquet" | "parq" | "pq") => Some((Format::Parquet, None)),
+        Some("tsv" | "tab") => Some((Format::Csv, Some('\t'))),
+        Some("csv") => Some((Format::Csv, Some(','))),
+        Some("psv") => Some((Format::Csv, Some('|'))),
+        Some("json" | "ndjson" | "jsonl") => Some((Format::Json, None)),
+        Some("arrow" | "ipc" | "feather" | "arrows") => Some((Format::Arrow, None)),
+        _ => None,
+    }
+}
+
 /// Finds the format of a file, the delimiter and the compression.
 ///
 /// The function uses three tests, in this order:
@@ -123,17 +145,8 @@ fn sniff_magic(path: &Path) -> Option<Format> {
 ///
 /// A file `data.dat` that holds values with commas therefore opens correctly.
 pub fn detect(path: &Path) -> (Format, Option<char>, bool) {
-    let (ext, compressed) = effective_extension(path);
-    let by_ext = match ext.as_deref() {
-        Some("parquet" | "parq" | "pq") => Some((Format::Parquet, None)),
-        Some("tsv" | "tab") => Some((Format::Csv, Some('\t'))),
-        Some("csv") => Some((Format::Csv, Some(','))),
-        Some("psv") => Some((Format::Csv, Some('|'))),
-        Some("json" | "ndjson" | "jsonl") => Some((Format::Json, None)),
-        Some("arrow" | "ipc" | "feather" | "arrows") => Some((Format::Arrow, None)),
-        _ => None,
-    };
-    if let Some((fmt, delim)) = by_ext {
+    let (_, compressed) = effective_extension(path);
+    if let Some((fmt, delim)) = by_extension(path) {
         return (fmt, delim, compressed);
     }
     match sniff_magic(path) {

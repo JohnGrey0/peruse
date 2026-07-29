@@ -115,7 +115,37 @@ Then:
 | `m` | what the file itself says: row groups, codecs, the writer |
 | `q` | quit |
 
-If you type `peruse` with no file, it prints its help.
+### Or start with no file at all
+
+```sh
+peruse
+```
+
+With no file, Peruse shows you what is around instead of a page of help:
+
+```
+ peruse  ~/work/data
+
+  recent
+  trips.parquet     ~/warehouse/2024        parquet   1.20 GB    2h ago
+  sales.csv         ~/work/data                 csv    4.10 MB    1d ago
+
+  ~/work/data
+  ../
+  archive/
+  events.ndjson                              json    88.0 MB   just now
+  sales.csv                                   csv     4.10 MB    1d ago
+  trips.parquet                           parquet     1.20 GB    2h ago
+
+  j/k move · Enter open · h up · / find · a every file · ~ home · q quit
+```
+
+Files you have opened before come first. `/` filters as you type, `h` goes up
+a directory, `~` goes home, and `a` shows every file — not just the ones Peruse
+recognises. See [`docs/chooser.md`](docs/chooser.md).
+
+`peruse --help` still prints the help, and so does `peruse` in a pipeline,
+where there is no terminal to draw on.
 
 ---
 
@@ -633,7 +663,8 @@ peruse [OPTIONS] [FILE]
 
 `FILE` is a path or a glob, such as `data.parquet` or `'part-*.csv'`. Put a
 glob in quotation marks, so that your shell gives the pattern to Peruse and
-does not expand it first. With no `FILE`, Peruse prints its help.
+does not expand it first. With no `FILE`, Peruse opens the
+[chooser](#or-start-with-no-file-at-all).
 
 | Option | Argument | What it does |
 |---|---|---|

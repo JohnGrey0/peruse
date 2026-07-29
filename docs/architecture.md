@@ -32,6 +32,7 @@ The crate `peruse-tui` holds these modules:
 |---|---|
 | `main.rs` | The options of the command line, the terminal, and the event loop |
 | `app.rs` | The state of the application and each change to that state |
+| `browser.rs` | The screen that a call with no file opens |
 | `grid.rs` | The grid of rows and columns |
 | `panels.rs` | The metadata panel and the column statistics panel |
 | `overlays.rs` | The help, the palette, the theme picker, the cell inspector, the record view and the filter builder |

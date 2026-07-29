@@ -18,6 +18,7 @@ starts with a summary of one paragraph, and then gives short sections. Read
 | [worker-and-concurrency.md](worker-and-concurrency.md) | The worker thread, the combination of requests, the epoch and the cancellation |
 | [user-interface.md](user-interface.md) | The layout, the grid, the panels, the overlays and the prompt |
 | [keys-and-commands.md](keys-and-commands.md) | The table of commands, and the help and the palette that come from it |
+| [chooser.md](chooser.md) | The screen that a call with no file opens, and how it finds the data files |
 | [settings.md](settings.md) | The settings that Peruse keeps, the settings page, and what the machine gives |
 | [themes.md](themes.md) | The model of the colors, the built-in themes, and how to write a theme file |
 | [performance.md](performance.md) | The measured times, and the decisions that give them |

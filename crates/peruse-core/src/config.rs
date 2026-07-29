@@ -24,6 +24,12 @@ use std::path::PathBuf;
 /// in a dark room is hard on the eyes.
 pub const DEFAULT_THEME: &str = "peruse-dark";
 
+/// The number of files that Peruse remembers.
+///
+/// The chooser shows these at the top of its list. A longer list would push
+/// the directory itself off the screen.
+pub const MAX_RECENT: usize = 8;
+
 /// The settings that Peruse keeps in a file.
 ///
 /// Each field is optional. A field with no value takes the value that Peruse
@@ -54,6 +60,12 @@ pub struct Config {
     pub no_index: Option<bool>,
     /// The panels that stay on the screen: `none`, `meta`, `stats` or `both`.
     pub panels: Option<String>,
+    /// The files that the user opened, the newest first.
+    ///
+    /// The chooser of files puts these at the top of its list. A user opens
+    /// the same few files again and again, and a path is long to type.
+    #[serde(default)]
+    pub recent: Vec<String>,
 }
 
 impl Config {
@@ -103,6 +115,16 @@ impl Config {
                 Some(format!("{}: {}", p.display(), first_line(&e.to_string()))),
             ),
         }
+    }
+
+    /// Puts a file at the top of the list of the files that the user opened.
+    ///
+    /// A file that is in the list already moves to the top, so the list holds
+    /// no name two times. The list stops at [`MAX_RECENT`] names.
+    pub fn remember_file(&mut self, path: &str) {
+        self.recent.retain(|r| r != path);
+        self.recent.insert(0, path.to_string());
+        self.recent.truncate(MAX_RECENT);
     }
 
     /// Gives the memory limit in the form that DuckDB takes.
@@ -194,6 +216,18 @@ impl Config {
         s.push_str("\n# The panels that stay at the side of the grid:\n");
         s.push_str("# none, meta, stats or both.\n");
         push_opt(&mut s, "panels", self.panels.as_deref().map(quote));
+
+        s.push_str("\n# The files that you opened, the newest first.\n");
+        s.push_str("# The chooser of files puts these at the top of its list.\n");
+        if self.recent.is_empty() {
+            s.push_str("# recent = []\n");
+        } else {
+            s.push_str("recent = [\n");
+            for r in &self.recent {
+                s.push_str(&format!("  {},\n", quote(r)));
+            }
+            s.push_str("]\n");
+        }
         s
     }
 }
@@ -375,9 +409,30 @@ mod tests {
             sample_size: Some(-1),
             no_index: Some(true),
             panels: Some("both".into()),
+            recent: vec!["/data/a.parquet".into(), "C:/data/b.csv".into()],
         };
         let back: Config = toml::from_str(&c.to_toml()).unwrap();
         assert_eq!(back, c);
+    }
+
+    #[test]
+    fn the_list_of_files_holds_no_name_two_times() {
+        let mut c = Config::default();
+        for f in ["a.csv", "b.csv", "a.csv"] {
+            c.remember_file(f);
+        }
+        // The newest comes first, and `a.csv` moved to the top.
+        assert_eq!(c.recent, ["a.csv", "b.csv"]);
+    }
+
+    #[test]
+    fn the_list_of_files_stops_at_a_length() {
+        let mut c = Config::default();
+        for i in 0..(MAX_RECENT + 5) {
+            c.remember_file(&format!("file{i}.csv"));
+        }
+        assert_eq!(c.recent.len(), MAX_RECENT);
+        assert_eq!(c.recent[0], format!("file{}.csv", MAX_RECENT + 4));
     }
 
     #[test]

@@ -5,6 +5,7 @@
 //! and the end of the terminal, and the event loop.
 
 mod app;
+mod browser;
 mod clip;
 mod colors;
 mod commands;
@@ -150,15 +151,6 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    // A call with no file is a request for the help, and not a mistake. The
-    // user typed the name of the program to find out what it does, and an
-    // error message is the wrong answer to that question.
-    let Some(file) = cli.file.clone() else {
-        Cli::command().print_help()?;
-        println!();
-        return Ok(());
-    };
-
     // The settings file gives the default for each option. The command line
     // wins over it, so a user can test an option one time without a change to
     // the file. A mistake in the file gives a message, and Peruse still opens
@@ -178,6 +170,31 @@ fn main() -> Result<()> {
             }
             theme
         }
+    };
+
+    // A call with no file opens the chooser. A user who types the name of the
+    // program alone wants to look at some data, and a page of help is not an
+    // answer to that wish.
+    //
+    // Two calls still get the help. A terminal that is not there cannot hold
+    // a chooser, so a call inside a pipeline must not wait for a key. The
+    // option `--ddl` writes to the standard output, and it needs a file that
+    // the caller names.
+    let file = match cli.file.clone() {
+        Some(f) => f,
+        None if cli.ddl.is_some() => {
+            anyhow::bail!("--ddl needs a file. Give the path of the file to read.")
+        }
+        None if !std::io::IsTerminal::is_terminal(&std::io::stdout()) => {
+            Cli::command().print_help()?;
+            println!();
+            return Ok(());
+        }
+        None => match browser::choose(&config, &theme)? {
+            Some(p) => p.to_string_lossy().into_owned(),
+            // The user left the chooser without a file.
+            None => return Ok(()),
+        },
     };
 
     // Check the query and the filter from the command line before Peruse
@@ -215,6 +232,22 @@ fn main() -> Result<()> {
     }
 
     let (worker, opened) = Worker::spawn(&file, opts)?;
+
+    // Remember the file, so that the chooser can offer it at the next start.
+    // The list holds the full path: a name by itself does not say which file
+    // it is. A glob is not a file, and it does not go into the list.
+    let mut config = config;
+    if !peruse_core::source::looks_like_glob(&file)
+        && let Ok(full) = std::fs::canonicalize(&file)
+    {
+        config.remember_file(&full.to_string_lossy().replace('\\', "/"));
+        if let Some(p) = Config::path() {
+            // A list that Peruse cannot write is not a reason to stop. The
+            // user came here to look at a file.
+            let _ = config.save_to(&p);
+        }
+    }
+
     let auto_index = !(cli.no_index || config.no_index.unwrap_or(false));
     let mut application = App::new(worker, opened, theme, auto_index);
     application.config = config;
