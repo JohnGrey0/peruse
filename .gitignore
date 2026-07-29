@@ -25,3 +25,7 @@ target
 
 # Peruse: local data files used while testing by hand
 /test_data
+
+# Peruse: the finished package manifests, which render.sh writes. The
+# templates beside them are the files that the repository keeps.
+/packaging/out

@@ -1,0 +1,23 @@
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.installer.1.6.0.schema.json
+#
+# Peruse is one program in a zip file, and it writes nothing to the registry.
+# WinGet calls that a portable package: it puts the program in a directory of
+# its own and adds a link on the path. `winget uninstall` then removes both.
+#
+# `NestedInstallerFiles` gives the path inside the zip. The archive holds one
+# directory, and that directory carries the version in its name, so this path
+# changes at each release. `render.sh` writes it.
+PackageIdentifier: JohnGrey0.Peruse
+PackageVersion: __VERSION__
+InstallerType: zip
+NestedInstallerType: portable
+NestedInstallerFiles:
+  - RelativeFilePath: peruse-__VERSION__-x86_64-pc-windows-msvc\peruse.exe
+    PortableCommandAlias: peruse
+Installers:
+  - Architecture: x64
+    InstallerUrl: https://github.com/JohnGrey0/peruse/releases/download/v__VERSION__/peruse-__VERSION__-x86_64-pc-windows-msvc.zip
+    InstallerSha256: __SHA_WINDOWS_X64_UPPER__
+ReleaseDate: __DATE__
+ManifestType: installer
+ManifestVersion: 1.6.0

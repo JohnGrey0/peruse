@@ -1,0 +1,28 @@
+{
+    "version": "__VERSION__",
+    "description": "A fast, read-only viewer for Parquet, CSV, TSV and JSON data files, in the terminal.",
+    "homepage": "https://github.com/JohnGrey0/peruse",
+    "license": "Apache-2.0",
+    "architecture": {
+        "64bit": {
+            "url": "https://github.com/JohnGrey0/peruse/releases/download/v__VERSION__/peruse-__VERSION__-x86_64-pc-windows-msvc.zip",
+            "hash": "__SHA_WINDOWS_X64__",
+            "extract_dir": "peruse-__VERSION__-x86_64-pc-windows-msvc"
+        }
+    },
+    "bin": "peruse.exe",
+    "checkver": {
+        "github": "https://github.com/JohnGrey0/peruse"
+    },
+    "autoupdate": {
+        "architecture": {
+            "64bit": {
+                "url": "https://github.com/JohnGrey0/peruse/releases/download/v$version/peruse-$version-x86_64-pc-windows-msvc.zip",
+                "extract_dir": "peruse-$version-x86_64-pc-windows-msvc"
+            }
+        },
+        "hash": {
+            "url": "$url.sha256"
+        }
+    }
+}

@@ -1,0 +1,40 @@
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.defaultLocale.1.6.0.schema.json
+# What a user reads in `winget show peruse` and on the web page.
+PackageIdentifier: JohnGrey0.Peruse
+PackageVersion: __VERSION__
+PackageLocale: en-US
+Publisher: JohnGrey0
+PublisherUrl: https://github.com/JohnGrey0
+PublisherSupportUrl: https://github.com/JohnGrey0/peruse/issues
+PackageName: Peruse
+PackageUrl: https://github.com/JohnGrey0/peruse
+License: Apache-2.0
+LicenseUrl: https://github.com/JohnGrey0/peruse/blob/main/LICENSE
+Copyright: Copyright (c) 2026 JohnGrey0
+ShortDescription: A fast, read-only viewer for Parquet, CSV, TSV and JSON data files.
+Description: |-
+  Peruse opens a data file in the terminal and shows it as a table. It reads
+  Parquet, CSV, TSV and JSON, and it reads a file that is larger than the
+  memory of the machine.
+
+  You can sort a column, filter the rows with a builder or with SQL, search
+  the text, read one record on its own, open the structures inside a JSON
+  value, and see the metadata and the statistics of each column. It can also
+  write the DDL for a table in Oracle, MySQL, Snowflake, PostgreSQL and
+  others from the shape of the file.
+
+  Peruse never writes to your file. It opens it read-only, and it refuses any
+  statement that would change data.
+Tags:
+  - parquet
+  - csv
+  - json
+  - data
+  - viewer
+  - tui
+  - terminal
+  - sql
+  - duckdb
+ReleaseNotesUrl: https://github.com/JohnGrey0/peruse/releases/tag/v__VERSION__
+ManifestType: defaultLocale
+ManifestVersion: 1.6.0

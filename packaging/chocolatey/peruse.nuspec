@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="utf-8"?>
+<package xmlns="http://schemas.microsoft.com/packaging/2015/06/nuspec.xsd">
+  <metadata>
+    <id>peruse</id>
+    <version>__VERSION__</version>
+    <packageSourceUrl>https://github.com/JohnGrey0/peruse/tree/main/packaging/chocolatey</packageSourceUrl>
+    <owners>JohnGrey0</owners>
+
+    <title>Peruse</title>
+    <authors>JohnGrey0</authors>
+    <projectUrl>https://github.com/JohnGrey0/peruse</projectUrl>
+    <licenseUrl>https://github.com/JohnGrey0/peruse/blob/main/LICENSE</licenseUrl>
+    <requireLicenseAcceptance>false</requireLicenseAcceptance>
+    <projectSourceUrl>https://github.com/JohnGrey0/peruse</projectSourceUrl>
+    <bugTrackerUrl>https://github.com/JohnGrey0/peruse/issues</bugTrackerUrl>
+    <tags>parquet csv json data viewer tui terminal sql duckdb</tags>
+    <summary>A fast, read-only viewer for Parquet, CSV, TSV and JSON data files.</summary>
+    <description>
+Peruse opens a data file in the terminal and shows it as a table. It reads
+Parquet, CSV, TSV and JSON, and it reads a file that is larger than the memory
+of the machine.
+
+You can sort a column, filter the rows with a builder or with SQL, search the
+text, read one record on its own, open the structures inside a JSON value, and
+see the metadata and the statistics of each column. It can also write the DDL
+for a table in Oracle, MySQL, Snowflake, PostgreSQL and others from the shape
+of the file.
+
+Peruse never writes to your file. It opens it read-only, and it refuses any
+statement that would change data.
+
+### Licences
+
+The program holds DuckDB and 26 C and C++ libraries. THIRD-PARTY-LICENSES.md,
+which is installed beside the program, names each one. Every licence is
+permissive.
+    </description>
+    <releaseNotes>https://github.com/JohnGrey0/peruse/releases/tag/v__VERSION__</releaseNotes>
+  </metadata>
+  <files>
+    <file src="tools\**" target="tools" />
+  </files>
+</package>
