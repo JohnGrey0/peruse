@@ -1299,30 +1299,59 @@ impl App {
             self.prompt_error = Some("type the start of a column name first".into());
             return;
         }
-        let lower = word.to_lowercase();
-        let names: Vec<&str> = self
-            .schema
-            .columns
+
+        // A path such as `actor.log` names a field inside a structure. The
+        // part in front of the last full stop says which structure, and the
+        // part after it is what the user started to type.
+        let (prefix, partial) = match word.rfind('.') {
+            Some(i) => (&word[..i], &word[i + 1..]),
+            None => ("", word.as_str()),
+        };
+        let names: Vec<String> = match self.fields_at(prefix) {
+            Some(fields) => fields,
+            None => {
+                self.prompt_error = Some(format!("{prefix} holds no fields"));
+                return;
+            }
+        };
+        let lower = partial.to_lowercase();
+        let matches: Vec<&str> = names
             .iter()
-            .map(|c| c.name.as_str())
+            .map(|s| s.as_str())
             .filter(|n| n.to_lowercase().starts_with(&lower))
             .collect();
-        match names.len() {
-            0 => self.prompt_error = Some(format!("no column starts with {word:?}")),
+
+        // The whole path goes back into the line, so the part in front of the
+        // last full stop keeps its own quotation marks.
+        let put = |app: &mut App, last: &str| {
+            let mut out = String::new();
+            for seg in prefix.split('.').filter(|s| !s.is_empty()) {
+                out.push_str(&quote_if_needed(seg));
+                out.push('.');
+            }
+            out.push_str(&quote_if_needed(last));
+            app.input.replace_word_before_cursor(&out);
+        };
+
+        match matches.len() {
+            0 if prefix.is_empty() => {
+                self.prompt_error = Some(format!("no column starts with {partial:?}"))
+            }
+            0 => self.prompt_error = Some(format!("{prefix} has no field {partial:?}")),
             1 => {
-                let name = quote_if_needed(names[0]);
-                self.input.replace_word_before_cursor(&name);
+                let only = matches[0].to_string();
+                put(self, &only);
                 self.prompt_error = None;
             }
             _ => {
                 // Put in the part that each name starts with. The user can
                 // then type one more character and press Tab again.
-                let common = common_prefix(&names);
-                if common.chars().count() > word.chars().count() {
-                    self.input.replace_word_before_cursor(&common);
+                let common = common_prefix(&matches);
+                if common.chars().count() > partial.chars().count() {
+                    put(self, &common);
                 }
-                let shown: Vec<&str> = names.iter().take(6).copied().collect();
-                let more = names.len().saturating_sub(shown.len());
+                let shown: Vec<&str> = matches.iter().take(6).copied().collect();
+                let more = matches.len().saturating_sub(shown.len());
                 self.prompt_error = Some(if more > 0 {
                     format!("{} … +{more}", shown.join(" "))
                 } else {
@@ -1332,13 +1361,154 @@ impl App {
         }
     }
 
+    /// Gives the part of a name that the user did not type yet.
+    ///
+    /// The prompt draws this text after the cursor, in a dim color. A user
+    /// who types `am` sees `amount` at once, and does not have to remember
+    /// the names or press a key to see them. The key `Tab` takes it.
+    ///
+    /// Each prompt with a known list of answers gets this help:
+    ///
+    /// | Prompt | The list |
+    /// |---|---|
+    /// | The filter and the SQL statement | the columns, and the fields inside them |
+    /// | The text step of the filter builder | the same |
+    /// | The find box of the record view | the fields of the row |
+    /// | The value of a setting | the answers that the setting takes |
+    ///
+    /// The search prompt and the row-number prompt get none. Peruse cannot
+    /// know what a user looks for.
+    ///
+    /// The text appears at the end of the line only. In the middle of a line
+    /// there is no room for it: the text of the user is there.
+    pub fn ghost(&self) -> Option<String> {
+        if !self.input.cursor_at_end() {
+            return None;
+        }
+        match self.mode {
+            Mode::Prompt(PromptKind::Filter) | Mode::Prompt(PromptKind::Sql) => self.ghost_column(),
+            Mode::FilterBuild if self.build == Build::Raw => self.ghost_column(),
+            Mode::Record if self.record_finding => {
+                let names: Vec<String> = self
+                    .record_tree
+                    .lines("")
+                    .into_iter()
+                    .map(|l| l.label)
+                    .collect();
+                ghost_from(&self.input.text(), &names)
+            }
+            Mode::Settings if self.settings_editing => {
+                let s = Setting::ALL[self.settings_sel.min(Setting::ALL.len() - 1)];
+                ghost_from(&self.input.text(), &self.setting_choices(s))
+            }
+            _ => None,
+        }
+    }
+
+    /// Puts the ghost completion into the line, when the key asks for it.
+    ///
+    /// The function gives the complete text of the line after the change, so
+    /// that a caller which keeps its own copy of that text can follow it.
+    fn take_ghost(&mut self, key: &KeyEvent) -> Option<String> {
+        let take =
+            key.code == KeyCode::Tab || (key.code == KeyCode::Right && self.input.cursor_at_end());
+        if !take {
+            return None;
+        }
+        let rest = self.ghost()?;
+        let full = format!("{}{rest}", self.input.text());
+        self.input.set(&full);
+        Some(full)
+    }
+
+    /// Gives the answers that one setting takes, for the ghost completion.
+    ///
+    /// A setting that takes a number has no list. A number is not a name, and
+    /// no part of it says what the rest is.
+    fn setting_choices(&self, s: Setting) -> Vec<String> {
+        match s {
+            Setting::Theme => self.themes.iter().map(|t| t.name.clone()).collect(),
+            Setting::Panels => ["none", "meta", "stats", "both"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            Setting::NoIndex => vec!["yes".into(), "no".into()],
+            Setting::Threads | Setting::MemoryLimit | Setting::SampleSize => Vec::new(),
+        }
+    }
+
+    /// Gives the part of a column name, or of a field name, that the user did
+    /// not type yet.
+    fn ghost_column(&self) -> Option<String> {
+        let word = self.input.word_before_cursor();
+        let (prefix, partial) = match word.rfind('.') {
+            Some(i) => (&word[..i], &word[i + 1..]),
+            None => ("", word.as_str()),
+        };
+        if partial.is_empty() {
+            return None;
+        }
+        ghost_from(partial, &self.fields_at(prefix)?)
+    }
+
+    /// Gives the names that a path can hold at its next level.
+    ///
+    /// An empty path gives the columns of the file. A path such as `actor`
+    /// gives the fields of that structure, and `payload.commits` gives the
+    /// fields of the structures inside that list.
+    ///
+    /// The function gives `None` when a step of the path names nothing, or
+    /// names a value that holds no field.
+    fn fields_at(&self, path: &str) -> Option<Vec<String>> {
+        if path.is_empty() {
+            return Some(self.schema.columns.iter().map(|c| c.name.clone()).collect());
+        }
+        let mut ty: Option<String> = None;
+        for seg in path.split('.') {
+            let seg = seg.trim_matches('"');
+            let next = match &ty {
+                // The first step names a column of the file.
+                None => self
+                    .schema
+                    .columns
+                    .iter()
+                    .find(|c| c.name.eq_ignore_ascii_case(seg))
+                    .map(|c| c.sql_type.clone())?,
+                // Each step after it names a field of a structure. A list of
+                // structures gives the fields of the structure inside it, so
+                // that `payload.commits.sha` completes.
+                Some(t) => {
+                    let base = t.trim_end_matches("[]");
+                    peruse_core::model::struct_fields(base)
+                        .into_iter()
+                        .find(|f| f.name.eq_ignore_ascii_case(seg))
+                        .map(|f| f.sql_type)?
+                }
+            };
+            ty = Some(next);
+        }
+        let t = ty?;
+        let fields = peruse_core::model::struct_fields(t.trim_end_matches("[]"));
+        if fields.is_empty() {
+            return None;
+        }
+        Some(fields.into_iter().map(|f| f.name).collect())
+    }
+
     /// Handles a key in the prompt.
     fn prompt_key(&mut self, kind: PromptKind, key: &KeyEvent) {
         // The line editor has no list of columns, so the completion happens
         // here, in front of it.
-        if key.code == KeyCode::Tab && matches!(kind, PromptKind::Filter | PromptKind::Sql) {
-            self.complete_column();
-            return;
+        if matches!(kind, PromptKind::Filter | PromptKind::Sql) {
+            // The key Tab takes the completion. The key → also takes it, at
+            // the end of a line, where that key has nothing else to do. A
+            // user of a shell knows that second form.
+            let take = key.code == KeyCode::Tab
+                || (key.code == KeyCode::Right && self.ghost().is_some());
+            if take {
+                self.complete_column();
+                return;
+            }
         }
         match self.input.handle(key) {
             Action::Cancel => {
@@ -1602,6 +1772,11 @@ impl App {
     /// Handles a key in the record view.
     fn record_key(&mut self, key: &KeyEvent) {
         if self.record_finding {
+            if let Some(rest) = self.take_ghost(key) {
+                self.record_find = rest;
+                self.record_sel = 0;
+                return;
+            }
             match self.input.handle(key) {
                 // Esc removes the text of the find box, and shows each field
                 // again. A second Esc closes the record view.
@@ -2056,6 +2231,9 @@ impl App {
     /// Handles a key in the settings page.
     fn settings_key(&mut self, key: &KeyEvent) {
         if self.settings_editing {
+            if self.take_ghost(key).is_some() {
+                return;
+            }
             match self.input.handle(key) {
                 Action::Cancel => self.settings_editing = false,
                 Action::Submit => {
@@ -2482,6 +2660,12 @@ impl App {
 
     /// Handles a key in the step that takes a `WHERE` expression.
     fn build_raw_key(&mut self, key: &KeyEvent) {
+        if key.code == KeyCode::Tab
+            || (key.code == KeyCode::Right && self.ghost().is_some())
+        {
+            self.complete_column();
+            return;
+        }
         match self.input.handle(key) {
             Action::Cancel => {
                 self.prompt_error = None;
@@ -2815,6 +2999,28 @@ impl App {
             Cmd::Settings => self.open_settings(),
         }
     }
+}
+
+/// Gives the part of a name that the user did not type yet.
+///
+/// The shortest name that starts with the text is the one that the user most
+/// probably wants. A file with `amount` and `amount_tax` therefore gives
+/// `amount` for the text `am`.
+fn ghost_from(typed: &str, names: &[String]) -> Option<String> {
+    if typed.is_empty() {
+        return None;
+    }
+    let lower = typed.to_lowercase();
+    let mut hits: Vec<&String> = names
+        .iter()
+        .filter(|n| n.to_lowercase().starts_with(&lower))
+        .collect();
+    if hits.is_empty() {
+        return None;
+    }
+    hits.sort_by_key(|n| (n.chars().count(), n.as_str()));
+    let rest: String = hits[0].chars().skip(typed.chars().count()).collect();
+    (!rest.is_empty()).then_some(rest)
 }
 
 /// Gives the part that each of the names starts with.

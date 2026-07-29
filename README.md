@@ -33,6 +33,8 @@ anything, and it refuses the query before the query reaches the database.
   - [SQL](#sql)
   - [Search](#search)
   - [Themes](#themes)
+- [Completion](#completion)
+- [Settings](#settings)
 - [Generate a table](#generate-a-table)
 - [Every key](#every-key)
 - [Every option](#every-option)
@@ -273,8 +275,9 @@ and not the SQL order in which `AND` binds first. What you read is what runs.
 
 - `f` — the builder, described above.
 - `E` — a `WHERE` expression that you type. It checks the expression while you
-  type it, colours the SQL, remembers your history on `↑` and `↓`, and
-  completes a column name when you press `Tab`.
+  type it, colours the SQL, remembers your history on `↑` and `↓`, and writes
+  the rest of a column name after the cursor as you type. See
+  [Completion](#completion).
 - `=` and `!` — the quickest way. They keep, or remove, the rows that hold the
   value in the cell under the cursor. A missing value gives `IS NULL` or
   `IS NOT NULL`, not a comparison against the word "NULL".
@@ -363,6 +366,74 @@ number = "#e0af68"
 
 Peruse uses 24-bit colour when the terminal can show it, and the 256 colours of
 the xterm set when it cannot.
+
+---
+
+## Completion
+
+Any prompt with a known set of answers writes the rest of the answer after your
+cursor, in a dim colour. Type `am` and you see `amount` straight away:
+
+```
+filter › amount
+           ▲ you typed "am"; "ount" is the suggestion
+```
+
+Press `Tab` to take it. At the end of a line, `→` takes it too.
+
+It follows a full stop into a structure, so nested fields complete as well:
+
+```
+filter › actor.login
+              ▲ you typed "actor.log"
+```
+
+You get suggestions in the filter prompt, the SQL prompt, the filter builder's
+SQL step, the record view's find box, and the value of a setting. The search
+prompt has none — Peruse cannot know what you are looking for.
+
+The shortest matching name wins, so a file with `amount` and `amount_tax` gives
+you `amount` for `am`. One more character reaches the longer one.
+
+---
+
+## Settings
+
+Press `,`.
+
+Peruse keeps your settings in `<config>/peruse/config.toml` and writes each
+change as soon as you make it — there is no key to press to save. Changing the
+theme with `t` or `T` saves it too, so you set it once.
+
+| Setting | What it does | With no value |
+|---|---|---|
+| theme | the colours | `peruse-dark` |
+| threads | threads for DuckDB | one for each core |
+| memory limit | whole gigabytes, nothing else | half of your machine |
+| sample size | rows the sniffer reads | 20,480 |
+| index at open | index a file of text at the start | yes, below 256 MB |
+| panels | `none`, `meta`, `stats` or `both` | `none` |
+
+The page also shows what your machine gives — cores, processor, free and total
+memory, the spill directory — and what DuckDB is using **right now**. A memory
+limit is a guess without those numbers.
+
+Threads and the memory limit take effect immediately; DuckDB changes both while
+it runs. The sample size and the index apply to the next file you open, and the
+page says so.
+
+Command-line options always win over the file, so you can try something once
+without changing anything permanently.
+
+### The side panels
+
+`m` adds the metadata, `i` adds the column statistics, and each keeps the
+other — so pressing both gives you both, stacked with the metadata on top. `M`
+cycles all four states. Set `panels = "both"` to get them at every start.
+
+The statistics of a column cost a scan, so Peruse remembers the answer for
+every column of the current view and asks at most once per frame. Holding `l`
+down across a wide file therefore does not queue a scan per column.
 
 ---
 
@@ -496,6 +567,8 @@ name, so no command is behind a key that you must know first.
 | `!` | remove the rows with the value in this cell |
 | `F` | clear the filter |
 | `e` | edit the SQL behind the grid |
+| `u` | undo the last filter, sort or query |
+| `U` | redo what `u` undid |
 | `R` | reset to the whole file |
 | `/` | search every column |
 | `n` | next match |
@@ -507,6 +580,7 @@ name, so no command is behind a key that you must know first.
 |---|---|
 | `m` | the file metadata panel |
 | `i` | the statistics of this column |
+| `M` | cycle the side panels: none, metadata, statistics, both |
 | `Enter` | show this cell in full |
 | `r` | show this row as a vertical record |
 
@@ -529,6 +603,7 @@ name, so no command is behind a key that you must know first.
 | `I` | index this file now, so that jumps are instant |
 | `t` | next theme |
 | `T` | choose a theme |
+| `,` | settings, and what this machine gives |
 | `?`, `F1` | the help |
 | `:`, `Ctrl-P` | run a command by name |
 | `Esc` | stop the query that runs now |
@@ -541,7 +616,7 @@ name, so no command is behind a key that you must know first.
 | `Enter` | apply |
 | `Esc` | cancel |
 | `↑` `↓` | the previous or the next entry from the history |
-| `Tab` | complete a column name (filter and SQL prompts) |
+| `Tab`, `→` | take the ghost completion |
 | `Ctrl-W` | delete the word in front of the cursor |
 | `Ctrl-U` `Ctrl-K` | delete to the start, or to the end |
 | `Ctrl-A` `Ctrl-E` | go to the start, or to the end |

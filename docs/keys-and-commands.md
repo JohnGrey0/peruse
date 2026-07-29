@@ -51,6 +51,8 @@ The five groups come in this order: `Move`, `Query`, `Inspect`, `Columns` and
 | `!` | `FilterExcludeValue` | remove the rows with the value in this cell |
 | `F` | `FilterClear` | clear the filter |
 | `e` | `Sql` | edit the SQL query behind the grid |
+| `u` | `Undo` | undo the last filter, sort or query |
+| `U` | `Redo` | redo the change that u undid |
 | `R` | `ResetView` | reset to the whole file |
 | `/` | `Search` | search all columns |
 | `n` | `SearchNext` | next match |
@@ -68,6 +70,7 @@ describes that list.
 |---|---|---|
 | `m` | `ToggleMeta` | file metadata panel |
 | `i` | `ToggleStats` | statistics for this column |
+| `M` | `CyclePanels` | cycle the side panels: none, metadata, statistics, both |
 | `Enter` | `InspectCell` | show this cell in full |
 | `r` | `Record` | show this row as a vertical record, one column per line |
 
@@ -90,6 +93,7 @@ describes that list.
 | `I` | `IndexCsv` | index this CSV now (makes jumping instant) |
 | `t` | `ThemeNext` | next theme |
 | `T` | `ThemePicker` | choose a theme |
+| `,` | `Settings` | settings, and what this machine gives |
 | `?`, `F1` | `Help` | this help |
 | `:`, `Ctrl-P` | `Palette` | run a command by name |
 | `Esc` | `Cancel` | cancel the running query |
@@ -118,8 +122,8 @@ The help and the keys can therefore never disagree.
 The overlay then adds two more parts:
 
 - the keys of the prompt: `Enter`, `Esc`, `↑` and `↓`, `Ctrl-W`, `Ctrl-U`,
-  `Ctrl-K`, `Ctrl-A` and `Ctrl-E`. The key `Tab` completes a column name in the
-  filter prompt and in the SQL prompt.
+  `Ctrl-K`, `Ctrl-A` and `Ctrl-E`. The key `Tab` takes the ghost completion,
+  and the key `→` takes it at the end of a line.
 - two notes: Peruse rejects a statement that would write, and the clipboard
   uses OSC 52, so it works through SSH
 
@@ -150,7 +154,7 @@ and the key `Esc` closes the palette.
 The footer shows a short form of the most important commands. The list
 `FOOTER_HINTS` gives them in order:
 
-`Help`, `Quit`, `Search`, `FilterBuild`, `Record`, `Sql`, `SortCycle`,
+`Help`, `Quit`, `Search`, `FilterBuild`, `Undo`, `Record`, `Sql`, `SortCycle`,
 `ToggleMeta`, `ToggleStats`, `Palette`
 
 A narrow terminal cuts the list at the end. The keys for "quit" and for "help"

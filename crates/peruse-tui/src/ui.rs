@@ -283,6 +283,22 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App, p: &Paint) -> Option<Positi
             }
         }
 
+        // The name of a column that the user did not type yet, in a dim
+        // color, after the cursor. The key Tab and the key → take it.
+        if let Some(rest) = app.ghost() {
+            let gx = vx + app.input.cursor_col() as u16;
+            if gx < area.right() {
+                let w = (area.right() - gx) as usize;
+                buf.set_stringn(
+                    gx,
+                    area.y,
+                    text::truncate(&rest, w),
+                    w,
+                    p.on(t.dim, t.bg),
+                );
+            }
+        }
+
         // Report a bad expression while the user types it. The message
         // goes at the right side, so it does not move the text of the user.
         if let Some(err) = &app.prompt_error {

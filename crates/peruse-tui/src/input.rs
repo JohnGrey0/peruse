@@ -86,6 +86,14 @@ impl LineInput {
     }
 
 
+    /// Gives `true` when the cursor is after the last character.
+    ///
+    /// The ghost completion draws in the room after the cursor. In the middle
+    /// of a line there is no such room: the text of the user is there.
+    pub fn cursor_at_end(&self) -> bool {
+        self.cursor >= self.chars.len()
+    }
+
     /// Gives the name that the user started to type in front of the cursor.
     ///
     /// A name holds letters, numbers and the character `_`. The completion of
@@ -105,9 +113,17 @@ impl LineInput {
     }
 
     /// Gives the position of the start of the name in front of the cursor.
+    ///
+    /// A full stop belongs to the name. A value inside a structure has a path
+    /// such as `actor.login`, and the completion must see the whole path to
+    /// know which fields to offer.
     fn name_start(&self) -> usize {
         let mut i = self.cursor;
-        while i > 0 && (self.chars[i - 1].is_alphanumeric() || self.chars[i - 1] == '_') {
+        while i > 0
+            && (self.chars[i - 1].is_alphanumeric()
+                || self.chars[i - 1] == '_'
+                || self.chars[i - 1] == '.')
+        {
             i -= 1;
         }
         i

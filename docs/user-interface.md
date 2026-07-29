@@ -340,6 +340,52 @@ user therefore sees a quotation mark with no partner as soon as the user types
 it. Peruse also checks the expression after each key, and it shows the error at
 the right side of the row.
 
+## The ghost completion
+
+A prompt with a known list of answers writes the rest of the answer after the
+cursor, in a dim color. A user who types `am` sees `amount` at once, and does
+not have to remember the names or press a key to see them.
+
+| Prompt | The list of answers |
+|---|---|
+| The filter and the SQL statement | the columns, and the fields inside them |
+| The text step of the filter builder | the same |
+| The find box of the record view | the fields of the row |
+| The value of a setting | the answers that the setting takes |
+
+The search prompt and the row-number prompt get no help. Peruse cannot know
+what a user looks for. A setting that takes a number gets none for the same
+reason: no part of a number says what the rest of it is.
+
+Three rules control the text:
+
+- **The shortest name wins.** A file with `amount` and `amount_tax` gives
+  `amount` for the text `am`. The shortest name is the one that the user most
+  probably wants, and one more character reaches the longer one.
+- **The text appears at the end of a line only.** In the middle of a line there
+  is no room for it: the text of the user is there.
+- **The key `Tab` takes it, and the key `→` also takes it.** At the end of a
+  line the key `→` has nothing else to do, and a user of a shell knows that
+  form.
+
+### A path into a structure
+
+The completion follows a full stop into a structure. The text `actor.log`
+gives the fields of `actor` that start with `log`:
+
+```text
+filter › actor.login
+              ▲ the user typed "actor.log", and "in" is the ghost
+```
+
+The function `App::fields_at` walks the path. The first step names a column of
+the file, and each step after it names a field of a structure, through
+`model::struct_fields`. A list of structures gives the fields of the structure
+inside it, so a path such as `payload.commits.sha` also completes.
+
+The completion writes the whole path back into the line, and it puts each part
+in quotation marks when a statement needs them.
+
 ## The status line and the footer
 
 With no prompt and no message, the status line shows the name and the type of

@@ -1355,3 +1355,138 @@ fn moving_across_the_columns_asks_for_each_column_one_time() {
     );
     assert_eq!(app.stats().map(|s| s.column.as_str()), Some("id"));
 }
+
+#[test]
+fn the_filter_prompt_shows_the_rest_of_a_column_name_as_you_type() {
+    let p = write_sample("ghost", SAMPLE, "csv");
+    let (mut app, mut term) = open(&p);
+    settle(&mut app, &mut term);
+
+    app.run(Cmd::Filter);
+    type_text(&mut app, "am");
+    settle(&mut app, &mut term);
+    // The line holds what the user typed, and the screen shows the rest.
+    assert_eq!(app.input.text(), "am");
+    assert_eq!(app.ghost().as_deref(), Some("ount"));
+    assert!(screen(&term).contains("amount"), "{}", screen(&term));
+
+    // The key Tab takes it.
+    press(&mut app, ratatui::crossterm::event::KeyCode::Tab);
+    assert_eq!(app.input.text(), "amount");
+    assert_eq!(app.ghost(), None, "a complete name needs no ghost");
+}
+
+#[test]
+fn the_key_right_also_takes_the_ghost_at_the_end_of_a_line() {
+    let p = write_sample("ghost-right", SAMPLE, "csv");
+    let (mut app, mut term) = open(&p);
+    settle(&mut app, &mut term);
+
+    app.run(Cmd::Filter);
+    type_text(&mut app, "reg");
+    press(&mut app, ratatui::crossterm::event::KeyCode::Right);
+    assert_eq!(app.input.text(), "region");
+}
+
+#[test]
+fn the_shortest_name_is_the_one_that_the_ghost_shows() {
+    let body = "a,amount,amount_tax\n1,2,3\n";
+    let p = write_sample("ghost-short", body, "csv");
+    let (mut app, mut term) = open(&p);
+    settle(&mut app, &mut term);
+
+    app.run(Cmd::Filter);
+    type_text(&mut app, "amo");
+    assert_eq!(app.ghost().as_deref(), Some("unt"));
+}
+
+#[test]
+fn there_is_no_ghost_in_the_middle_of_a_line() {
+    let p = write_sample("ghost-mid", SAMPLE, "csv");
+    let (mut app, mut term) = open(&p);
+    settle(&mut app, &mut term);
+
+    app.run(Cmd::Filter);
+    type_text(&mut app, "am");
+    press(&mut app, ratatui::crossterm::event::KeyCode::Left);
+    // The text of the user is after the cursor, so there is no room.
+    assert_eq!(app.ghost(), None);
+}
+
+#[test]
+fn the_ghost_follows_a_path_into_a_structure() {
+    let body = "[{\"id\":1,\"actor\":{\"login\":\"alice\",\"site_admin\":false}}]";
+    let p = write_sample("ghost-struct", body, "json");
+    let (mut app, mut term) = open(&p);
+    settle(&mut app, &mut term);
+
+    app.run(Cmd::Filter);
+    type_text(&mut app, "act");
+    assert_eq!(app.ghost().as_deref(), Some("or"));
+    press(&mut app, ratatui::crossterm::event::KeyCode::Tab);
+    assert_eq!(app.input.text(), "actor");
+
+    // A full stop moves into the structure, and the fields follow.
+    type_text(&mut app, ".log");
+    assert_eq!(app.ghost().as_deref(), Some("in"));
+    press(&mut app, ratatui::crossterm::event::KeyCode::Tab);
+    assert_eq!(app.input.text(), "actor.login");
+    settle(&mut app, &mut term);
+}
+
+#[test]
+fn a_field_of_a_structure_completes_and_the_filter_runs() {
+    let body = "[{\"id\":1,\"actor\":{\"login\":\"alice\"}},\
+                {\"id\":2,\"actor\":{\"login\":\"bob\"}}]";
+    let p = write_sample("ghost-run", body, "json");
+    let (mut app, mut term) = open(&p);
+    settle(&mut app, &mut term);
+
+    app.run(Cmd::Filter);
+    type_text(&mut app, "actor.log");
+    press(&mut app, ratatui::crossterm::event::KeyCode::Tab);
+    type_text(&mut app, " = 'alice'");
+    press(&mut app, ratatui::crossterm::event::KeyCode::Enter);
+    settle(&mut app, &mut term);
+
+    assert_eq!(app.view.filter.as_deref(), Some("(actor.login = 'alice')"));
+    assert!(screen(&term).contains("1 × 2"), "{}", screen(&term));
+}
+
+#[test]
+fn a_setting_shows_the_rest_of_its_answer() {
+    let p = write_sample("ghost-setting", SAMPLE, "csv");
+    let (mut app, mut term) = open(&p);
+    settle(&mut app, &mut term);
+    app.run(Cmd::Settings);
+    settle(&mut app, &mut term);
+
+    // The theme is the first setting, and the names of the themes are known.
+    press(&mut app, ratatui::crossterm::event::KeyCode::Enter);
+    app.input.clear();
+    type_text(&mut app, "dra");
+    settle(&mut app, &mut term);
+    assert_eq!(app.ghost().as_deref(), Some("cula"));
+    assert!(screen(&term).contains("dracula"), "{}", screen(&term));
+
+    press(&mut app, ratatui::crossterm::event::KeyCode::Tab);
+    press(&mut app, ratatui::crossterm::event::KeyCode::Enter);
+    settle(&mut app, &mut term);
+    assert_eq!(app.config.theme.as_deref(), Some("dracula"));
+    assert_eq!(app.theme.name, "dracula");
+}
+
+#[test]
+fn a_setting_that_takes_a_number_has_no_ghost() {
+    let p = write_sample("ghost-number", SAMPLE, "csv");
+    let (mut app, mut term) = open(&p);
+    settle(&mut app, &mut term);
+    app.run(Cmd::Settings);
+    settle(&mut app, &mut term);
+
+    press_char(&mut app, 'j'); // threads
+    press(&mut app, ratatui::crossterm::event::KeyCode::Enter);
+    type_text(&mut app, "1");
+    // No part of a number says what the rest of it is.
+    assert_eq!(app.ghost(), None);
+}

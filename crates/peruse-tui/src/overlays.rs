@@ -58,6 +58,27 @@ fn centered_rows(area: Rect, w_pct: u16, rows: u16, max_w: u16) -> Rect {
 
 
 
+/// Draws the ghost completion after the cursor, in a dim color.
+///
+/// The three prompts inside an overlay call this. The prompt at the bottom of
+/// the screen draws its own, because it colors the SQL of the line first.
+fn ghost(buf: &mut Buffer, app: &App, p: &Paint, at: Option<Position>, right: u16) {
+    let (Some(pos), Some(rest)) = (at, app.ghost()) else {
+        return;
+    };
+    if pos.x >= right {
+        return;
+    }
+    let w = (right - pos.x) as usize;
+    buf.set_stringn(
+        pos.x,
+        pos.y,
+        text::truncate(&rest, w),
+        w,
+        p.on(app.theme.dim, app.theme.bg_alt),
+    );
+}
+
 /// Clears the area, draws the border and the title, and gives the area inside.
 fn frame(buf: &mut Buffer, area: Rect, title: &str, app: &App, p: &Paint) -> Rect {
     let t = &app.theme;
@@ -432,6 +453,7 @@ pub fn draw_record(buf: &mut Buffer, area: Rect, app: &App, p: &Paint) -> Option
                 (inner.x + lw as u16 + app.input.cursor_col() as u16).min(inner.right() - 1),
                 inner.y,
             ));
+            ghost(buf, app, p, cursor, inner.right());
         }
     }
     let top = inner.y + if find_on { 2 } else { 0 };
@@ -964,15 +986,17 @@ fn draw_build_value(buf: &mut Buffer, area: Rect, app: &App, p: &Paint) -> Optio
         app,
         p,
         if app.build == Build::Raw {
-            " Enter add · Esc back "
+            " Enter add · Tab take · Esc back "
         } else {
             " Enter next · Esc back "
         },
     );
-    Some(Position::new(
+    let at = Some(Position::new(
         (inner.x + lw as u16 + app.input.cursor_col() as u16).min(inner.right() - 1),
         inner.y,
-    ))
+    ));
+    ghost(buf, app, p, at, inner.right());
+    at
 }
 
 /// Draws the settings page.
@@ -1040,6 +1064,7 @@ pub fn draw_settings(buf: &mut Buffer, area: Rect, app: &App, p: &Paint) -> Opti
                 (x + app.input.cursor_col() as u16).min(inner.right() - 1),
                 y,
             ));
+            ghost(buf, app, p, cursor, x + value_w as u16);
         } else if value.is_empty() {
             buf.set_stringn(
                 x,
