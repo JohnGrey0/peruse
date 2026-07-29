@@ -100,6 +100,12 @@ pub struct Tree {
     root: Option<Value>,
     /// The path of each line that is open, as text.
     open: HashSet<String>,
+    /// `true` after the user asked for every level.
+    ///
+    /// The flag exists so that the answer survives a move to another row. A
+    /// list of paths could not do that: the next row holds other fields, and
+    /// each of them would come back closed.
+    all_open: bool,
     /// `true` while the tree hides the fields that hold no value.
     pub hide_empty: bool,
     /// The message from a row that the module could not read.
@@ -116,6 +122,7 @@ impl Default for Tree {
         Tree {
             root: None,
             open: HashSet::new(),
+            all_open: false,
             hide_empty: true,
             error: None,
         }
@@ -141,12 +148,14 @@ impl Tree {
             Ok(root) => Tree {
                 root: Some(root),
                 open: HashSet::new(),
+                all_open: false,
                 hide_empty: true,
                 error: None,
             },
             Err(e) => Tree {
                 root: None,
                 open: HashSet::new(),
+                all_open: false,
                 hide_empty: true,
                 error: Some(e.to_string()),
             },
@@ -165,6 +174,7 @@ impl Tree {
     pub fn with_row(self, json: &str) -> Tree {
         let mut t = Tree::new(json);
         t.open = self.open;
+        t.all_open = self.all_open;
         t.hide_empty = self.hide_empty;
         t
     }
@@ -183,28 +193,48 @@ impl Tree {
     }
 
     /// Closes a line.
+    ///
+    /// While every level is open, no list of paths holds that fact. The
+    /// function therefore writes the list first, and then removes this one
+    /// path from it.
     pub fn close_path(&mut self, path: &[Step]) {
+        if self.all_open {
+            self.all_open = false;
+            self.open = self.container_paths();
+        }
         self.open.remove(&path_text(path));
     }
 
     /// Gives `true` when a line is open.
     pub fn is_open(&self, path: &[Step]) -> bool {
-        self.open.contains(&path_text(path))
+        self.all_open || self.open.contains(&path_text(path))
+    }
+
+    /// Gives `true` when every level is open.
+    pub fn is_all_open(&self) -> bool {
+        self.all_open
     }
 
     /// Closes each line.
     pub fn collapse_all(&mut self) {
+        self.all_open = false;
         self.open.clear();
     }
 
-    /// Opens each line that holds other values.
+    /// Opens each line that holds other values, and each line of the rows
+    /// that follow.
     pub fn expand_all(&mut self) {
-        let Some(root) = self.root.clone() else { return };
+        self.all_open = true;
+    }
+
+    /// Gives the path of each line that can open.
+    fn container_paths(&self) -> HashSet<String> {
+        let Some(root) = &self.root else {
+            return HashSet::new();
+        };
         let mut paths = Vec::new();
-        collect_paths(&root, &mut Vec::new(), 0, &mut paths);
-        for p in paths {
-            self.open.insert(p);
-        }
+        collect_paths(root, &mut Vec::new(), 0, &mut paths);
+        paths.into_iter().collect()
     }
 
     /// Gives the lines that the record view draws.
@@ -601,6 +631,34 @@ mod tests {
         assert!(found.contains(&"      sha".to_string()), "{found:?}");
         t.collapse_all();
         assert_eq!(found_depth_max(&t), 0);
+    }
+
+    #[test]
+    fn every_level_stays_open_on_the_next_row() {
+        // A record of structures is unreadable until it opens. A user who
+        // asks for every level wants it for each row, and not for one row.
+        // A list of paths could not carry that: the next row holds other
+        // fields, and each of them would come back closed.
+        let mut t = Tree::new(ROW);
+        t.expand_all();
+        let next = t.with_row(r#"{"other": {"deep": {"leaf": 1}}}"#);
+        let found = labels(&next.lines(""));
+        assert_eq!(found, ["other", "  deep", "    leaf"]);
+    }
+
+    #[test]
+    fn closing_one_line_while_every_level_is_open_keeps_the_others_open() {
+        let mut t = Tree::new(ROW);
+        t.expand_all();
+        assert!(t.is_all_open());
+        t.close_path(&[Step::Field("actor".into())]);
+
+        assert!(!t.is_all_open(), "one closed line ends the state");
+        let found = labels(&t.lines(""));
+        // `actor` is closed, and the payload below it is still open.
+        assert!(found.contains(&"actor".to_string()), "{found:?}");
+        assert!(!found.contains(&"  login".to_string()), "{found:?}");
+        assert!(found.contains(&"      sha".to_string()), "{found:?}");
     }
 
     fn found_depth_max(t: &Tree) -> usize {

@@ -78,6 +78,7 @@ pub fn draw(f: &mut Frame, app: &mut App, depth: Depth) {
         Mode::FilterBuild => {
             overlay_cursor = overlays::draw_filter_build(f.buffer_mut(), area, app, &p)
         }
+        Mode::Settings => overlay_cursor = overlays::draw_settings(f.buffer_mut(), area, app, &p),
         _ => {}
     }
 
@@ -360,9 +361,11 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App, p: &Paint) {
             ("j/k".into(), "scroll".into()),
             ("Esc".into(), "close".into()),
         ],
-        // The two new overlays write their own keys along their bottom edge,
-        // where the user is already looking.
-        Mode::Record | Mode::FilterBuild => vec![("Esc".into(), "close".into())],
+        // These overlays write their own keys along their bottom edge, where
+        // the user is already looking.
+        Mode::Record | Mode::FilterBuild | Mode::Settings => {
+            vec![("Esc".into(), "close".into())]
+        }
         Mode::Palette => vec![
             ("↑↓".into(), "select".into()),
             ("Enter".into(), "run".into()),
@@ -422,6 +425,8 @@ fn short_desc(desc: &str) -> String {
     let first = desc.split([' ', '(']).next().unwrap_or(desc);
     match desc {
         d if d.starts_with("build a filter") => "filter".into(),
+        d if d.starts_with("undo the last") => "undo".into(),
+        d if d.starts_with("redo the change") => "redo".into(),
         d if d.starts_with("show this row") => "record".into(),
         d if d.starts_with("filter rows") => "where".into(),
         d if d.starts_with("edit the SQL") => "query".into(),

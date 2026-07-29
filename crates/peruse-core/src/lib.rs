@@ -15,6 +15,7 @@
 //! # Ok::<(), anyhow::Error>(())
 //! ```
 
+pub mod config;
 pub mod ddl;
 pub mod engine;
 pub mod filter;
@@ -27,6 +28,7 @@ pub mod stats;
 pub mod theme;
 pub mod worker;
 
+pub use config::{Config, Resources};
 pub use ddl::{Dialect, TableProfile};
 pub use engine::{Engine, OpenOptions};
 pub use filter::{Condition, FilterSet, Join, Op, Term};

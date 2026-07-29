@@ -12,12 +12,12 @@
 //! layout.
 
 use peruse_core::model::{Align, CellKind};
-use peruse_core::source::human_count;
+use peruse_core::source::{human_bytes, human_count};
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Position, Rect};
 use ratatui::widgets::{Block, Clear, Widget};
 
-use crate::app::{App, Build};
+use crate::app::{App, Build, Setting};
 use crate::commands::{self, Cmd, BINDINGS, GROUPS};
 use crate::paint::Paint;
 use crate::text;
@@ -571,17 +571,24 @@ pub fn draw_record(buf: &mut Buffer, area: Rect, app: &App, p: &Paint) -> Option
         );
     }
 
-    // The keys change with the line. A line that opens needs `l` and `h`, and
-    // a line that holds one value needs `Enter`.
+    // The keys change with the line and with the state. A narrow screen cuts
+    // the end of this line, so the keys that the user needs most come first.
+    // The two that open the record come before the rest, because a record of
+    // structures is unreadable until it opens.
     let open_hint = if lines[sel].kind.opens() {
-        "l open · h close · "
+        "l/h open"
     } else {
-        "Enter full value · "
+        "Enter full value"
+    };
+    let all_hint = if app.record_tree.is_all_open() {
+        "c close all"
+    } else {
+        "a open all"
     };
     let empty_hint = if app.record_tree.hide_empty {
-        "z shows the empty fields · "
+        "z shows empty"
     } else {
-        "z hides the empty fields · "
+        "z hides empty"
     };
     hints(
         buf,
@@ -589,7 +596,7 @@ pub fn draw_record(buf: &mut Buffer, area: Rect, app: &App, p: &Paint) -> Option
         app,
         p,
         &format!(
-            " field {}/{} · j/k move · {open_hint}n/p record · / find · {empty_hint}y copy · = filter · Esc close ",
+            " {}/{} · {open_hint} · {all_hint} · {empty_hint} · n/p row · / find · y copy · P path · = filter · Esc ",
             sel + 1,
             lines.len()
         ),
@@ -968,6 +975,175 @@ fn draw_build_value(buf: &mut Buffer, area: Rect, app: &App, p: &Paint) -> Optio
     ))
 }
 
+/// Draws the settings page.
+///
+/// The page has two halves. The upper half holds the settings that the user
+/// can change. The lower half holds what the machine gives and what DuckDB
+/// uses now. A user who sets a memory limit needs to know how much memory the
+/// machine has, and a user who sets the threads needs to know how many cores
+/// it has. Without those numbers the user is guessing.
+pub fn draw_settings(buf: &mut Buffer, area: Rect, app: &App, p: &Paint) -> Option<Position> {
+    let outer = centered(area, 80, 88, 88);
+    // Every change writes the file at once, so the title needs no mark for
+    // a change that the user did not keep.
+    let inner = frame(buf, outer, "settings · kept as you change them", app, p);
+    let t = &app.theme;
+    if inner.width < 20 || inner.height < 4 {
+        return None;
+    }
+
+    let name_w = 15usize.min(inner.width as usize / 3);
+    let value_w = 22usize.min(inner.width as usize / 3);
+    let mut y = inner.y;
+    let mut cursor = None;
+
+    let sel = app.settings_sel.min(Setting::ALL.len() - 1);
+    for (i, s) in Setting::ALL.iter().enumerate() {
+        if y >= inner.bottom() {
+            break;
+        }
+        let selected = i == sel;
+        let bg = if selected { t.cursor_row } else { t.bg_alt };
+        buf.set_stringn(
+            inner.x,
+            y,
+            " ".repeat(inner.width as usize),
+            inner.width as usize,
+            p.bg(bg),
+        );
+        buf.set_stringn(
+            inner.x,
+            y,
+            text::fit(s.label(), name_w, Align::Left),
+            name_w,
+            if selected {
+                p.bold(p.on(t.accent, bg))
+            } else {
+                p.on(t.fg, bg)
+            },
+        );
+
+        // A setting with no value shows the value that Peruse builds in, in
+        // a dim color. The user then sees what happens without a setting.
+        let x = inner.x + name_w as u16 + 1;
+        let value = app.setting_value(*s);
+        if selected && app.settings_editing {
+            let shown = app.input.text();
+            buf.set_stringn(
+                x,
+                y,
+                text::fit(&shown, value_w, Align::Left),
+                value_w,
+                p.on(t.lit, bg),
+            );
+            cursor = Some(Position::new(
+                (x + app.input.cursor_col() as u16).min(inner.right() - 1),
+                y,
+            ));
+        } else if value.is_empty() {
+            buf.set_stringn(
+                x,
+                y,
+                text::fit(&app.setting_default(*s), value_w, Align::Left),
+                value_w,
+                p.on(t.dim, bg),
+            );
+        } else {
+            buf.set_stringn(
+                x,
+                y,
+                text::fit(&value, value_w, Align::Left),
+                value_w,
+                p.on(t.lit, bg),
+            );
+        }
+
+        let hx = x + value_w as u16 + 1;
+        let hw = (inner.right().saturating_sub(hx)) as usize;
+        buf.set_stringn(hx, y, text::truncate(s.help(), hw), hw, p.on(t.dim, bg));
+        y += 1;
+    }
+
+    // The lower half: the machine, and what DuckDB uses now.
+    let r = &app.resources;
+    let mem = |v: Option<u64>| match v {
+        Some(n) => human_bytes(n),
+        None => "not known".into(),
+    };
+    let mut facts: Vec<(String, String)> = Vec::new();
+    facts.push((
+        "cores".into(),
+        match &r.cpu {
+            Some(name) => format!("{}  ·  {name}", r.cores),
+            None => r.cores.to_string(),
+        },
+    ));
+    facts.push((
+        "memory".into(),
+        format!("{} free of {}", mem(r.free_memory), mem(r.total_memory)),
+    ));
+    facts.push((
+        "duckdb now".into(),
+        format!(
+            "{} threads  ·  {} memory limit",
+            app.duck_threads.as_deref().unwrap_or("?"),
+            app.duck_memory.as_deref().unwrap_or("?")
+        ),
+    ));
+    facts.push(("spill to".into(), r.temp_dir.display().to_string()));
+    facts.push((
+        "file".into(),
+        match peruse_core::config::Config::path() {
+            Some(p) => p.display().to_string(),
+            None => "this system gives no directory".into(),
+        },
+    ));
+
+    y += 1;
+    if y < inner.bottom() {
+        buf.set_stringn(
+            inner.x,
+            y,
+            text::truncate("this machine", inner.width as usize),
+            inner.width as usize,
+            p.bold(p.on(t.accent, t.bg_alt)),
+        );
+        y += 1;
+    }
+    for (k, v) in facts {
+        if y >= inner.bottom() {
+            break;
+        }
+        buf.set_stringn(
+            inner.x,
+            y,
+            text::fit(&k, name_w, Align::Left),
+            name_w,
+            p.on(t.dim, t.bg_alt),
+        );
+        let vx = inner.x + name_w as u16 + 1;
+        let vw = (inner.right().saturating_sub(vx)) as usize;
+        buf.set_stringn(vx, y, text::truncate(&v, vw), vw, p.on(t.fg, t.bg_alt));
+        y += 1;
+    }
+
+    let keys = if app.settings_editing {
+        " Enter apply · Esc cancel ".to_string()
+    } else {
+        let machine = if matches!(
+            Setting::ALL[sel],
+            Setting::Threads | Setting::MemoryLimit
+        ) {
+            "m use this machine · "
+        } else {
+            ""
+        };
+        format!(" Enter change · d built-in · {machine}T themes · Esc close ")
+    };
+    hints(buf, outer, app, p, &keys);
+    cursor
+}
+
 /// The commands that the footer shows, the most important command first.
 ///
 /// A narrow terminal cuts the list at the end. The keys for "quit" and for
@@ -978,6 +1154,7 @@ pub const FOOTER_HINTS: &[Cmd] = &[
     Cmd::Quit,
     Cmd::Search,
     Cmd::FilterBuild,
+    Cmd::Undo,
     Cmd::Record,
     Cmd::Sql,
     Cmd::SortCycle,

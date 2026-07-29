@@ -41,14 +41,19 @@ fn write_sample(tag: &str, body: &str, ext: &str) -> PathBuf {
 }
 
 /// Opens a file and makes a terminal for the test.
+///
+/// The settings go to a file beside the data of the test. The program keeps a
+/// setting as soon as the user changes it, and a test must never write the
+/// settings of the user who runs it.
 fn open(path: &Path) -> (App, Terminal<TestBackend>) {
     let (worker, opened) = Worker::spawn(path.to_str().unwrap(), OpenOptions::default()).unwrap();
-    let app = App::new(
+    let mut app = App::new(
         worker,
         opened,
         peruse_core::theme::builtin("peruse-dark").unwrap(),
         false,
     );
+    app.config_path = path.parent().map(|d| d.join("config.toml"));
     let terminal = Terminal::new(TestBackend::new(110, 24)).unwrap();
     (app, terminal)
 }
@@ -934,4 +939,295 @@ fn a_filter_on_a_value_inside_a_structure_uses_its_path() {
 
     assert_eq!(app.view.filter.as_deref(), Some("(\"actor\".\"login\" = 'alice')"));
     assert!(screen(&term).contains("2 × 2"), "{}", screen(&term));
+}
+
+#[test]
+fn the_settings_page_shows_the_settings_and_the_machine() {
+    let p = write_sample("settings", SAMPLE, "csv");
+    let (mut app, mut term) = open(&p);
+    settle(&mut app, &mut term);
+
+    app.run(Cmd::Settings);
+    settle(&mut app, &mut term);
+    let s = screen(&term);
+
+    for label in ["theme", "threads", "memory limit", "sample size"] {
+        assert!(s.contains(label), "setting {label} missing\n{s}");
+    }
+    // The page says what the machine gives. A user who sets a memory limit
+    // needs to know how much memory the machine has.
+    assert!(s.contains("this machine"), "no resources\n{s}");
+    assert!(s.contains("cores"), "no core count\n{s}");
+    assert!(s.contains("memory"), "no memory\n{s}");
+    // It also says what DuckDB uses now, and not only what the user asked
+    // for.
+    assert!(s.contains("duckdb now"), "no live settings\n{s}");
+    assert!(
+        app.duck_threads.is_some(),
+        "the engine did not report its threads"
+    );
+}
+
+#[test]
+fn changing_a_setting_applies_it_and_keeps_it() {
+    let p = write_sample("settings-edit", SAMPLE, "csv");
+    let (mut app, mut term) = open(&p);
+    settle(&mut app, &mut term);
+    app.run(Cmd::Settings);
+    settle(&mut app, &mut term);
+
+    // Move to `threads` and give it a value.
+    press_char(&mut app, 'j');
+    press(&mut app, ratatui::crossterm::event::KeyCode::Enter);
+    type_text(&mut app, "3");
+    press(&mut app, ratatui::crossterm::event::KeyCode::Enter);
+    settle(&mut app, &mut term);
+
+    assert_eq!(app.config.threads, Some(3));
+    // DuckDB changes its threads while it runs, so the page shows the new
+    // value without a restart.
+    assert_eq!(app.duck_threads.as_deref(), Some("3"));
+    // The change goes into the file at once. A second key to keep it is one
+    // that the user forgets to press.
+    assert!(
+        screen(&term).contains("kept as you change them"),
+        "{}",
+        screen(&term)
+    );
+}
+
+#[test]
+fn a_setting_with_no_value_shows_what_peruse_uses_instead() {
+    let p = write_sample("settings-default", SAMPLE, "csv");
+    let (mut app, mut term) = open(&p);
+    settle(&mut app, &mut term);
+    app.run(Cmd::Settings);
+    settle(&mut app, &mut term);
+
+    // Nothing is set, so the page shows the built-in value in its place.
+    assert_eq!(app.setting_value(crate::app::Setting::Threads), "");
+    assert!(
+        app.setting_default(crate::app::Setting::Threads)
+            .contains("each core"),
+        "{}",
+        app.setting_default(crate::app::Setting::Threads)
+    );
+    assert!(screen(&term).contains("each core"), "{}", screen(&term));
+}
+
+#[test]
+fn a_bad_value_for_a_setting_is_refused_with_a_reason() {
+    let p = write_sample("settings-bad", SAMPLE, "csv");
+    let (mut app, mut term) = open(&p);
+    settle(&mut app, &mut term);
+    app.run(Cmd::Settings);
+    settle(&mut app, &mut term);
+
+    press_char(&mut app, 'j'); // threads
+    press(&mut app, ratatui::crossterm::event::KeyCode::Enter);
+    type_text(&mut app, "lots");
+    press(&mut app, ratatui::crossterm::event::KeyCode::Enter);
+    settle(&mut app, &mut term);
+
+    assert_eq!(app.config.threads, None, "a bad value must not be taken");
+    assert!(screen(&term).contains("not a number"), "{}", screen(&term));
+}
+
+#[test]
+fn the_machine_can_give_the_value_of_a_setting() {
+    let p = write_sample("settings-machine", SAMPLE, "csv");
+    let (mut app, mut term) = open(&p);
+    settle(&mut app, &mut term);
+    app.run(Cmd::Settings);
+    settle(&mut app, &mut term);
+
+    press_char(&mut app, 'j'); // threads
+    press_char(&mut app, 'm'); // take the value of this machine
+    settle(&mut app, &mut term);
+    assert_eq!(app.config.threads, Some(app.resources.cores));
+}
+
+#[test]
+fn undo_goes_back_one_filter_at_a_time() {
+    let p = write_sample("undo", SAMPLE, "csv");
+    let (mut app, mut term) = open(&p);
+    settle(&mut app, &mut term);
+
+    // Two filters, one after the other.
+    app.run(Cmd::ColLast); // region, EU on the first row
+    app.run(Cmd::FilterThisValue);
+    settle(&mut app, &mut term);
+    assert_eq!(app.view.filter.as_deref(), Some("(\"region\" = 'EU')"));
+
+    app.run(Cmd::ColFirst); // id
+    app.run(Cmd::FilterExcludeValue);
+    settle(&mut app, &mut term);
+    assert_eq!(
+        app.view.filter.as_deref(),
+        Some("((\"region\" = 'EU') AND (\"id\" <> 1))")
+    );
+
+    // One key goes back one step, and the grid follows.
+    app.run(Cmd::Undo);
+    settle(&mut app, &mut term);
+    assert_eq!(app.view.filter.as_deref(), Some("(\"region\" = 'EU')"));
+    assert!(screen(&term).contains("3 × 4"), "{}", screen(&term));
+    // The builder must agree with the grid after a step backward.
+    assert_eq!(app.fset.len(), 1, "the conditions did not follow");
+
+    app.run(Cmd::Undo);
+    settle(&mut app, &mut term);
+    assert_eq!(app.view.filter, None);
+    assert!(screen(&term).contains("5 × 4"), "{}", screen(&term));
+    assert!(app.fset.is_empty());
+}
+
+#[test]
+fn undo_says_where_it_arrived_and_stops_at_the_start() {
+    let p = write_sample("undo-end", SAMPLE, "csv");
+    let (mut app, mut term) = open(&p);
+    settle(&mut app, &mut term);
+
+    app.run(Cmd::SortCycle);
+    settle(&mut app, &mut term);
+    app.run(Cmd::Undo);
+    settle(&mut app, &mut term);
+    // The message names the view that the user arrived at.
+    assert!(
+        screen(&term).contains("back to the whole file"),
+        "{}",
+        screen(&term)
+    );
+
+    // At the start there is nothing behind, and the key says so.
+    app.run(Cmd::Undo);
+    settle(&mut app, &mut term);
+    assert!(
+        screen(&term).contains("nothing to go back to"),
+        "{}",
+        screen(&term)
+    );
+}
+
+#[test]
+fn redo_puts_back_the_change_that_undo_removed() {
+    let p = write_sample("redo", SAMPLE, "csv");
+    let (mut app, mut term) = open(&p);
+    settle(&mut app, &mut term);
+
+    app.run(Cmd::ColLast);
+    app.run(Cmd::FilterThisValue);
+    settle(&mut app, &mut term);
+    app.run(Cmd::Undo);
+    settle(&mut app, &mut term);
+    assert_eq!(app.view.filter, None);
+
+    app.run(Cmd::Redo);
+    settle(&mut app, &mut term);
+    assert_eq!(app.view.filter.as_deref(), Some("(\"region\" = 'EU')"));
+    assert!(screen(&term).contains("3 × 4"), "{}", screen(&term));
+}
+
+#[test]
+fn a_new_change_removes_the_way_forward() {
+    let p = write_sample("undo-branch", SAMPLE, "csv");
+    let (mut app, mut term) = open(&p);
+    settle(&mut app, &mut term);
+
+    app.run(Cmd::ColLast);
+    app.run(Cmd::FilterThisValue);
+    settle(&mut app, &mut term);
+    app.run(Cmd::Undo);
+    settle(&mut app, &mut term);
+
+    // A change after a step backward cannot keep the old way forward.
+    app.run(Cmd::SortCycle);
+    settle(&mut app, &mut term);
+    app.run(Cmd::Redo);
+    settle(&mut app, &mut term);
+    assert!(
+        screen(&term).contains("nothing to go forward to"),
+        "{}",
+        screen(&term)
+    );
+}
+
+#[test]
+fn undo_also_covers_a_sql_statement() {
+    let p = write_sample("undo-sql", SAMPLE, "csv");
+    let (mut app, mut term) = open(&p);
+    settle(&mut app, &mut term);
+
+    app.view.base = Base::Sql("SELECT region FROM src".into());
+    app.run_startup_view();
+    settle(&mut app, &mut term);
+    assert!(screen(&term).contains("5 × 1"), "{}", screen(&term));
+
+    app.run(Cmd::Undo);
+    settle(&mut app, &mut term);
+    assert_eq!(app.view.base, Base::Source);
+    assert!(screen(&term).contains("5 × 4"), "{}", screen(&term));
+}
+
+#[test]
+fn a_setting_goes_into_the_file_as_soon_as_it_changes() {
+    let p = write_sample("settings-keep", SAMPLE, "csv");
+    let (mut app, mut term) = open(&p);
+    settle(&mut app, &mut term);
+    let cfg = app.config_path.clone().unwrap();
+
+    app.run(Cmd::Settings);
+    settle(&mut app, &mut term);
+    press_char(&mut app, 'j'); // threads
+    press(&mut app, ratatui::crossterm::event::KeyCode::Enter);
+    type_text(&mut app, "2");
+    press(&mut app, ratatui::crossterm::event::KeyCode::Enter);
+    settle(&mut app, &mut term);
+
+    // The file holds the change with no second key.
+    let (on_disk, err) = peruse_core::config::Config::load_from(&cfg);
+    assert_eq!(err, None);
+    assert_eq!(on_disk.threads, Some(2));
+}
+
+#[test]
+fn the_memory_limit_takes_whole_gigabytes_only() {
+    let p = write_sample("settings-gb", SAMPLE, "csv");
+    let (mut app, mut term) = open(&p);
+    settle(&mut app, &mut term);
+    app.run(Cmd::Settings);
+    settle(&mut app, &mut term);
+
+    press_char(&mut app, 'j');
+    press_char(&mut app, 'j'); // memory limit
+    press(&mut app, ratatui::crossterm::event::KeyCode::Enter);
+    type_text(&mut app, "8");
+    press(&mut app, ratatui::crossterm::event::KeyCode::Enter);
+    settle(&mut app, &mut term);
+    assert_eq!(app.config.memory_limit_gb, Some(8));
+    assert_eq!(app.duck_memory.as_deref(), Some("8.0 GiB"));
+
+    // A size with a unit that is not the gigabyte says what to write.
+    press(&mut app, ratatui::crossterm::event::KeyCode::Enter);
+    app.input.clear();
+    type_text(&mut app, "512MB");
+    press(&mut app, ratatui::crossterm::event::KeyCode::Enter);
+    settle(&mut app, &mut term);
+    assert_eq!(app.config.memory_limit_gb, Some(8), "the old value stays");
+    assert!(
+        screen(&term).contains("whole number of gigabytes"),
+        "{}",
+        screen(&term)
+    );
+}
+
+#[test]
+fn with_no_setting_duckdb_gets_a_quarter_of_the_machine() {
+    // Without a limit DuckDB takes 80 percent of the memory for itself, and
+    // a viewer of data is not the only program that the user runs.
+    let r = peruse_core::config::Resources::read();
+    if let Some(gb) = r.default_memory_gb() {
+        assert!(gb >= 1);
+        assert_eq!(r.default_memory_text(), Some(format!("{gb}GiB")));
+    }
 }

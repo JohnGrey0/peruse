@@ -256,6 +256,46 @@ impl Engine {
         }
     }
 
+    /// Applies the settings that DuckDB can change while it runs.
+    ///
+    /// The settings page uses this function. Without it, a change to the
+    /// threads or to the memory limit would need a restart of the program,
+    /// and the user could not see the result of the change.
+    ///
+    /// The statement `SET` is one that [`crate::sql_guard`] refuses. That
+    /// guard reads the statements of the **user**. This statement comes from
+    /// Peruse, it names one setting of the engine, and it writes no data.
+    pub fn apply_settings(&self, threads: Option<usize>, memory_limit: Option<&str>) -> Result<()> {
+        let mut sql = String::new();
+        if let Some(n) = threads {
+            // A value of zero would stop DuckDB from running any query.
+            let n = n.max(1);
+            sql.push_str(&format!("SET threads TO {n};\n"));
+        }
+        if let Some(m) = memory_limit {
+            let m = m.trim();
+            if !m.is_empty() {
+                sql.push_str(&format!("SET memory_limit = {};\n", quote_str(m)));
+            }
+        }
+        if sql.is_empty() {
+            return Ok(());
+        }
+        self.conn.execute_batch(&sql)?;
+        Ok(())
+    }
+
+    /// Gives the value that DuckDB uses now for one of its settings.
+    pub fn current_setting(&self, name: &str) -> Option<String> {
+        self.conn
+            .query_row(
+                &format!("SELECT CAST(current_setting({}) AS VARCHAR)", quote_str(name)),
+                [],
+                |r| r.get::<_, String>(0),
+            )
+            .ok()
+    }
+
     /// Reads one complete row as JSON, for the record view.
     ///
     /// The function gives `None` when the view holds no row at that offset.

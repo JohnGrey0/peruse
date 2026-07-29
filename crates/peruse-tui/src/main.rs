@@ -21,6 +21,7 @@ mod tree;
 mod ui;
 
 use anyhow::{Context, Result};
+use peruse_core::config::Config;
 use clap::{CommandFactory, Parser};
 use crossbeam_channel::{select, unbounded};
 use peruse_core::query::Base;
@@ -66,8 +67,8 @@ struct Cli {
     filter: Option<String>,
 
     /// Colour theme name, or a path to a .toml theme
-    #[arg(short = 't', long, default_value = "peruse-dark")]
-    theme: String,
+    #[arg(short = 't', long)]
+    theme: Option<String>,
 
     /// List available themes and exit
     #[arg(long)]
@@ -158,7 +159,26 @@ fn main() -> Result<()> {
         return Ok(());
     };
 
-    let theme = peruse_core::theme::resolve(&cli.theme).map_err(anyhow::Error::msg)?;
+    // The settings file gives the default for each option. The command line
+    // wins over it, so a user can test an option one time without a change to
+    // the file. A mistake in the file gives a message, and Peruse still opens
+    // the file: a setting is not a reason to refuse the work.
+    let (config, mut config_error) = Config::load();
+
+    // A theme from the command line must be right, so a mistake in it stops
+    // the program. A theme from the settings file must never do that: a name
+    // that a later version removes would lock the user out of the program,
+    // and the only way back would be to edit the file by hand.
+    let theme = match &cli.theme {
+        Some(name) => peruse_core::theme::resolve(name).map_err(anyhow::Error::msg)?,
+        None => {
+            let (theme, why) = config.theme_or_default();
+            if let Some(w) = why {
+                config_error.get_or_insert(w);
+            }
+            theme
+        }
+    };
 
     // Check the query and the filter from the command line before Peruse
     // opens the file. A mistake in the text is then one error message on the
@@ -170,14 +190,22 @@ fn main() -> Result<()> {
         sql_guard::ensure_safe_predicate(f).map_err(|e| anyhow::anyhow!("--filter: {e}"))?;
     }
 
+    // With no setting, Peruse gives DuckDB a quarter of the memory of the
+    // machine. Without a limit, DuckDB takes 80 percent of it, and a viewer
+    // of data is not the only program that the user runs.
+    let resources = peruse_core::config::Resources::read();
     let opts = OpenOptions {
-        threads: cli.threads,
-        memory_limit: cli.memory_limit.clone(),
+        threads: cli.threads.or(config.threads),
+        memory_limit: cli
+            .memory_limit
+            .clone()
+            .or_else(|| config.memory_limit_text())
+            .or_else(|| resources.default_memory_text()),
         all_varchar: cli.all_varchar,
         ignore_errors: cli.ignore_errors,
         delimiter: cli.delimiter.as_deref().map(parse_delimiter).transpose()?,
         header: cli.no_header.then_some(false),
-        sample_size: cli.sample_size,
+        sample_size: cli.sample_size.or(config.sample_size),
     };
 
     // The option --ddl writes to the standard output and stops. The terminal
@@ -187,8 +215,12 @@ fn main() -> Result<()> {
     }
 
     let (worker, opened) = Worker::spawn(&file, opts)?;
-    let auto_index = !cli.no_index;
+    let auto_index = !(cli.no_index || config.no_index.unwrap_or(false));
     let mut application = App::new(worker, opened, theme, auto_index);
+    application.config = config;
+    if let Some(e) = config_error {
+        application.error(format!("settings: {e}"));
+    }
 
     if let Some(q) = cli.query {
         application.view.base = Base::Sql(q);

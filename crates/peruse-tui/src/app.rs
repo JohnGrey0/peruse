@@ -8,6 +8,7 @@
 //! adds the response to the state. If the view changed after the request, the
 //! function discards the response instead.
 
+use peruse_core::config::{Config, Resources};
 use peruse_core::filter::{FilterSet, Op, Term};
 use peruse_core::query::{quote_str, Step};
 use peruse_core::meta::FileMeta;
@@ -92,6 +93,68 @@ pub enum Mode {
     Record,
     /// The filter builder is open.
     FilterBuild,
+    /// The settings page is open.
+    Settings,
+}
+
+/// One setting that the settings page can change.
+///
+/// The list is short on purpose. A setting belongs here when a user changes it
+/// for each file, or when the machine decides the right value for it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Setting {
+    /// The colors.
+    Theme,
+    /// The number of threads that DuckDB can use.
+    Threads,
+    /// The memory that DuckDB can use before it writes to the disk.
+    MemoryLimit,
+    /// The rows that the sniffer of a file of text examines.
+    SampleSize,
+    /// Whether Peruse indexes a file of text when it opens the file.
+    NoIndex,
+}
+
+impl Setting {
+    /// Each setting, in the order that the page shows them.
+    pub const ALL: &'static [Setting] = &[
+        Setting::Theme,
+        Setting::Threads,
+        Setting::MemoryLimit,
+        Setting::SampleSize,
+        Setting::NoIndex,
+    ];
+
+    /// The name that the page shows.
+    pub fn label(self) -> &'static str {
+        match self {
+            Setting::Theme => "theme",
+            Setting::Threads => "threads",
+            Setting::MemoryLimit => "memory limit",
+            Setting::SampleSize => "sample size",
+            Setting::NoIndex => "index at open",
+        }
+    }
+
+    /// What the setting does, in one line.
+    pub fn help(self) -> &'static str {
+        match self {
+            Setting::Theme => "the colors. T also opens the picker",
+            Setting::Threads => "threads for DuckDB. Empty means one for each core",
+            Setting::MemoryLimit => "such as 4GB, before DuckDB writes to the disk",
+            Setting::SampleSize => "rows the sniffer reads. -1 reads the whole file",
+            Setting::NoIndex => "index a file of text at the start, for instant jumps",
+        }
+    }
+
+    /// Gives `true` when a change takes effect at the next file, and not now.
+    ///
+    /// DuckDB changes its threads and its memory while it runs. The sniffer
+    /// and the index do their work when a file opens, so a change to them
+    /// cannot reach the file that is open already.
+    pub fn at_next_file(self) -> bool {
+        matches!(self, Setting::SampleSize | Setting::NoIndex)
+    }
 }
 
 /// The step that the filter builder is at.
@@ -192,6 +255,27 @@ struct Scan {
     total: u64,
 }
 
+/// One view that the user had, for the keys that go back and forward.
+///
+/// The step holds the filter as a list of conditions beside the expression.
+/// Without the list, a step backward would give the rows of the old filter and
+/// the conditions of the new one, and the builder would then disagree with the
+/// grid.
+#[derive(Clone, Debug, PartialEq)]
+struct ViewStep {
+    /// The relation, the filter and the sort.
+    view: View,
+    /// The conditions that compiled to the filter.
+    fset: FilterSet,
+}
+
+/// The number of views that Peruse remembers.
+///
+/// The list holds one entry for each change, and a change is a press of a key.
+/// This number is more than a user needs in one session, and it stops the list
+/// from growing without an end.
+const MAX_HISTORY: usize = 100;
+
 /// The complete state of the application.
 pub struct App {
     /// The handle to the engine thread.
@@ -206,6 +290,17 @@ pub struct App {
     pub view: View,
     /// The epoch of the current view. Each change of the view increases it.
     epoch: u64,
+
+    /// The view that the grid shows now. [`App::reload`] compares the new
+    /// view against it, and a difference makes one entry of the history.
+    applied: ViewStep,
+    /// The views that the user had before this one. The key `u` takes one.
+    history: Vec<ViewStep>,
+    /// The views that the key `u` removed. The key `U` puts one back.
+    undone: Vec<ViewStep>,
+    /// `true` while `u` or `U` changes the view. The list of the views that
+    /// `u` removed must not clear itself during that change.
+    restoring: bool,
 
     /// The page of rows that the grid draws now.
     pub page: RowPage,
@@ -288,6 +383,24 @@ pub struct App {
     pub record_find: String,
     /// `true` while the user types in the find box of the record view.
     pub record_finding: bool,
+    /// The settings that Peruse keeps between sessions.
+    pub config: Config,
+    /// The file that holds the settings.
+    ///
+    /// A test points this at its own file. Without it, a test would write the
+    /// settings of the user who runs it.
+    pub config_path: Option<std::path::PathBuf>,
+    /// What the machine gives to Peruse.
+    pub resources: Resources,
+    /// The selected setting in the settings page.
+    pub settings_sel: usize,
+    /// `true` while the user types the value of a setting.
+    pub settings_editing: bool,
+    /// The values that DuckDB uses now, for the settings page.
+    pub duck_threads: Option<String>,
+    /// The memory limit that DuckDB uses now.
+    pub duck_memory: Option<String>,
+
     /// The row of the record view, as a tree that opens and closes.
     pub record_tree: Tree,
     /// The row that the tree holds. The record view asks the engine again
@@ -352,6 +465,14 @@ impl App {
             view: View::default(),
             epoch: 0,
 
+            applied: ViewStep {
+                view: View::default(),
+                fset: FilterSet::default(),
+            },
+            history: Vec::new(),
+            undone: Vec::new(),
+            restoring: false,
+
             page: RowPage::default(),
             page_limit: 0,
             requested: None,
@@ -392,6 +513,14 @@ impl App {
             record_sel: 0,
             record_find: String::new(),
             record_finding: false,
+            config: Config::default(),
+            config_path: Config::path(),
+            resources: Resources::read(),
+            settings_sel: 0,
+            settings_editing: false,
+            duck_threads: None,
+            duck_memory: None,
+
             record_tree: Tree::default(),
             record_row: None,
 
@@ -468,7 +597,27 @@ impl App {
 
     /// Discards each result of the old view and asks the worker for the new
     /// view. The function also increases the epoch.
+    ///
+    /// Each change of the view passes through here, so this is the one place
+    /// that can remember what the user had before. A key that goes back needs
+    /// no help from the code that made the change.
     fn reload(&mut self, reset_cursor: bool) {
+        let now = ViewStep {
+            view: self.view.clone(),
+            fset: self.fset.clone(),
+        };
+        if now != self.applied {
+            let before = std::mem::replace(&mut self.applied, now);
+            self.history.push(before);
+            if self.history.len() > MAX_HISTORY {
+                self.history.remove(0);
+            }
+            // A new change makes the way forward meaningless. A step that
+            // `u` removed can no longer follow the view that the user is on.
+            if !self.restoring {
+                self.undone.clear();
+            }
+        }
         self.epoch += 1;
         self.total = RowCount::Counting;
         self.page = RowPage::default();
@@ -638,6 +787,7 @@ impl App {
             | Response::Stats { epoch, .. }
             | Response::Cell { epoch, .. }
             | Response::RowJson { epoch, .. }
+            | Response::Configured { epoch, .. }
             | Response::Search { epoch, .. }
             | Response::Meta { epoch, .. }
             | Response::Indexed { epoch }
@@ -712,6 +862,10 @@ impl App {
             Response::Cell { value, .. } => {
                 self.cell_value = Some(value.unwrap_or_else(|| "NULL".into()));
                 self.cell_scroll = 0;
+            }
+            Response::Configured { threads, memory_limit, .. } => {
+                self.duck_threads = threads;
+                self.duck_memory = memory_limit;
             }
             Response::Search { hits, .. } => self.apply_search(hits),
             // The code above handles these two, before the test of the epoch.
@@ -910,6 +1064,7 @@ impl App {
                 app.cell_scroll = app.cell_scroll.saturating_add_signed(d as i16);
             }),
             Mode::Record => self.record_key(key),
+            Mode::Settings => self.settings_key(key),
             Mode::FilterBuild => self.build_key(key),
             Mode::Palette => self.palette_key(key),
             Mode::ThemePicker => self.theme_picker_key(key),
@@ -1013,8 +1168,7 @@ impl App {
                 self.theme_idx = self.theme_sel;
                 self.theme = self.themes[self.theme_idx].clone();
                 self.mode = Mode::Normal;
-                let name = self.theme.name.clone();
-                self.ok(format!("theme: {name}"));
+                self.remember_theme();
             }
             _ => {}
         }
@@ -1552,6 +1706,281 @@ impl App {
         self.request_record();
     }
 
+    // ---------------------------------------------------- the settings page
+
+    /// Gives the value of one setting, as the page shows it.
+    ///
+    /// An empty text means that the setting has no value, and that Peruse
+    /// uses the value that it builds in.
+    pub fn setting_value(&self, s: Setting) -> String {
+        match s {
+            Setting::Theme => self.config.theme.clone().unwrap_or_default(),
+            Setting::Threads => self.config.threads.map(|v| v.to_string()).unwrap_or_default(),
+            Setting::MemoryLimit => self
+                .config
+                .memory_limit_gb
+                .map(|v| format!("{v} GB"))
+                .unwrap_or_default(),
+            Setting::SampleSize => self
+                .config
+                .sample_size
+                .map(|v| v.to_string())
+                .unwrap_or_default(),
+            Setting::NoIndex => match self.config.no_index {
+                Some(true) => "no".into(),
+                Some(false) => "yes".into(),
+                None => String::new(),
+            },
+        }
+    }
+
+    /// Gives the value that Peruse uses when the setting has none.
+    pub fn setting_default(&self, s: Setting) -> String {
+        match s {
+            Setting::Theme => "peruse-dark".into(),
+            Setting::Threads => format!("{} (one for each core)", self.resources.cores),
+            Setting::MemoryLimit => self
+                .resources
+                .default_memory_gb()
+                .map(|gb| format!("{gb} GB (a quarter of this machine)"))
+                .unwrap_or_else(|| "the rule of DuckDB".into()),
+            Setting::SampleSize => "20,480 rows".into(),
+            Setting::NoIndex => "yes, below 256 MB".into(),
+        }
+    }
+
+    /// Keeps the theme in the settings file.
+    ///
+    /// A theme is a choice that a user makes one time, so the key `t` and the
+    /// picker write it at once. The user does not have to open the settings
+    /// page to keep a choice that they made there.
+    ///
+    /// The function writes the theme by itself. It reads the file again and
+    /// changes one line of it, so a setting that the user is testing in this
+    /// session does not go into the file without a request.
+    fn remember_theme(&mut self) {
+        let name = self.theme.name.clone();
+        self.config.theme = Some(name.clone());
+        let Some(path) = self.config_path.clone() else {
+            self.ok(format!("theme: {name}"));
+            return;
+        };
+        let (mut on_disk, _) = Config::load_from(&path);
+        if on_disk.theme.as_deref() == Some(name.as_str()) {
+            self.ok(format!("theme: {name}"));
+            return;
+        }
+        on_disk.theme = Some(name.clone());
+        match on_disk.save_to(&path) {
+            Ok(_) => self.ok(format!("theme: {name} (kept)")),
+            // A theme that Peruse cannot keep still works for this session.
+            Err(e) => self.ok(format!("theme: {name} (not kept: {e})")),
+        }
+    }
+
+    /// Writes the settings to the file.
+    fn save_config(&self) -> Result<(), String> {
+        let Some(p) = &self.config_path else {
+            return Err("this system gives no directory for settings".into());
+        };
+        self.config.save_to(p).map(|_| ())
+    }
+
+    /// Opens the settings page.
+    fn open_settings(&mut self) {
+        self.settings_sel = 0;
+        self.settings_editing = false;
+        self.mode = Mode::Settings;
+        // Ask DuckDB what it uses now. The page then shows the truth, and
+        // not the wish of the user.
+        self.worker.send(Request::Configure {
+            epoch: self.epoch,
+            threads: None,
+            memory_limit: None,
+        });
+    }
+
+    /// Takes the text that the user typed as the value of a setting.
+    fn commit_setting(&mut self, s: Setting, text: &str) {
+        let t = text.trim();
+        let empty = t.is_empty();
+        match s {
+            Setting::Theme => {
+                if empty {
+                    self.config.theme = None;
+                } else {
+                    // Apply the theme at once, so the user sees the result.
+                    match peruse_core::theme::resolve(t) {
+                        Ok(theme) => {
+                            self.theme_idx = self
+                                .themes
+                                .iter()
+                                .position(|x| x.name == theme.name)
+                                .unwrap_or(self.theme_idx);
+                            self.theme = theme;
+                            self.config.theme = Some(t.to_string());
+                        }
+                        Err(e) => {
+                            self.error(format!("theme: {e}"));
+                            return;
+                        }
+                    }
+                }
+            }
+            Setting::Threads => {
+                if empty {
+                    self.config.threads = None;
+                } else {
+                    match t.parse::<usize>() {
+                        Ok(n) if n >= 1 => self.config.threads = Some(n),
+                        _ => {
+                            self.error(format!("threads: {t:?} is not a number of 1 or more"));
+                            return;
+                        }
+                    }
+                }
+            }
+            Setting::MemoryLimit => {
+                if empty {
+                    self.config.memory_limit_gb = None;
+                } else {
+                    // The unit is always the gigabyte. A user who writes
+                    // "8GB" means the same thing, so take that form too.
+                    //
+                    // Each other unit is refused, and not read as gigabytes.
+                    // A user who writes "512MB" wants half a gigabyte, and
+                    // 512 gigabytes would be a bad surprise.
+                    let upper = t.to_ascii_uppercase();
+                    let digits = upper
+                        .strip_suffix("GIB")
+                        .or_else(|| upper.strip_suffix("GB"))
+                        .or_else(|| upper.strip_suffix("G"))
+                        .unwrap_or(&upper)
+                        .trim();
+                    match digits.parse::<u32>() {
+                        Ok(n) if n >= 1 => self.config.memory_limit_gb = Some(n),
+                        _ => {
+                            self.error(format!(
+                                "memory limit: write a whole number of gigabytes, such as 8 (got {t:?})"
+                            ));
+                            return;
+                        }
+                    }
+                }
+            }
+            Setting::SampleSize => {
+                if empty {
+                    self.config.sample_size = None;
+                } else {
+                    match t.replace([',', '_'], "").parse::<i64>() {
+                        Ok(n) if n == -1 || n > 0 => self.config.sample_size = Some(n),
+                        _ => {
+                            self.error(format!("sample size: {t:?} is not a number, and not -1"));
+                            return;
+                        }
+                    }
+                }
+            }
+            Setting::NoIndex => {
+                self.config.no_index = match t.to_ascii_lowercase().as_str() {
+                    "" => None,
+                    "yes" | "true" | "y" | "on" => Some(false),
+                    "no" | "false" | "n" | "off" => Some(true),
+                    _ => {
+                        self.error("index at open: write yes or no");
+                        return;
+                    }
+                };
+            }
+        }
+        self.settings_editing = false;
+        self.apply_engine_settings();
+        // Keep the change at once. A user who changes a setting means it, and
+        // a second key to keep it is one that the user forgets to press.
+        let kept = match self.save_config() {
+            Ok(()) => String::new(),
+            Err(e) => format!(" (not kept: {e})"),
+        };
+        if s.at_next_file() {
+            self.info(format!(
+                "{}: takes effect at the next file{kept}",
+                s.label()
+            ));
+        } else if !kept.is_empty() {
+            self.error(format!("{}{kept}", s.label()));
+        }
+    }
+
+    /// Sends the settings that DuckDB can change while it runs.
+    fn apply_engine_settings(&mut self) {
+        self.worker.send(Request::Configure {
+            epoch: self.epoch,
+            threads: self.config.threads,
+            memory_limit: self.config.memory_limit_text(),
+        });
+    }
+
+    /// Handles a key in the settings page.
+    fn settings_key(&mut self, key: &KeyEvent) {
+        if self.settings_editing {
+            match self.input.handle(key) {
+                Action::Cancel => self.settings_editing = false,
+                Action::Submit => {
+                    let text = self.input.text();
+                    let s = Setting::ALL[self.settings_sel.min(Setting::ALL.len() - 1)];
+                    self.commit_setting(s, &text);
+                }
+                _ => {}
+            }
+            return;
+        }
+        let n = Setting::ALL.len();
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => self.mode = Mode::Normal,
+            KeyCode::Char('j') | KeyCode::Down => {
+                self.settings_sel = (self.settings_sel + 1).min(n - 1);
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.settings_sel = self.settings_sel.saturating_sub(1);
+            }
+            KeyCode::Enter | KeyCode::Char('e') => {
+                let s = Setting::ALL[self.settings_sel.min(n - 1)];
+                self.input.set(&self.setting_value(s));
+                self.settings_editing = true;
+            }
+            // Remove the value, so Peruse uses the one that it builds in.
+            KeyCode::Char('d') | KeyCode::Delete | KeyCode::Backspace => {
+                let s = Setting::ALL[self.settings_sel.min(n - 1)];
+                self.commit_setting(s, "");
+                self.ok(format!("{}: back to the built-in value", s.label()));
+            }
+            // Take the value that fits this machine.
+            KeyCode::Char('m') => {
+                let s = Setting::ALL[self.settings_sel.min(n - 1)];
+                match s {
+                    Setting::Threads => {
+                        let v = self.resources.cores.to_string();
+                        self.commit_setting(s, &v);
+                        self.ok(format!("threads: {v}, one for each core"));
+                    }
+                    Setting::MemoryLimit => match self.resources.default_memory_gb() {
+                        Some(gb) => {
+                            self.commit_setting(s, &gb.to_string());
+                            self.ok(format!("memory limit: {gb} GB, a quarter of this machine"));
+                        }
+                        None => self.error("this system does not report its memory"),
+                    },
+                    _ => self.info("this setting has no value from the machine"),
+                }
+            }
+            KeyCode::Char('T') => {
+                self.theme_sel = self.theme_idx;
+                self.mode = Mode::ThemePicker;
+            }
+            _ => {}
+        }
+    }
+
     // ------------------------------------------------- the filter builder
 
     /// Puts the compiled filter in the view and asks for the new rows.
@@ -1573,6 +2002,72 @@ impl App {
         }
         self.view.filter = sql;
         self.reload(true);
+    }
+
+    /// Writes what the view shows now, in a few words.
+    ///
+    /// A user who goes back one step must see where they arrived. The name of
+    /// the key alone does not say that.
+    fn view_summary(&self) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        if let Base::Sql(_) = &self.view.base {
+            parts.push("a statement".into());
+        }
+        if let Some(f) = &self.view.filter {
+            parts.push(format!("filter {}", crate::text::truncate(f, 40)));
+        }
+        if let Some(k) = self.view.sort.first() {
+            parts.push(format!("sort {}{}", k.dir.arrow(), k.column));
+        }
+        if parts.is_empty() {
+            "the whole file".into()
+        } else {
+            parts.join(", ")
+        }
+    }
+
+    /// Goes back to the view that the user had before this one, or forward to
+    /// a view that the key `u` removed.
+    fn step_history(&mut self, back: bool) {
+        let taken = if back {
+            self.history.pop()
+        } else {
+            self.undone.pop()
+        };
+        let Some(step) = taken else {
+            self.info(if back {
+                "nothing to go back to"
+            } else {
+                "nothing to go forward to"
+            });
+            return;
+        };
+        let current = ViewStep {
+            view: self.view.clone(),
+            fset: self.fset.clone(),
+        };
+        self.view = step.view;
+        self.fset = step.fset;
+
+        // `reload` writes the history itself. Tell it that this change comes
+        // from the history, so it keeps the way forward.
+        self.restoring = true;
+        self.reload(true);
+        self.restoring = false;
+
+        if back {
+            // `reload` put the view that the user left into the history.
+            // Move it to the list that the key `U` reads instead.
+            self.history.pop();
+            self.undone.push(current);
+        } else {
+            self.history.push(current);
+        }
+        let where_now = self.view_summary();
+        self.ok(format!(
+            "{} {where_now}",
+            if back { "back to" } else { "forward to" }
+        ));
     }
 
     /// Takes a `WHERE` expression as the complete filter.
@@ -2035,6 +2530,8 @@ impl App {
                 }
             }
             Cmd::Sql => self.open_prompt(PromptKind::Sql),
+            Cmd::Undo => self.step_history(true),
+            Cmd::Redo => self.step_history(false),
             Cmd::ResetView => {
                 self.view = View::default();
                 self.fset.clear();
@@ -2154,13 +2651,13 @@ impl App {
             Cmd::ThemeNext => {
                 self.theme_idx = (self.theme_idx + 1) % self.themes.len();
                 self.theme = self.themes[self.theme_idx].clone();
-                let name = self.theme.name.clone();
-                self.ok(format!("theme: {name}"));
+                self.remember_theme();
             }
             Cmd::ThemePicker => {
                 self.theme_sel = self.theme_idx;
                 self.mode = Mode::ThemePicker;
             }
+            Cmd::Settings => self.open_settings(),
         }
     }
 }

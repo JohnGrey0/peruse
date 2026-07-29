@@ -57,6 +57,13 @@ pub enum Request {
         column: String,
         row: u64,
     },
+    /// Apply the settings that DuckDB can change while it runs, and give the
+    /// values that it uses after the change.
+    Configure {
+        epoch: u64,
+        threads: Option<usize>,
+        memory_limit: Option<String>,
+    },
     /// Read one complete row as JSON, for the record view.
     RowJson {
         epoch: u64,
@@ -100,6 +107,7 @@ impl Request {
             | Request::Stats { epoch, .. }
             | Request::Cell { epoch, .. }
             | Request::RowJson { epoch, .. }
+            | Request::Configure { epoch, .. }
             | Request::Search { epoch, .. }
             | Request::Meta { epoch }
             | Request::Index { epoch } => *epoch,
@@ -119,7 +127,8 @@ impl Request {
             Request::Meta { .. } => 5,
             Request::Index { .. } => 6,
             Request::RowJson { .. } => 7,
-            Request::Shutdown => 8,
+            Request::Configure { .. } => 8,
+            Request::Shutdown => 9,
         }
     }
 }
@@ -140,6 +149,8 @@ pub enum Response {
     Cell { epoch: u64, row: u64, column: String, value: Option<String> },
     /// One complete row as JSON.
     RowJson { epoch: u64, row: u64, json: Option<String> },
+    /// The values that DuckDB uses after a change to its settings.
+    Configured { epoch: u64, threads: Option<String>, memory_limit: Option<String> },
     /// The offsets of the rows that match, and the part of the view that the
     /// worker examined.
     Search { epoch: u64, hits: Vec<u64>, from: u64, scan: u64 },
@@ -380,6 +391,18 @@ fn handle(engine: &mut Engine, req: Request, tx: &Sender<Response>) -> Result<()
             }
         }
 
+        Request::Configure { epoch, threads, memory_limit } => {
+            match engine.apply_settings(threads, memory_limit.as_deref()) {
+                Ok(()) => tx
+                    .send(Response::Configured {
+                        epoch,
+                        threads: engine.current_setting("threads"),
+                        memory_limit: engine.current_setting("memory_limit"),
+                    })
+                    .map_err(|_| ()),
+                Err(e) => fail(tx, epoch, "settings", e),
+            }
+        }
         Request::RowJson { epoch, view, schema, row } => {
             match engine.row_json(&view, &schema, row) {
                 Ok(json) => tx
