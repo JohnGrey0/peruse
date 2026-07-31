@@ -247,7 +247,7 @@ impl Term {
                     Op::StartsWith => format!("({})", like(&as_text, value, false, true)),
                     Op::EndsWith => format!("({})", like(&as_text, value, true, false)),
                     // A row with NULL holds no text, so it does not hold the
-                    // value. `NOT (NULL ILIKE …)` gives NULL, and the row
+                    // value. `NOT (NULL ILIKE ...)` gives NULL, and the row
                     // would go away. The call to coalesce keeps it.
                     Op::NotContains => format!(
                         "(NOT coalesce({}, false))",

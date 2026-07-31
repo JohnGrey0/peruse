@@ -16,6 +16,12 @@ pub enum Format {
     Json,
     /// The Arrow IPC format, which also has the name Feather version 2.
     Arrow,
+    /// A DuckDB database file. Such a file holds many tables, so Peruse
+    /// attaches it and reads one table of it.
+    DuckDb,
+    /// A SQLite database file. Peruse cannot read one, and it gives the format
+    /// a name so that the message can say why.
+    Sqlite,
 }
 
 impl fmt::Display for Format {
@@ -25,6 +31,8 @@ impl fmt::Display for Format {
             Format::Csv => "csv",
             Format::Json => "json",
             Format::Arrow => "arrow",
+            Format::DuckDb => "duckdb",
+            Format::Sqlite => "sqlite",
         })
     }
 }
@@ -49,6 +57,11 @@ pub struct Source {
     pub delimiter: Option<char>,
     /// `true` when the file name ends with `.gz`, `.zst` or `.bz2`.
     pub compressed: bool,
+    /// The table that the grid shows, for a database source.
+    ///
+    /// A file holds one table, and that table has no name of its own, so the
+    /// value is `None` for a file.
+    pub table: Option<String>,
 }
 
 impl Source {
@@ -59,7 +72,14 @@ impl Source {
 
     /// Gives the text for the title bar: the name of the file, or a name and
     /// the number of the other files, such as `name.parquet +3`.
+    ///
+    /// A database holds many tables, so the title also names the table that the
+    /// grid shows. The name of the file alone would not say which rows these
+    /// are.
     pub fn title(&self) -> String {
+        if let Some(table) = &self.table {
+            return format!("{} · {table}", self.label);
+        }
         if self.is_multi() {
             format!("{} +{}", self.label, self.files.len() - 1)
         } else {
@@ -113,6 +133,53 @@ fn sniff_magic(path: &Path) -> Option<Format> {
     }
 }
 
+/// The position of the mark `DUCK` in a DuckDB database file.
+///
+/// The first eight bytes of the file hold a checksum of the header, and the
+/// mark follows them.
+const DUCKDB_MARK_AT: usize = 8;
+
+/// The mark of a DuckDB database file.
+const DUCKDB_MARK: &[u8] = b"DUCK";
+
+/// The mark of a SQLite database file. The zero byte is part of it.
+const SQLITE_MARK: &[u8] = b"SQLite format 3\0";
+
+/// The number of bytes that [`sniff_database`] needs for both marks.
+const DB_HEAD_LEN: usize = if DUCKDB_MARK_AT + DUCKDB_MARK.len() > SQLITE_MARK.len() {
+    DUCKDB_MARK_AT + DUCKDB_MARK.len()
+} else {
+    SQLITE_MARK.len()
+};
+
+/// Reads the first bytes of the file and finds a database format.
+///
+/// The name of a database file says nothing certain. A file `.db` can hold a
+/// DuckDB database, a SQLite database or something else, and a user can give a
+/// database any name at all. The first bytes are therefore the only honest
+/// test, and [`detect`] makes this test before it reads the extension.
+///
+/// A DuckDB file holds `DUCK` after its checksum. A SQLite file starts with
+/// `SQLite format 3` and one zero byte.
+fn sniff_database(path: &Path) -> Option<Format> {
+    use std::io::Read;
+    let f = std::fs::File::open(path).ok()?;
+    // One read can give fewer bytes than the caller asked for. The function
+    // `read_to_end` over a reader with a limit therefore reads until the head is
+    // full or the file ends. A file that is shorter than the marks is not a
+    // database, and `read_exact` would give an error for it.
+    let mut head = Vec::with_capacity(DB_HEAD_LEN);
+    f.take(DB_HEAD_LEN as u64).read_to_end(&mut head).ok()?;
+    if head.starts_with(SQLITE_MARK) {
+        return Some(Format::Sqlite);
+    }
+    let end = DUCKDB_MARK_AT + DUCKDB_MARK.len();
+    if head.len() >= end && &head[DUCKDB_MARK_AT..end] == DUCKDB_MARK {
+        return Some(Format::DuckDb);
+    }
+    None
+}
+
 /// Finds the format from the extension of the file, and the delimiter that
 /// the extension gives.
 ///
@@ -131,21 +198,35 @@ pub fn by_extension(path: &Path) -> Option<(Format, Option<char>)> {
         Some("psv") => Some((Format::Csv, Some('|'))),
         Some("json" | "ndjson" | "jsonl") => Some((Format::Json, None)),
         Some("arrow" | "ipc" | "feather" | "arrows") => Some((Format::Arrow, None)),
+        // The chooser of files lists a database with these two extensions. The
+        // first bytes decide the format of a file that Peruse opens, so a
+        // database with another name still opens. Refer to [`detect`].
+        Some("duckdb" | "ddb") => Some((Format::DuckDb, None)),
         _ => None,
     }
 }
 
 /// Finds the format of a file, the delimiter and the compression.
 ///
-/// The function uses three tests, in this order:
+/// The function uses four tests, in this order:
 ///
-/// 1. The extension of the file.
-/// 2. The first four bytes of the file.
-/// 3. CSV, as the last choice.
+/// 1. The first bytes, for a database file.
+/// 2. The extension of the file.
+/// 3. The first four bytes of the file.
+/// 4. CSV, as the last choice.
 ///
 /// A file `data.dat` that holds values with commas therefore opens correctly.
+///
+/// A database comes first, because a database can carry any name. A file
+/// `sales.db` that holds a SQLite database therefore gets a message about
+/// SQLite, and not a parse failure from the CSV reader.
 pub fn detect(path: &Path) -> (Format, Option<char>, bool) {
     let (_, compressed) = effective_extension(path);
+    // A database file holds its data in blocks that the storage engine reads.
+    // No such file arrives compressed, so the answer here says `false`.
+    if let Some(fmt) = sniff_database(path) {
+        return (fmt, None, false);
+    }
     if let Some((fmt, delim)) = by_extension(path) {
         return (fmt, delim, compressed);
     }
@@ -229,7 +310,7 @@ pub fn json_depth_over(path: &Path, limit: usize) -> bool {
 /// On Windows, `std::fs::canonicalize` gives a verbatim path, which starts
 /// with `\\?\`. Windows gives such a path to its own calls with no change, and
 /// it does not read a forward slash inside one. A change of the separators
-/// would therefore give `//?/C:/…`, and that path never opens again.
+/// would therefore give `//?/C:/...`, and that path never opens again.
 ///
 /// The function removes that start first, and then changes the separators.
 /// A path with no verbatim start accepts a forward slash on Windows.
@@ -321,6 +402,56 @@ mod tests {
         assert_eq!(detect(Path::new("a.jsonl")).0, Format::Json);
         assert_eq!(detect(Path::new("a.arrow")).0, Format::Arrow);
         assert_eq!(detect(Path::new("a.feather")).0, Format::Arrow);
+        // The chooser of files reads the name only, and it must list a
+        // database.
+        assert_eq!(by_extension(Path::new("a.duckdb")).unwrap().0, Format::DuckDb);
+        assert_eq!(by_extension(Path::new("a.ddb")).unwrap().0, Format::DuckDb);
+    }
+
+    #[test]
+    fn the_first_bytes_find_a_database_whatever_the_name_is() {
+        // A database can carry any name, so the name is not a test. The mark
+        // `DUCK` follows the eight bytes of the checksum.
+        let dir = std::env::temp_dir().join("peruse-sniff-db");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut duck = vec![0u8; 8];
+        duck.extend_from_slice(b"DUCK");
+        duck.extend_from_slice(&[0u8; 32]);
+        for name in ["shop.db", "shop.csv", "shop", "shop.parquet"] {
+            let p = dir.join(name);
+            std::fs::write(&p, &duck).unwrap();
+            assert_eq!(detect(&p).0, Format::DuckDb, "file {name}");
+        }
+
+        // A SQLite file gets its own format, so that the message can name it.
+        let mut lite = b"SQLite format 3\0".to_vec();
+        lite.extend_from_slice(&[0u8; 32]);
+        for name in ["shop.db", "shop.sqlite", "shop.duckdb"] {
+            let p = dir.join(name);
+            std::fs::write(&p, &lite).unwrap();
+            assert_eq!(detect(&p).0, Format::Sqlite, "file {name}");
+        }
+
+        // The head that the function reads must cover both marks. The mark of
+        // SQLite is the longer of the two, and a file that holds it and nothing
+        // else still gets the name of SQLite.
+        let p = dir.join("bare.db");
+        std::fs::write(&p, b"SQLite format 3\0").unwrap();
+        assert_eq!(detect(&p).0, Format::Sqlite, "the head is too short");
+
+        // The mark must be at the right place. The four letters somewhere else
+        // are a value of a file of text.
+        let p = dir.join("word.csv");
+        std::fs::write(&p, b"name\nDUCK\n").unwrap();
+        assert_eq!(detect(&p).0, Format::Csv);
+
+        // A file that is shorter than the marks is not a database, and it must
+        // not stop the program either.
+        let p = dir.join("tiny.csv");
+        std::fs::write(&p, b"a\n1\n").unwrap();
+        assert_eq!(detect(&p).0, Format::Csv);
     }
 
     #[test]
@@ -402,7 +533,7 @@ mod tests {
     #[test]
     fn a_path_for_the_settings_file_opens_again() {
         // On Windows, `canonicalize` gives a verbatim path. A change of the
-        // separators inside one gives `//?/C:/…`, and Windows cannot open
+        // separators inside one gives `//?/C:/...`, and Windows cannot open
         // that. The list of the files that the user opened was therefore
         // always empty on Windows.
         if cfg!(windows) {
@@ -425,7 +556,7 @@ mod tests {
 
     #[test]
     fn a_path_from_an_older_settings_file_still_opens() {
-        // A version before this one wrote `//?/C:/…`. A user keeps the list
+        // A version before this one wrote `//?/C:/...`. A user keeps the list
         // of files that they built.
         if cfg!(windows) {
             assert_eq!(

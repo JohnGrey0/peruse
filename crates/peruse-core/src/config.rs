@@ -60,6 +60,19 @@ pub struct Config {
     pub no_index: Option<bool>,
     /// The panels that stay on the screen: `none`, `meta`, `stats` or `both`.
     pub panels: Option<String>,
+    /// The rows of facts under the column names: `off`, `compact` or
+    /// `detailed`.
+    pub band: Option<String>,
+    /// The number of rows or columns that one step moves.
+    ///
+    /// The keys `J`, `K`, `H` and `L` move by this number.
+    pub step: Option<usize>,
+    /// `false` to make Peruse ignore the mouse.
+    ///
+    /// A terminal that sends the mouse to the program does not select text with
+    /// the mouse in the usual way. A user who copies text out of the grid with
+    /// the mouse each day can turn the mouse off here.
+    pub mouse: Option<bool>,
     /// The files that the user opened, the newest first.
     ///
     /// The chooser of files puts these at the top of its list. A user opens
@@ -215,6 +228,18 @@ impl Config {
         s.push_str("\n# The panels that stay at the side of the grid:\n");
         s.push_str("# none, meta, stats or both.\n");
         push_opt(&mut s, "panels", self.panels.as_deref().map(quote));
+
+        s.push_str("\n# The rows of facts under the column names:\n");
+        s.push_str("# off, compact or detailed. The key d moves through the three.\n");
+        push_opt(&mut s, "band", self.band.as_deref().map(quote));
+
+        s.push_str("\n# The rows or columns that the keys J, K, H and L move.\n");
+        push_opt(&mut s, "step", self.step.map(|v| v.to_string()));
+
+        s.push_str("\n# Set this to false to make peruse ignore the mouse.\n");
+        s.push_str("# With the mouse on, the terminal gives each click and each turn of\n");
+        s.push_str("# the wheel to peruse, and it does not select text in the usual way.\n");
+        push_opt(&mut s, "mouse", self.mouse.map(|v| v.to_string()));
 
         s.push_str("\n# The files that you opened, the newest first.\n");
         s.push_str("# The chooser of files puts these at the top of its list.\n");
@@ -421,6 +446,9 @@ mod tests {
             sample_size: Some(-1),
             no_index: Some(true),
             panels: Some("both".into()),
+            band: Some("detailed".into()),
+            step: Some(25),
+            mouse: Some(false),
             recent: vec!["/data/a.parquet".into(), "C:/data/b.csv".into()],
         };
         let back: Config = toml::from_str(&c.to_toml()).unwrap();

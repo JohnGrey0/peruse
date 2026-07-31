@@ -13,7 +13,7 @@ The crate `peruse-core` holds these modules:
 
 | Module | Function |
 |---|---|
-| `engine.rs` | The connection to DuckDB, the open operation, the pages, the counts, the statistics, the metadata and the CSV index |
+| `engine.rs` | The connection to DuckDB, the open operation, the pages, the counts, the statistics, the facts of the detail band, the metadata, the tables of a database and the index of a file of text |
 | `query.rs` | The code that builds SQL from the view |
 | `filter.rs` | The list of conditions, and the `WHERE` expression that it compiles to |
 | `ddl.rs` | The `CREATE TABLE` statement for another database, and the rules behind it |
@@ -25,6 +25,7 @@ The crate `peruse-core` holds these modules:
 | `stats.rs` | The statistics of a column and the histogram |
 | `source.rs` | The format detection, and the text forms of a size and a count |
 | `theme.rs` | The colors, the built-in themes and the theme files |
+| `dirs.rs` | The directories for the settings and for the theme files |
 
 The crate `peruse-tui` holds these modules:
 
@@ -32,7 +33,7 @@ The crate `peruse-tui` holds these modules:
 |---|---|
 | `main.rs` | The options of the command line, the terminal, and the event loop |
 | `app.rs` | The state of the application and each change to that state |
-| `browser.rs` | The screen that a call with no file opens |
+| `browser.rs` | The screen that a call with no file opens, and the picker of the tables of a database |
 | `grid.rs` | The grid of rows and columns |
 | `panels.rs` | The metadata panel and the column statistics panel |
 | `overlays.rs` | The help, the palette, the theme picker, the cell inspector, the record view and the filter builder |
@@ -54,7 +55,7 @@ interface (GUI) can therefore use the same API.
 
 | Thread | Name | Work |
 |---|---|---|
-| The main thread | — | It draws the frames and it changes the state. |
+| The main thread | none | It draws the frames and it changes the state. |
 | The input thread | `peruse-input` | It reads the terminal events and sends them. |
 | The engine thread | `peruse-engine` | It runs the engine and sends the responses. |
 
@@ -78,13 +79,20 @@ The steps below show what happens after the user presses a key:
    or open an overlay, or change the view.
 5. A change of the view calls `App::reload`. That function increases the epoch,
    discards the old results, and sends the request `SetView`.
-6. The main thread draws the frame. The function `App::ensure_rows` then asks
-   for a page when the grid needs rows that the current page does not hold.
+6. The main thread draws the frame. The functions `App::ensure_rows` and
+   `App::ensure_band` then ask for a page and for the facts of the columns, when
+   the grid needs something that it does not hold.
 7. The worker combines the requests in its queue, does the work, and sends the
    responses.
 8. The main thread receives each response and gives it to `App::on_response`.
    That function discards a response with an old epoch.
 9. The main thread draws the next frame.
+
+A mouse event follows the same path, through `App::on_mouse`. The event carries a
+row and a column of the terminal, and the code that drew the last frame wrote
+the position of each cell into `App::hit`. Peruse draws a frame only when the
+event changed something: with the mouse on, the terminal reports each movement
+of the pointer, and a frame for each of them would draw the same screen again.
 
 ## The state
 

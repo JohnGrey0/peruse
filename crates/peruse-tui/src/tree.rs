@@ -5,7 +5,7 @@
 //! text:
 //!
 //! ```text
-//! {'id': 665991, 'login': petroav, 'url': 'https://api.github.com/users/pe…
+//! {'id': 665991, 'login': petroav, 'url': 'https://api.github.com/users/pe...
 //! ```
 //!
 //! That text says what the value holds, but the user cannot read one field of

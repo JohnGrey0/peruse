@@ -68,35 +68,48 @@ pub fn draw(f: &mut Frame, app: &mut App, depth: Depth) {
 
     // An overlay that takes text gives the position of the terminal cursor
     // back. The caller therefore needs no second calculation of the layout.
+    //
+    // Each overlay also gives its box back. This frame is the only place that
+    // knows where an overlay sits, and the mouse needs the box. A mode with no
+    // overlay writes `None`, so a click can never act on a box that is gone.
     let mut overlay_cursor = None;
-    match app.mode {
-        Mode::Help => overlays::draw_help(f.buffer_mut(), area, app, &p),
-        Mode::Palette => overlays::draw_palette(f.buffer_mut(), area, app, &p),
-        Mode::ThemePicker => overlays::draw_theme_picker(f.buffer_mut(), area, app, &p),
-        Mode::Cell => overlays::draw_cell(f.buffer_mut(), area, app, &p),
-        Mode::Record => overlay_cursor = overlays::draw_record(f.buffer_mut(), area, app, &p),
-        Mode::FilterBuild => {
-            overlay_cursor = overlays::draw_filter_build(f.buffer_mut(), area, app, &p)
+    let overlay = match app.mode {
+        Mode::Help => Some(overlays::draw_help(f.buffer_mut(), area, app, &p)),
+        Mode::Palette => Some(overlays::draw_palette(f.buffer_mut(), area, app, &p)),
+        Mode::ThemePicker => Some(overlays::draw_theme_picker(f.buffer_mut(), area, app, &p)),
+        Mode::Cell => Some(overlays::draw_cell(f.buffer_mut(), area, app, &p)),
+        Mode::Record => {
+            let drawn = overlays::draw_record(f.buffer_mut(), area, app, &p);
+            overlay_cursor = drawn.cursor;
+            Some(drawn.hit)
         }
-        Mode::Settings => overlay_cursor = overlays::draw_settings(f.buffer_mut(), area, app, &p),
-        _ => {}
-    }
+        Mode::FilterBuild => {
+            let drawn = overlays::draw_filter_build(f.buffer_mut(), area, app, &p);
+            overlay_cursor = drawn.cursor;
+            Some(drawn.hit)
+        }
+        Mode::Settings => {
+            let drawn = overlays::draw_settings(f.buffer_mut(), area, app, &p);
+            overlay_cursor = drawn.cursor;
+            Some(drawn.hit)
+        }
+        _ => None,
+    };
+    app.overlay = overlay;
 
     if let Some(pos) = overlay_cursor {
         f.set_cursor_position(pos);
         return;
     }
 
-    // The palette holds its own prompt inside the overlay.
+    // The palette holds its own prompt inside the overlay. Ask the overlay for
+    // its box, so one calculation gives the box and the cursor. The prompt is
+    // on the row `y + 1`, and its text starts at the column `x + 4`.
     if app.mode == Mode::Palette {
-        // Multiply with 32 bits. A terminal of more than 936 columns makes
-        // `width * 70` too large for 16 bits. These two calculations must give
-        // the same result as `overlays::centered` with the same percentages.
-        let pct = |v: u16, p: u16| -> u16 { ((v as u32 * p as u32) / 100) as u16 };
-        let outer_x = area.x + (area.width - pct(area.width, 70).min(76)) / 2;
+        let r = overlays::palette_rect(area);
         f.set_cursor_position(Position::new(
-            outer_x + 4 + app.input.cursor_col() as u16,
-            area.y + (area.height - pct(area.height, 70)) / 2 + 1,
+            r.x + 4 + app.input.cursor_col() as u16,
+            r.y + 1,
         ));
     } else if let Some(pos) = cursor {
         f.set_cursor_position(pos);
@@ -110,17 +123,23 @@ pub fn draw(f: &mut Frame, app: &mut App, depth: Depth) {
 /// Below this, each of the two would have one row of text inside its border.
 /// One panel with room to say something is more use than two with none.
 const BOTH_PANELS_MIN_HEIGHT: u16 = 14;
-/// The rows that the statistics take in the stacked view.
+/// The smallest height of the statistics panel in the stacked view.
 ///
-/// The statistics of a column have an end: some rows of numbers, a chart of
-/// one row, and the most frequent values. The metadata holds the list of
-/// columns, which has no end, so the metadata takes the room that is left.
-const STATS_HEIGHT: u16 = 18;
+/// The statistics of a column arrive after the engine reads them, and the panel
+/// holds one row until they do. This limit keeps the panel near the height of
+/// the first numbers, so the border makes a small step and not a large one.
+const STATS_MIN_HEIGHT: u16 = 8;
+/// The rows that the metadata panel always keeps in the stacked view.
+///
+/// Two rows go to the border, one row to the heading `columns`, and the rest to
+/// the list of columns and the first rows of the summary. Below this the panel
+/// says nothing that the user can read.
+const META_MIN_HEIGHT: u16 = 8;
 
 /// Draws the panel that is open, or the two panels one above the other.
 fn draw_panel(f: &mut Frame, area: Rect, app: &App, p: &Paint) {
     match app.panel {
-        Panel::Meta => panels::draw_meta(f.buffer_mut(), area, app, p, false),
+        Panel::Meta => panels::draw_meta(f.buffer_mut(), area, app, p),
         Panel::Stats => panels::draw_stats(f.buffer_mut(), area, app, p),
         Panel::Both => {
             if area.height < BOTH_PANELS_MIN_HEIGHT {
@@ -130,19 +149,61 @@ fn draw_panel(f: &mut Frame, area: Rect, app: &App, p: &Paint) {
                 panels::note(f.buffer_mut(), area, app, p, " screen too short for both ");
                 return;
             }
-            // The metadata goes on top, and the statistics below it. The
-            // order never changes, so the eye finds each of them in the same
-            // place.
-            let stats_h = STATS_HEIGHT.min(area.height / 2).max(8);
-            let parts = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([Constraint::Min(6), Constraint::Length(stats_h)])
-                .split(area);
-            panels::draw_meta(f.buffer_mut(), parts[0], app, p, true);
-            panels::draw_stats(f.buffer_mut(), parts[1], app, p);
+            // The metadata goes on top, and the statistics below it. The order
+            // never changes, so the eye finds each of them on the same side.
+            //
+            // The line between them moves, because each panel takes the height
+            // that its own content needs. A column of numbers asks for four
+            // more rows than a column of text, for the chart of the
+            // distribution.
+            let (meta, stats) = split_panels(area, panels::stats_content_height(app));
+            panels::draw_meta(f.buffer_mut(), meta, app, p);
+            panels::draw_stats(f.buffer_mut(), stats, app, p);
         }
         Panel::None => {}
     }
+}
+
+/// Divides the side pane between the metadata panel above and the statistics
+/// panel below.
+///
+/// `stats_content` is the count of rows that the statistics need inside their
+/// border. The statistics get that height and no more, because they have an
+/// end. The metadata then keeps each row that is left: it holds the list of
+/// columns, and that list has no end.
+///
+/// The limit on the statistics is the room that the metadata must keep, and not
+/// one half of the pane. One half is the wrong limit in the two directions: on
+/// a tall pane it cuts the statistics while the metadata above them holds empty
+/// rows, and on a short pane it gives the metadata too little to read.
+///
+/// The result covers the area exactly, with no gap and no overlap.
+fn split_panels(area: Rect, stats_content: u16) -> (Rect, Rect) {
+    // Two rows for the border of the statistics panel.
+    let want = stats_content.saturating_add(2).max(STATS_MIN_HEIGHT);
+    // A column with many frequent values must not push the metadata out. On a
+    // pane that cannot hold the two minimum heights, the metadata keeps one
+    // half: the two panels are then both small, and neither one is empty.
+    let room = area
+        .height
+        .saturating_sub(META_MIN_HEIGHT)
+        .max(area.height / 2);
+    let stats_h = want.min(room);
+    let meta_h = area.height.saturating_sub(stats_h);
+    (
+        Rect {
+            x: area.x,
+            y: area.y,
+            width: area.width,
+            height: meta_h,
+        },
+        Rect {
+            x: area.x,
+            y: area.y.saturating_add(meta_h),
+            width: area.width,
+            height: stats_h,
+        },
+    )
 }
 
 /// Draws the title bar.
@@ -284,7 +345,7 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App, p: &Paint) -> Option<Positi
         }
 
         // The name of a column that the user did not type yet, in a dim
-        // color, after the cursor. The key Tab and the key → take it.
+        // color, after the cursor. The key Tab and the key -> take it.
         if let Some(rest) = app.ghost() {
             let gx = vx + app.input.cursor_col() as u16;
             if gx < area.right() {
@@ -507,11 +568,112 @@ mod tests {
         assert_eq!(short_desc("quit"), "quit");
     }
 
+    /// A side pane of the given height, as the layout of the body gives it.
+    fn pane(height: u16) -> Rect {
+        Rect {
+            x: 54,
+            y: 1,
+            width: SIDE_PANEL_WIDTH,
+            height,
+        }
+    }
+
+    /// Tests that the two panels cover the pane and nothing outside it.
+    fn covers_the_pane(area: Rect, meta: Rect, stats: Rect) {
+        assert_eq!(meta.y, area.y, "the metadata starts at the top");
+        assert_eq!(stats.y, meta.bottom(), "no gap and no overlap");
+        assert_eq!(
+            meta.height + stats.height,
+            area.height,
+            "the two panels must fill the pane"
+        );
+        assert!(stats.bottom() <= area.bottom(), "the statistics leave the pane");
+    }
+
+    #[test]
+    fn the_statistics_take_the_height_of_their_content_and_no_more() {
+        // A tall pane: the statistics end after their content, and each row
+        // that is left goes to the metadata. The metadata holds the list of
+        // columns, and that list has no end.
+        let area = pane(57);
+        let (meta, stats) = split_panels(area, 12);
+        assert_eq!(stats.height, 14, "12 rows of content and 2 of border");
+        assert_eq!(meta.height, 43);
+        covers_the_pane(area, meta, stats);
+    }
+
+    #[test]
+    fn a_short_pane_still_holds_the_two_panels() {
+        let area = pane(BOTH_PANELS_MIN_HEIGHT);
+        let (meta, stats) = split_panels(area, 12);
+        covers_the_pane(area, meta, stats);
+        assert!(meta.height >= 6, "the metadata needs room to say something");
+        assert!(stats.height >= 6, "the statistics need room to say something");
+    }
+
+    #[test]
+    fn a_pane_of_no_rows_makes_no_panel_outside_it() {
+        for height in [0u16, 1] {
+            let area = pane(height);
+            let (meta, stats) = split_panels(area, 12);
+            covers_the_pane(area, meta, stats);
+            // One row cannot hold a border, so the statistics get nothing and
+            // draw nothing.
+            assert_eq!(stats.height, 0);
+        }
+    }
+
+    #[test]
+    fn content_taller_than_the_pane_cannot_squeeze_the_metadata_out() {
+        // A column with many frequent values asks for more rows than the pane
+        // has. The metadata keeps its smallest usable height, and the
+        // statistics take each row that is left.
+        let area = pane(30);
+        let (meta, stats) = split_panels(area, 200);
+        assert_eq!(meta.height, META_MIN_HEIGHT);
+        assert_eq!(stats.height, 30 - META_MIN_HEIGHT);
+        covers_the_pane(area, meta, stats);
+    }
+
+    #[test]
+    fn a_tall_pane_gives_the_statistics_each_row_of_their_content() {
+        // One half of the pane is the wrong limit in this direction. One half
+        // of 57 rows is 28, so content of 30 rows lost 2 rows of frequent
+        // values while the metadata above it held 27 empty rows.
+        let area = pane(57);
+        let (meta, stats) = split_panels(area, 30);
+        assert_eq!(stats.height, 32, "30 rows of content and 2 of border");
+        assert_eq!(meta.height, 25);
+        covers_the_pane(area, meta, stats);
+    }
+
+    #[test]
+    fn a_pane_that_holds_neither_minimum_gives_the_metadata_one_half() {
+        // The two smallest heights together need more rows than this pane has.
+        // Neither panel can have what it asks for, so the two share the pane
+        // and neither one is empty.
+        let area = pane(BOTH_PANELS_MIN_HEIGHT);
+        let (meta, stats) = split_panels(area, 40);
+        assert_eq!(meta.height, BOTH_PANELS_MIN_HEIGHT / 2);
+        assert_eq!(stats.height, BOTH_PANELS_MIN_HEIGHT / 2);
+        covers_the_pane(area, meta, stats);
+    }
+
+    #[test]
+    fn the_statistics_keep_a_floor_while_the_engine_reads_them() {
+        // With no answer yet the panel shows one row. The limit keeps the
+        // panel near the height of the first numbers, so the border makes a
+        // small step when the answer arrives.
+        let area = pane(57);
+        let (_, stats) = split_panels(area, 1);
+        assert_eq!(stats.height, STATS_MIN_HEIGHT);
+    }
+
     #[test]
     fn every_footer_hint_has_a_short_form() {
         // The footer has little space. A description with no short form
         // falls back to its first word, and that word is often the wrong
-        // one: "build a filter …" would show as "build".
+        // one: "build a filter ..." would show as "build".
         for cmd in overlays::FOOTER_HINTS {
             let b = commands::binding(*cmd).expect("hint with no entry in the table");
             let short = short_desc(b.desc);

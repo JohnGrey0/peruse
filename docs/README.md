@@ -9,7 +9,7 @@ starts with a summary of one paragraph, and then gives short sections. Read
 | Document | Subject |
 |---|---|
 | [architecture.md](architecture.md) | The two crates, the threads, and the path from a key to a frame |
-| [engine.md](engine.md) | The set-up of DuckDB, the open operation, the pages, the counts and the CSV index |
+| [engine.md](engine.md) | The set-up of DuckDB, the open operation, the pages, the counts, a database file and the index of a file of text |
 | [query-generation.md](query-generation.md) | How the view becomes SQL, and each statement that Peruse builds |
 | [filter.md](filter.md) | The list of conditions, the operators, and how the list becomes one expression |
 | [ddl.md](ddl.md) | How Peruse measures a file and writes a `CREATE TABLE` statement for another database |
@@ -17,11 +17,12 @@ starts with a summary of one paragraph, and then gives short sections. Read
 | [read-only-guard.md](read-only-guard.md) | The two layers that stop a write, and the statements that pass |
 | [worker-and-concurrency.md](worker-and-concurrency.md) | The worker thread, the combination of requests, the epoch and the cancellation |
 | [user-interface.md](user-interface.md) | The layout, the grid, the panels, the overlays and the prompt |
-| [keys-and-commands.md](keys-and-commands.md) | The table of commands, and the help and the palette that come from it |
-| [chooser.md](chooser.md) | The screen that a call with no file opens, and how it finds the data files |
+| [keys-and-commands.md](keys-and-commands.md) | The table of commands, the mouse, and the help and the palette that come from it |
+| [chooser.md](chooser.md) | The screen that a call with no file opens, how it finds the data files, and the picker of the tables of a database |
 | [settings.md](settings.md) | The settings that Peruse keeps, the settings page, and what the machine gives |
 | [themes.md](themes.md) | The model of the colors, the built-in themes, and how to write a theme file |
 | [performance.md](performance.md) | The measured times, and the decisions that give them |
+| [releasing.md](releasing.md) | The forms that Peruse goes out in, the release script, and the steps by hand |
 
 ## The rules for this documentation
 
@@ -55,6 +56,8 @@ the code. The right column gives the words that these documents do not use.
 |---|---|---|
 | file | The data on the disk that Peruse shows | dataset, document, data source |
 | file set | More than one file that Peruse shows as one table | dataset, partition |
+| database | A DuckDB database file, which holds many tables | db, catalog, store |
+| table | One named group of rows inside a database | relation, dataset |
 | row | One record of the data | record, line, entry, tuple |
 | column | One field of the data | field, attribute |
 | cell | One value at one row and one column | box, item |
@@ -77,6 +80,12 @@ the code. The right column gives the words that these documents do not use.
 | response | An answer from the worker | reply, result, event |
 | panel | The metadata panel or the column statistics panel | sidebar, pane |
 | side pane | The area at the side of the grid that holds the panels | sidebar, dock |
+| detail band | The rows of facts between the column names and the first row of data | band, summary row, info row |
+| family | One group of types that share a color, from `CellKind` | kind, class, category |
+| mark | The dim character after a column name that gives the family | badge, tag, sigil |
+| step | The number of rows or columns that one press of `J`, `K`, `H` or `L` moves | jump, stride |
+| wheel | The wheel of the mouse | scroll wheel |
+| click | One press of the left button of the mouse | tap, press |
 | setting | One value that Peruse keeps between sessions | option, preference, config |
 | overlay | A box that covers the grid: the help, the palette, the theme picker, the cell inspector, the record view or the filter builder | popup, dialog, modal |
 | record view | The overlay that shows one row from the top to the bottom | transpose, detail view |

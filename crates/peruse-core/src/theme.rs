@@ -254,7 +254,13 @@ impl Theme {
 }
 
 /// The themes that Peruse holds inside the program.
+///
+/// The first theme is the default theme, and it must stay in the first place.
+/// The other themes are in groups. Most groups hold a dark form and a light
+/// form of the same palette, because a user of a light terminal also needs a
+/// choice. The colors of each group come from the palette of that project.
 pub static BUILTINS: &[Base] = &[
+    // The themes of Peruse.
     Base {
         name: "peruse-dark",
         dark: true,
@@ -289,6 +295,7 @@ pub static BUILTINS: &[Base] = &[
         cyan: rgb(0x0f7b8a),
         orange: rgb(0xb35c1e),
     },
+    // The themes that give a dark form only.
     Base {
         name: "nord",
         dark: true,
@@ -323,6 +330,45 @@ pub static BUILTINS: &[Base] = &[
         cyan: rgb(0x8be9fd),
         orange: rgb(0xffb86c),
     },
+    // Monokai. The palette of the editor has no cyan, so the yellow and the
+    // cyan come from the Monokai palette for a terminal.
+    Base {
+        name: "monokai",
+        dark: true,
+        bg: rgb(0x272822),
+        bg_alt: rgb(0x1e1f1c),
+        fg: rgb(0xf8f8f2),
+        dim: rgb(0x75715e),
+        border: rgb(0x49483e),
+        sel: rgb(0x3e3d32),
+        red: rgb(0xf92672),
+        green: rgb(0xa6e22e),
+        yellow: rgb(0xf4bf75),
+        blue: rgb(0x66d9ef),
+        magenta: rgb(0xae81ff),
+        cyan: rgb(0xa1efe4),
+        orange: rgb(0xfd971f),
+    },
+    // Kanagawa, in the Wave form. The red is peachRed, because the color
+    // samuraiRed is too dark on this background.
+    Base {
+        name: "kanagawa",
+        dark: true,
+        bg: rgb(0x1f1f28),
+        bg_alt: rgb(0x16161d),
+        fg: rgb(0xdcd7ba),
+        dim: rgb(0x727169),
+        border: rgb(0x2a2a37),
+        sel: rgb(0x2d4f67),
+        red: rgb(0xff5d62),
+        green: rgb(0x98bb6c),
+        yellow: rgb(0xe6c384),
+        blue: rgb(0x7e9cd8),
+        magenta: rgb(0x957fb8),
+        cyan: rgb(0x7fb4ca),
+        orange: rgb(0xffa066),
+    },
+    // Gruvbox. Peruse uses the medium background of the three levels.
     Base {
         name: "gruvbox-dark",
         dark: true,
@@ -340,6 +386,25 @@ pub static BUILTINS: &[Base] = &[
         cyan: rgb(0x8ec07c),
         orange: rgb(0xfe8019),
     },
+    Base {
+        name: "gruvbox-light",
+        dark: false,
+        bg: rgb(0xfbf1c7),
+        bg_alt: rgb(0xf2e5bc),
+        fg: rgb(0x3c3836),
+        dim: rgb(0x7c6f64),
+        border: rgb(0xd5c4a1),
+        sel: rgb(0xebdbb2),
+        red: rgb(0x9d0006),
+        green: rgb(0x79740e),
+        yellow: rgb(0xb57614),
+        blue: rgb(0x076678),
+        magenta: rgb(0x8f3f71),
+        cyan: rgb(0x427b58),
+        orange: rgb(0xaf3a03),
+    },
+    // Solarized. The two forms use the same accent colors, and only the grays
+    // change. The authors of the palette give this rule.
     Base {
         name: "solarized-dark",
         dark: true,
@@ -374,6 +439,241 @@ pub static BUILTINS: &[Base] = &[
         cyan: rgb(0x2aa198),
         orange: rgb(0xcb4b16),
     },
+    // Catppuccin. Mocha is the darkest form, Frappe is not as dark, and Latte
+    // is light. The dim color is overlay1 of the palette, because the color
+    // overlay0 is too weak for the numbers in the gutter.
+    Base {
+        name: "catppuccin-mocha",
+        dark: true,
+        bg: rgb(0x1e1e2e),
+        bg_alt: rgb(0x181825),
+        fg: rgb(0xcdd6f4),
+        dim: rgb(0x7f849c),
+        border: rgb(0x45475a),
+        sel: rgb(0x313244),
+        red: rgb(0xf38ba8),
+        green: rgb(0xa6e3a1),
+        yellow: rgb(0xf9e2af),
+        blue: rgb(0x89b4fa),
+        magenta: rgb(0xcba6f7),
+        cyan: rgb(0x94e2d5),
+        orange: rgb(0xfab387),
+    },
+    Base {
+        name: "catppuccin-frappe",
+        dark: true,
+        bg: rgb(0x303446),
+        bg_alt: rgb(0x292c3c),
+        fg: rgb(0xc6d0f5),
+        dim: rgb(0x838ba7),
+        border: rgb(0x51576d),
+        sel: rgb(0x414559),
+        red: rgb(0xe78284),
+        green: rgb(0xa6d189),
+        yellow: rgb(0xe5c890),
+        blue: rgb(0x8caaee),
+        magenta: rgb(0xca9ee6),
+        cyan: rgb(0x81c8be),
+        orange: rgb(0xef9f76),
+    },
+    Base {
+        name: "catppuccin-latte",
+        dark: false,
+        bg: rgb(0xeff1f5),
+        bg_alt: rgb(0xe6e9ef),
+        fg: rgb(0x4c4f69),
+        dim: rgb(0x8c8fa1),
+        border: rgb(0xbcc0cc),
+        sel: rgb(0xdce0e8),
+        red: rgb(0xd20f39),
+        green: rgb(0x40a02b),
+        yellow: rgb(0xdf8e1d),
+        blue: rgb(0x1e66f5),
+        magenta: rgb(0x8839ef),
+        cyan: rgb(0x179299),
+        orange: rgb(0xfe640b),
+    },
+    // Tokyo Night. The Night form is dark, and the Day form is light.
+    Base {
+        name: "tokyo-night",
+        dark: true,
+        bg: rgb(0x1a1b26),
+        bg_alt: rgb(0x16161e),
+        fg: rgb(0xc0caf5),
+        dim: rgb(0x565f89),
+        border: rgb(0x3b4261),
+        sel: rgb(0x292e42),
+        red: rgb(0xf7768e),
+        green: rgb(0x9ece6a),
+        yellow: rgb(0xe0af68),
+        blue: rgb(0x7aa2f7),
+        magenta: rgb(0xbb9af7),
+        cyan: rgb(0x7dcfff),
+        orange: rgb(0xff9e64),
+    },
+    Base {
+        name: "tokyo-night-day",
+        dark: false,
+        bg: rgb(0xe1e2e7),
+        bg_alt: rgb(0xd0d5e3),
+        fg: rgb(0x3760bf),
+        dim: rgb(0x848cb5),
+        border: rgb(0xa8aecb),
+        sel: rgb(0xc4c8da),
+        red: rgb(0xf52a65),
+        green: rgb(0x587539),
+        yellow: rgb(0x8c6c3e),
+        blue: rgb(0x2e7de9),
+        magenta: rgb(0x9854f1),
+        cyan: rgb(0x007197),
+        orange: rgb(0xb15c00),
+    },
+    // One, from the Atom text editor. The dim color is the second gray of the
+    // palette, mono2.
+    Base {
+        name: "one-dark",
+        dark: true,
+        bg: rgb(0x282c34),
+        bg_alt: rgb(0x21252b),
+        fg: rgb(0xabb2bf),
+        dim: rgb(0x828997),
+        border: rgb(0x4b5263),
+        sel: rgb(0x3e4451),
+        red: rgb(0xe06c75),
+        green: rgb(0x98c379),
+        yellow: rgb(0xe5c07b),
+        blue: rgb(0x61afef),
+        magenta: rgb(0xc678dd),
+        cyan: rgb(0x56b6c2),
+        orange: rgb(0xd19a66),
+    },
+    Base {
+        name: "one-light",
+        dark: false,
+        bg: rgb(0xfafafa),
+        bg_alt: rgb(0xeaeaeb),
+        fg: rgb(0x383a42),
+        dim: rgb(0x696c77),
+        border: rgb(0xdbdbdc),
+        sel: rgb(0xe5e5e6),
+        red: rgb(0xe45649),
+        green: rgb(0x50a14f),
+        yellow: rgb(0x986801),
+        blue: rgb(0x4078f2),
+        magenta: rgb(0xa626a4),
+        cyan: rgb(0x0184bc),
+        orange: rgb(0xc18401),
+    },
+    // Everforest. Peruse uses the medium background of the three levels. The
+    // color aqua does the work of the cyan.
+    Base {
+        name: "everforest-dark",
+        dark: true,
+        bg: rgb(0x2d353b),
+        bg_alt: rgb(0x343f44),
+        fg: rgb(0xd3c6aa),
+        dim: rgb(0x859289),
+        border: rgb(0x475258),
+        sel: rgb(0x3d484d),
+        red: rgb(0xe67e80),
+        green: rgb(0xa7c080),
+        yellow: rgb(0xdbbc7f),
+        blue: rgb(0x7fbbb3),
+        magenta: rgb(0xd699b6),
+        cyan: rgb(0x83c092),
+        orange: rgb(0xe69875),
+    },
+    Base {
+        name: "everforest-light",
+        dark: false,
+        bg: rgb(0xfdf6e3),
+        bg_alt: rgb(0xf4f0d9),
+        fg: rgb(0x5c6a72),
+        dim: rgb(0x829181),
+        border: rgb(0xe0dcc7),
+        sel: rgb(0xefebd4),
+        red: rgb(0xf85552),
+        green: rgb(0x8da101),
+        yellow: rgb(0xdfa000),
+        blue: rgb(0x3a94c5),
+        magenta: rgb(0xdf69ba),
+        cyan: rgb(0x35a77c),
+        orange: rgb(0xf57d26),
+    },
+    // Rose Pine. The Main form is dark, and the Dawn form is light. The palette
+    // gives six accent colors, but a theme needs seven. The color foam
+    // therefore does the work of the blue and of the cyan.
+    Base {
+        name: "rose-pine",
+        dark: true,
+        bg: rgb(0x191724),
+        bg_alt: rgb(0x1f1d2e),
+        fg: rgb(0xe0def4),
+        dim: rgb(0x908caa),
+        border: rgb(0x403d52),
+        sel: rgb(0x26233a),
+        red: rgb(0xeb6f92),
+        green: rgb(0x31748f),
+        yellow: rgb(0xf6c177),
+        blue: rgb(0x9ccfd8),
+        magenta: rgb(0xc4a7e7),
+        cyan: rgb(0x9ccfd8),
+        orange: rgb(0xebbcba),
+    },
+    Base {
+        name: "rose-pine-dawn",
+        dark: false,
+        bg: rgb(0xfaf4ed),
+        bg_alt: rgb(0xf2e9e1),
+        fg: rgb(0x575279),
+        dim: rgb(0x797593),
+        border: rgb(0xcecacd),
+        sel: rgb(0xdfdad9),
+        red: rgb(0xb4637a),
+        green: rgb(0x286983),
+        yellow: rgb(0xea9d34),
+        blue: rgb(0x56949f),
+        magenta: rgb(0x907aa9),
+        cyan: rgb(0x56949f),
+        orange: rgb(0xd7827e),
+    },
+    // GitHub. The colors come from the default forms of the Primer palette.
+    Base {
+        name: "github-dark",
+        dark: true,
+        bg: rgb(0x0d1117),
+        bg_alt: rgb(0x161b22),
+        fg: rgb(0xe6edf3),
+        dim: rgb(0x8b949e),
+        border: rgb(0x30363d),
+        sel: rgb(0x21262d),
+        red: rgb(0xff7b72),
+        green: rgb(0x3fb950),
+        yellow: rgb(0xd29922),
+        blue: rgb(0x58a6ff),
+        magenta: rgb(0xbc8cff),
+        cyan: rgb(0x39c5cf),
+        orange: rgb(0xffa657),
+    },
+    Base {
+        name: "github-light",
+        dark: false,
+        bg: rgb(0xffffff),
+        bg_alt: rgb(0xf6f8fa),
+        fg: rgb(0x1f2328),
+        dim: rgb(0x656d76),
+        border: rgb(0xd0d7de),
+        sel: rgb(0xeaeef2),
+        red: rgb(0xcf222e),
+        green: rgb(0x1a7f37),
+        yellow: rgb(0x9a6700),
+        blue: rgb(0x0969da),
+        magenta: rgb(0x8250df),
+        cyan: rgb(0x1b7c83),
+        orange: rgb(0x953800),
+    },
+    // The themes for a special need. One theme gives the maximum contrast, and
+    // one theme uses gray only.
     Base {
         name: "high-contrast",
         dark: true,
@@ -549,5 +849,130 @@ mod tests {
             let contrast = t.match_bg.luma().abs_diff(t.match_fg.luma());
             assert!(contrast > 80, "{} match_bg/fg too close", t.name);
         }
+    }
+
+    /// The smallest difference of brightness between the text and the
+    /// background that a built-in theme must give. Each real palette gives
+    /// more than this value. The smallest value in the list is 125, from
+    /// solarized-dark.
+    const MIN_FG_CONTRAST: u32 = 100;
+
+    /// The same rule for the text that is less important. This value is
+    /// smaller, because that text must look weak. The smallest value in the
+    /// list is 70, from tokyo-night.
+    const MIN_DIM_CONTRAST: u32 = 60;
+
+    /// The smallest difference of brightness between the text and `bg_alt`
+    /// that a built-in theme must give. The header of the grid, the title bar
+    /// and the status line put `fg` on `bg_alt`, and a theme that gives a
+    /// dark enough `bg` can still give a `bg_alt` that is too near the text.
+    /// The smallest value in the list is 115, from solarized-dark.
+    const MIN_PANEL_CONTRAST: u32 = 100;
+
+    #[test]
+    fn text_stays_readable_on_the_background() {
+        for b in BUILTINS {
+            let t = Theme::from_base(b);
+            let contrast = t.fg.luma().abs_diff(t.bg.luma());
+            assert!(
+                contrast > MIN_FG_CONTRAST,
+                "{}: the fg/bg difference is {contrast}, and the rule asks for more than \
+                 {MIN_FG_CONTRAST}",
+                t.name
+            );
+        }
+    }
+
+    #[test]
+    fn dim_text_stays_readable_on_the_background() {
+        for b in BUILTINS {
+            let t = Theme::from_base(b);
+            let contrast = t.dim.luma().abs_diff(t.bg.luma());
+            assert!(
+                contrast > MIN_DIM_CONTRAST,
+                "{}: the dim/bg difference is {contrast}, and the rule asks for more than \
+                 {MIN_DIM_CONTRAST}",
+                t.name
+            );
+        }
+    }
+
+    #[test]
+    fn text_stays_readable_on_the_panels() {
+        for b in BUILTINS {
+            let t = Theme::from_base(b);
+            let contrast = t.fg.luma().abs_diff(t.bg_alt.luma());
+            assert!(
+                contrast > MIN_PANEL_CONTRAST,
+                "{}: the fg/bg_alt difference is {contrast}, and the rule asks for more than \
+                 {MIN_PANEL_CONTRAST}",
+                t.name
+            );
+        }
+    }
+
+    #[test]
+    fn the_dark_flag_agrees_with_the_colors() {
+        for b in BUILTINS {
+            let t = Theme::from_base(b);
+            if t.dark {
+                assert!(
+                    t.bg.luma() < t.fg.luma(),
+                    "{}: the flag says dark, but the background is brighter than the text",
+                    t.name
+                );
+            } else {
+                assert!(
+                    t.bg.luma() > t.fg.luma(),
+                    "{}: the flag says light, but the background is darker than the text",
+                    t.name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn enough_themes_are_light() {
+        let light = BUILTINS.iter().filter(|b| !b.dark).count();
+        assert!(
+            light >= 6,
+            "only {light} light themes: a user of a light terminal needs a choice"
+        );
+    }
+
+    #[test]
+    fn each_name_is_different() {
+        let mut names = builtin_names();
+        let count = names.len();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), count, "two built-in themes have the same name");
+    }
+
+    #[test]
+    fn each_name_uses_lower_case_and_hyphens() {
+        for b in BUILTINS {
+            let ok = b
+                .name
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
+            assert!(ok, "{}: a name takes lower case and hyphens only", b.name);
+        }
+    }
+
+    #[test]
+    fn builtin_finds_each_theme_in_any_case() {
+        for b in BUILTINS {
+            assert!(builtin(b.name).is_some(), "{} is lost", b.name);
+            let loud = b.name.to_ascii_uppercase();
+            let found = builtin(&loud).unwrap_or_else(|| panic!("{loud} is lost"));
+            assert_eq!(found.name, b.name);
+        }
+    }
+
+    #[test]
+    fn the_default_theme_stays_the_same() {
+        assert_eq!(BUILTINS[0].name, "peruse-dark");
+        assert_eq!(Theme::default().name, "peruse-dark");
     }
 }

@@ -20,26 +20,42 @@ makes three channels:
 The new thread opens the file, reads the schema, and sends the result on the
 ready channel. The function then gives a `Worker` and an `Opened`.
 
-To open a file, the engine reads a Parquet footer or a sample of a CSV file.
-This work is fast, so the wait is short. A bad path therefore gives a plain
-error on the command line. The terminal does not start and then stop again.
+To open a file, the engine reads a Parquet footer or asks the sniffer about a
+CSV file one time. This work is fast, so the wait is short. A bad path therefore
+gives a plain error on the command line. The terminal does not start and then
+stop again.
 
 ## The requests
 
-| Request | Work | Responses |
-|---|---|---|
-| `SetView` | Use a new view | `Schema`, then `Page`, then `Count` |
-| `Page` | Read one page of rows | `Page` |
-| `Stats` | Calculate the statistics of a column | `Stats` |
-| `Cell` | Read one cell in full | `Cell` |
-| `Search` | Find the rows that hold a value | `Search` |
-| `Meta` | Read the metadata of the file | `Meta` |
-| `Index` | Copy a CSV file into a table | `Indexed` |
-| `Shutdown` | Stop the thread | None |
+| Request | Kind | Work | Responses |
+|---|---|---|---|
+| `SetView` | 0 | Use a new view | `Schema`, then `Page`, then `Count` |
+| `Page` | 1 | Read one page of rows | `Page` |
+| `Stats` | 2 | Calculate the statistics of a column | `Stats` |
+| `Cell` | 3 | Read one cell in full | `Cell` |
+| `Search` | 4 | Find the rows that hold a value | `Search` |
+| `Meta` | 5 | Read the metadata of the file | `Meta` |
+| `Index` | 6 | Copy a file of text into a table | `Indexed` |
+| `RowJson` | 7 | Read one complete row as JSON, for the record view | `RowJson` |
+| `Configure` | 8 | Change the settings that DuckDB accepts while it runs | `Configured` |
+| `Band` | 9 | Measure each column that the detail band draws | `Band` |
+| `Shutdown` | 10 | Stop the thread | None |
+
+The worker also sends `Busy(true)` before a group of requests and `Busy(false)`
+after it, and `Error` when one request fails.
+
+The number in the column `Kind` is the value of `Request::kind`. A newer request
+of one kind replaces an older request of the same kind, and it replaces no
+request of another kind. A new band request therefore never removes the page
+request that the grid waits for.
 
 The request `SetView` gives three responses, in this order: the schema, the
 first page, and then the count. The count is the one part that can need a full
 scan, and the user can use the grid before it arrives.
+
+The request `Band` covers each column that the grid draws, in one request. One
+request for each column would read the view again for each column, and the width
+of the terminal already bounds the number of columns.
 
 ## How the worker combines the requests
 
@@ -50,9 +66,10 @@ The main loop of the worker does these steps:
 3. It calls the function `coalesce` on that group.
 4. It sends `Busy(true)`, does the work, and sends `Busy(false)`.
 
-The function `coalesce` uses three rules:
+The function `coalesce` uses four rules:
 
-- A shutdown request removes each other request.
+- A shutdown request removes each other request. It carries the largest possible
+  epoch, so no other request can remove it.
 - The function keeps the requests with the newest epoch only. A request from an
   old view is work with no result, because the user interface discards the
   response.
@@ -64,6 +81,12 @@ The function `coalesce` uses three rules:
 
 A key that the user holds down sends one page request for each press. Only the
 newest page is useful. The engine therefore never falls behind the cursor.
+
+A dropped request needs its work again. `App::band_asked` therefore holds the
+columns of the request that is in flight, and not the columns of every request
+of this view. Without that rule, a user who scrolls past the first screen of
+columns before the first answer arrives would see a row of points on the first
+columns until the view changed.
 
 ## The epoch
 
@@ -81,7 +104,8 @@ number of rows.
 
 The state `App` also discards the match offsets of a search at each change of
 the view. An offset is a position in the old view, and a new sort makes each
-offset wrong.
+offset wrong. It empties `stats_cache` and `band_cache` for the same reason: the
+numbers of those two describe the rows of one view.
 
 ## Work that has no view
 
@@ -105,6 +129,11 @@ Two rules stop this:
 - `App::on_response` applies the responses `Indexed` and `Meta` in front of the
   test of the epoch.
 
+Peruse asks for the metadata one time in a session, and it keeps the answer. The
+metadata panel and the compact detail band both read that one answer. A read of
+the footer that fails is not final: `App::after_panel_change` clears the latch
+when the last request failed, so the key `m` gives a second try. A file that was
+truncated or that changed on the disk therefore needs no restart.
 
 ## The cancellation
 
@@ -116,9 +145,11 @@ command `Cancel`, and that command calls `Worker::cancel` when the worker is
 busy. The request that stops gives an error, and the user interface shows a
 message about the cancellation.
 
-The search also uses this rule. Each search request examines 250,000 rows at
-the most. The worker therefore answers quickly, and the key `Esc` can stop the
-search between two parts.
+The search also uses this rule. The first search request examines 250,000 rows
+at the most, and each request after it examines two times the rows of the one
+before, up to 4 million. The worker therefore answers quickly at the start, and
+the key `Esc` can stop the search between two parts. See
+[performance.md](performance.md).
 
 ## The errors
 

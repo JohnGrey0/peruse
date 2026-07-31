@@ -9,19 +9,25 @@
 //! function discards the response instead.
 
 use peruse_core::config::{Config, Resources};
+use peruse_core::engine::{footer_briefs, ColumnBrief};
 use peruse_core::filter::{FilterSet, Op, Term};
 use peruse_core::query::{quote_str, Step};
 use peruse_core::meta::FileMeta;
 use peruse_core::model::RowCount;
-use peruse_core::query::{Base, SortDir, SortKey};
+use peruse_core::query::{Base, SortDir, SortKey, PROMPT_START};
+use peruse_core::source::Format;
 use peruse_core::stats::ColumnStats;
 use peruse_core::theme::Theme;
 use peruse_core::{sql_guard, Opened, Request, Response, RowPage, Schema, Source, View, Worker};
-use ratatui::crossterm::event::{KeyCode, KeyEvent};
+use ratatui::crossterm::event::{
+    KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
+use ratatui::layout::Rect;
+use std::time::{Duration, Instant};
 
 use crate::clip;
 use crate::commands::{self, Cmd};
-use crate::input::{Action, LineInput};
+use crate::input::{Action, LineInput, plain};
 use crate::tree::{Family, Line, Tree};
 
 /// The number of rows that Peruse reads before the first row of the viewport
@@ -71,10 +77,199 @@ const AUTO_INDEX_BYTES: u64 = 64 * 1024 * 1024;
 /// so the number of columns needs its own limit.
 const AUTO_INDEX_COLUMNS: usize = 256;
 
+/// The number of rows or columns that one step moves, when the settings file
+/// names no other number.
+///
+/// The keys `J`, `K`, `H` and `L` move by one step. A user who reads a file
+/// looks at groups of rows, and one row for each press of a key is too slow.
+/// Ten is a number that the user can count on the screen, and it is therefore
+/// easy to predict.
+pub const DEFAULT_STEP: usize = 10;
+
+/// The largest step that the settings page accepts.
+///
+/// A step of some thousand rows is a jump, and the key `#` does a jump to a
+/// row number better.
+pub const MAX_STEP: usize = 1000;
+
+/// The rows that one turn of the wheel moves.
+///
+/// A terminal and a text editor both move three lines for one turn. The grid
+/// therefore moves by the same amount as the other windows of the user.
+const WHEEL_ROWS: i64 = 3;
+
+/// The columns that one turn of the wheel to the side moves.
+///
+/// A column is much wider than a row is high, so a turn moves fewer columns
+/// than rows. Two columns keep the movement inside one screen.
+const WHEEL_COLS: i64 = 2;
+
+/// What one turn of the wheel does in the grid.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Wheel {
+    /// Move this number of rows. A negative number moves up the view.
+    Rows(i64),
+    /// Move this number of columns. A negative number moves to the left.
+    Cols(i64),
+    /// The event is not a turn of the wheel.
+    None,
+}
+
+/// Reads one mouse event and gives the movement for it.
+///
+/// The plain wheel always moves the view up and down. That is what the wheel
+/// does in each other program, and it must not change.
+///
+/// The wheel with the control key, and the wheel with the shift key, move the
+/// view to the side. A wheel that turns to the side does the same, but few mice
+/// have one. Some terminals keep the control key with the wheel for the size of
+/// the text, and Peruse then never sees the event. The shift key is therefore
+/// the form that always works, and the two are both here.
+fn wheel_of(ev: &MouseEvent) -> Wheel {
+    let sideways = ev.modifiers.contains(KeyModifiers::SHIFT)
+        || ev.modifiers.contains(KeyModifiers::CONTROL);
+    match ev.kind {
+        MouseEventKind::ScrollDown if sideways => Wheel::Cols(WHEEL_COLS),
+        MouseEventKind::ScrollUp if sideways => Wheel::Cols(-WHEEL_COLS),
+        MouseEventKind::ScrollDown => Wheel::Rows(WHEEL_ROWS),
+        MouseEventKind::ScrollUp => Wheel::Rows(-WHEEL_ROWS),
+        MouseEventKind::ScrollRight => Wheel::Cols(WHEEL_COLS),
+        MouseEventKind::ScrollLeft => Wheel::Cols(-WHEEL_COLS),
+        _ => Wheel::None,
+    }
+}
+
+/// The longest time between two presses of the left button that Peruse reads
+/// as one double click.
+///
+/// A terminal reports a press and a release, and never a double click. Peruse
+/// therefore finds the double click itself: two presses of the left button, at
+/// the same row and the same column of the terminal, inside this time. 400 ms
+/// is the value that a desktop system uses, so a user who already clicks two
+/// times to open something is inside it.
+const DOUBLE_CLICK: Duration = Duration::from_millis(400);
+
+/// One press of the left button.
+#[derive(Clone, Copy, Debug)]
+struct Press {
+    /// The column of the terminal.
+    column: u16,
+    /// The row of the terminal.
+    row: u16,
+    /// The time of the press.
+    at: Instant,
+    /// `true` when this press closed a double click.
+    ///
+    /// The next press then starts a new pair. Without this, three presses
+    /// would give two double clicks, and a user who clicks quickly would open
+    /// the same thing two times.
+    paired: bool,
+}
+
+/// Finds a double click in the presses of the left button.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Clicks {
+    /// The press that came before this one.
+    last: Option<Press>,
+}
+
+impl Clicks {
+    /// Records one press of the left button, and gives `true` when the press
+    /// closes a double click.
+    fn press(&mut self, column: u16, row: u16, now: Instant) -> bool {
+        let double = self.last.is_some_and(|l| {
+            !l.paired
+                && l.column == column
+                && l.row == row
+                && now.duration_since(l.at) <= DOUBLE_CLICK
+        });
+        self.last = Some(Press {
+            column,
+            row,
+            at: now,
+            paired: double,
+        });
+        double
+    }
+
+    /// Records one press that happens now.
+    pub fn press_now(&mut self, column: u16, row: u16) -> bool {
+        self.press(column, row, Instant::now())
+    }
+}
+
+/// Gives the reason that Peruse must not write the settings file now, or `None`
+/// when it can write.
+///
+/// A file that Peruse cannot read gives the built-in settings and the reason.
+/// The function [`peruse_core::config::Config::to_toml`] then writes the whole
+/// file from the fields that Peruse holds, so a write would replace each setting
+/// that the user wrote in the file, and every note in it. One character wrong in
+/// the file would cost the user the rest of it.
+///
+/// A file that is not there is not a fault, and Peruse writes a new one.
+fn write_blocked(path: &std::path::Path) -> Option<String> {
+    Config::load_from(path)
+        .1
+        .map(|why| format!("the file has a fault, so nothing was written: {why}"))
+}
+
+/// Reads the step from the settings, and keeps it inside its limits.
+///
+/// The value is never below one. A step of zero would give a key that does
+/// nothing, and the user would read that as a fault in the program. The value
+/// has an upper limit, because a step of some million rows is a jump, and the
+/// key `#` does a jump better.
+fn step_of(setting: Option<usize>) -> i64 {
+    setting.unwrap_or(DEFAULT_STEP).clamp(1, MAX_STEP) as i64
+}
+
 /// The smallest width of a column, in screen columns.
 const MIN_COL_WIDTH: u16 = 3;
 /// The largest width that Peruse gives to a column when it fits the widths.
 const MAX_COL_WIDTH: u16 = 60;
+
+/// The screen columns that a fitted column keeps free after its name.
+///
+/// Two parts of the header ask for this room, and the larger of the two gives
+/// the number:
+///
+/// * `grid::draw_header` writes the type mark at the far side of the column,
+///   and it keeps two blank columns between the name and that mark. The mark is
+///   one character wide, so the header asks for 3. With less, the header drops
+///   the mark.
+/// * `grid::compact_line` writes the type at the left of the band and the share
+///   of NULL values at the right, with one blank column between them. The share
+///   is four characters at the most, as in `100%`, so the band asks for 5. With
+///   less, the band drops the type of a column whose type is no wider than its
+///   name.
+///
+/// The header of a sorted column also holds an arrow in front of the name, which
+/// costs one screen column. The larger of the two demands covers it, because the
+/// header then asks for 4 and this constant gives 5.
+///
+/// The test `grid::tests::the_room_after_a_name_covers_the_largest_share_of_null_values`
+/// holds this value at 5. A share of 20% needs one column less, so a test over a
+/// column with some values only does not hold it.
+pub(crate) const NAME_HEADROOM: usize = 5;
+
+/// Gives the width of one column, from the width of its name and the width of
+/// the widest value on the screen.
+///
+/// The result covers the name and [`NAME_HEADROOM`], so the header and the band
+/// always have their room, also for a column of narrow values.
+///
+/// The limit [`MAX_COL_WIDTH`] comes last and wins over that rule. A name of 56
+/// characters or more therefore gets a width below `name + NAME_HEADROOM`, and
+/// the header of such a column does squeeze the band. That is the correct trade:
+/// one column with a very long name must not push each other column off the
+/// right edge, and the user can widen it by hand with the key `>`.
+fn fitted_width(name: usize, widest: usize) -> u16 {
+    // The limit applies before the cast. A name has no limit of its own, and a
+    // name of some thousand characters does not fit in 16 bits.
+    let w = widest.max(name + NAME_HEADROOM).min(MAX_COL_WIDTH as usize);
+    (w as u16).max(MIN_COL_WIDTH)
+}
 
 /// The kind of text that the prompt asks the user for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -142,6 +337,10 @@ pub enum Setting {
     NoIndex,
     /// The panels that stay at the side of the grid.
     Panels,
+    /// The rows of facts under the column names.
+    Band,
+    /// The number of rows or columns that one step moves.
+    Step,
 }
 
 impl Setting {
@@ -153,6 +352,8 @@ impl Setting {
         Setting::SampleSize,
         Setting::NoIndex,
         Setting::Panels,
+        Setting::Band,
+        Setting::Step,
     ];
 
     /// The name that the page shows.
@@ -164,6 +365,8 @@ impl Setting {
             Setting::SampleSize => "sample size",
             Setting::NoIndex => "index at open",
             Setting::Panels => "panels",
+            Setting::Band => "column details",
+            Setting::Step => "step",
         }
     }
 
@@ -176,6 +379,8 @@ impl Setting {
             Setting::SampleSize => "rows the sniffer reads. -1 reads the whole file",
             Setting::NoIndex => "index a file of text at the start, for instant jumps",
             Setting::Panels => "keep at the side: none, meta, stats or both",
+            Setting::Band => "rows under the headers: off, compact or detailed. d cycles",
+            Setting::Step => "rows or columns that J, K, H and L move",
         }
     }
 
@@ -294,6 +499,224 @@ impl Panel {
     }
 }
 
+/// The rows of facts that the grid draws between the column names and the first
+/// row of data.
+///
+/// The band answers the first question about a file: what is in each column?
+/// The statistics panel answers it for one column at a time, and it stays at the
+/// side. The band answers it for every column that is on the screen, in the
+/// spirit of `df.info()` and `df.describe()` of pandas.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Band {
+    /// The band is not on the screen.
+    #[default]
+    Off,
+    /// One row for each column: the type and the share of NULL values.
+    Compact,
+    /// Four rows for each column.
+    Detailed,
+}
+
+impl Band {
+    /// The number of rows of the detailed band.
+    ///
+    /// The four rows are the type, the share of NULL values, the count of the
+    /// different values, and the range from the smallest value to the largest
+    /// value. Those four answer the question "what is in this column?" and each
+    /// of them has a meaning for every type.
+    ///
+    /// The mean and the deviation are not in the band. Only a column of numbers
+    /// has them, so the row would be empty over each column of text, and a row
+    /// of the grid is expensive. The statistics panel shows them.
+    ///
+    /// Every column gives the same rows in the same order, so the facts line up
+    /// across the grid and the eye can compare one fact over many columns.
+    pub const DETAIL_ROWS: u16 = 4;
+
+    /// Gives the number of rows that this mode asks for.
+    pub fn rows(self) -> u16 {
+        match self {
+            Band::Off => 0,
+            Band::Compact => 1,
+            Band::Detailed => Band::DETAIL_ROWS,
+        }
+    }
+
+    /// Gives `true` when the band needs the count of the different values and
+    /// the range of the values.
+    ///
+    /// The compact band needs the NULL share only, and the footer of a Parquet
+    /// file gives that share with no query.
+    pub fn needs_values(self) -> bool {
+        matches!(self, Band::Detailed)
+    }
+
+    /// Reads a mode from the name that the settings file holds.
+    pub fn parse(s: &str) -> Option<Band> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "off" | "none" | "" => Some(Band::Off),
+            "compact" | "short" => Some(Band::Compact),
+            "detailed" | "detail" | "full" => Some(Band::Detailed),
+            _ => None,
+        }
+    }
+
+    /// Gives the name that the settings file holds.
+    pub fn name(self) -> &'static str {
+        match self {
+            Band::Off => "off",
+            Band::Compact => "compact",
+            Band::Detailed => "detailed",
+        }
+    }
+
+    /// Gives the text that the status line shows after a change.
+    pub fn label(self) -> &'static str {
+        match self {
+            Band::Off => "no column details",
+            Band::Compact => "column details: compact",
+            Band::Detailed => "column details: type, nulls, distinct, range",
+        }
+    }
+
+    /// Gives the next mode, for the key that moves through the three.
+    pub fn next(self) -> Band {
+        match self {
+            Band::Off => Band::Compact,
+            Band::Compact => Band::Detailed,
+            Band::Detailed => Band::Off,
+        }
+    }
+}
+
+/// Where the grid is on the screen.
+///
+/// A mouse event gives a row and a column of the terminal. Only the code that
+/// draws the grid knows which cell is at that position, so it writes the
+/// positions here after each frame. The mouse then reads them.
+#[derive(Clone, Debug, Default)]
+pub struct Hit {
+    /// The row of the terminal that holds the column names.
+    pub header_y: u16,
+    /// The number of rows of the detail band, under the column names.
+    ///
+    /// The band takes rows from the data. Without this count, a click would
+    /// land some rows above the row that the user pointed at.
+    pub band: u16,
+    /// The first row of the terminal that holds a row of data.
+    pub top: u16,
+    /// The number of rows of data on the screen. Zero means that the grid has
+    /// no room, and that no click can land on a row.
+    pub rows: u16,
+    /// The first column of the terminal that the grid covers.
+    pub left: u16,
+    /// The number of columns of the terminal that the grid covers. Zero means
+    /// that the grid has no room.
+    ///
+    /// A panel at the side of the grid sits on the same rows as the grid. Without
+    /// this width, a click in the panel would count as a click on the row of the
+    /// grid beside it, and the cursor would jump.
+    pub width: u16,
+    /// Each column that the grid draws: its position in the schema, its column
+    /// of the terminal, and its width.
+    pub cols: Vec<(usize, u16, u16)>,
+}
+
+impl Hit {
+    /// Gives `true` when a column of the terminal is inside the grid.
+    ///
+    /// A panel at the side of the grid covers the same rows as the grid, so the
+    /// row of an event does not say that the event belongs to the grid.
+    pub fn holds(&self, x: u16) -> bool {
+        self.width > 0 && x >= self.left && x < self.left.saturating_add(self.width)
+    }
+
+    /// Gives the offset of the row at a row of the terminal, counted from the
+    /// first row on the screen. The result is `None` when the position is
+    /// outside the grid.
+    pub fn row_at(&self, y: u16) -> Option<u64> {
+        (self.rows > 0 && y >= self.top && y < self.top.saturating_add(self.rows))
+            .then(|| (y - self.top) as u64)
+    }
+
+    /// Gives `true` when a row of the terminal holds the column names or one row
+    /// of the detail band.
+    ///
+    /// A click there moves to the column and leaves the row where it is. The
+    /// band belongs to the header: it describes a column and not a row.
+    pub fn on_labels(&self, y: u16) -> bool {
+        y >= self.header_y && y < self.header_y.saturating_add(1 + self.band)
+    }
+
+    /// Gives the position in the schema of the column at a column of the
+    /// terminal. The result is `None` for the gutter of row numbers and for
+    /// the space after the last column.
+    pub fn col_at(&self, x: u16) -> Option<usize> {
+        self.cols
+            .iter()
+            .find(|(_, cx, w)| x >= *cx && x < cx.saturating_add(*w))
+            .map(|(ci, _, _)| *ci)
+    }
+}
+
+/// Where an overlay is on the screen.
+///
+/// This is the same idea as [`Hit`], for the box that covers the grid. Only the
+/// code that draws an overlay knows the box that it chose, so each overlay
+/// gives the box back and [`crate::ui::draw`] writes it here. The mouse then
+/// reads it: a click outside the box closes the overlay, and a click on a line
+/// of the list acts on that line.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OverlayHit {
+    /// The mode that drew this box.
+    ///
+    /// A click uses the box in that mode only. A key can change the mode
+    /// between two frames, and a click must never act on a box that is gone.
+    pub mode: Mode,
+    /// The box, with its border.
+    pub area: Rect,
+    /// One pair for each line of the list on the screen: the row of the
+    /// terminal, and the position of that line in the list.
+    ///
+    /// A list scrolls, and some lists hold a heading that the selection goes
+    /// past. The row on the screen is therefore not the position in the list,
+    /// and a click needs this table to find the line under the pointer.
+    pub lines: Vec<(u16, usize)>,
+}
+
+impl OverlayHit {
+    /// Makes the record of a box that holds no list.
+    pub fn new(mode: Mode, area: Rect) -> OverlayHit {
+        OverlayHit {
+            mode,
+            area,
+            lines: Vec::new(),
+        }
+    }
+
+    /// Adds one line of the list, at a row of the terminal.
+    pub fn line(&mut self, y: u16, at: usize) {
+        self.lines.push((y, at));
+    }
+
+    /// Gives `true` when a position of the terminal is inside the box.
+    pub fn holds(&self, x: u16, y: u16) -> bool {
+        x >= self.area.x
+            && x < self.area.right()
+            && y >= self.area.y
+            && y < self.area.bottom()
+    }
+
+    /// Gives the position in the list of the line at a row of the terminal.
+    /// The result is `None` for the border, for a prompt and for a heading.
+    pub fn line_at(&self, y: u16) -> Option<usize> {
+        self.lines
+            .iter()
+            .find(|(ly, _)| *ly == y)
+            .map(|(_, at)| *at)
+    }
+}
+
 /// The kind of a message on the status line.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StatusKind {
@@ -404,6 +827,13 @@ pub struct App {
     pub left_col: usize,
     /// The number of rows that the grid can draw.
     pub viewport_rows: usize,
+    /// Where the grid is on the screen, for the mouse.
+    pub hit: Hit,
+    /// Where the overlay is on the screen, for the mouse. A mode with no
+    /// overlay holds `None`.
+    pub overlay: Option<OverlayHit>,
+    /// The presses of the left button, for the double click.
+    clicks: Clicks,
 
     /// The width of each column, in screen columns.
     pub widths: Vec<u16>,
@@ -449,8 +879,60 @@ pub struct App {
     /// The column that the engine measures now. It stops Peruse from asking
     /// for the same column two times.
     stats_pending: Option<String>,
+
+    /// The facts of the detail band, for each column of this view.
+    ///
+    /// The key is the name of the column. [`App::reload`] empties the cache,
+    /// because the facts describe one view. A move across the columns therefore
+    /// costs no query while the answer is here.
+    band_cache: std::collections::HashMap<String, ColumnBrief>,
+    /// The columns of the one band request that is on its way to the engine.
+    ///
+    /// The set stops an endless re-ask: the engine can give no answer for a
+    /// column, and without the set the band asks again at each frame.
+    ///
+    /// A new request replaces the set, and does not add to it. The worker keeps
+    /// one band request only, so a new request drops the older one and the older
+    /// answer never arrives. The columns of that older request must therefore go
+    /// back into the list of the columns that the band still needs. Without
+    /// this, a scroll to the side and back leaves a row of points on the first
+    /// columns until the user changes the view.
+    band_asked: std::collections::HashSet<String>,
+    /// `true` when the band request that has no answer yet measures the count of
+    /// the different values and the range.
+    ///
+    /// A compact request measures two counts, and that is not enough for the
+    /// detailed band. Without this flag the record of what Peruse asked for would
+    /// count as an answer for either mode, and a change from compact to detailed
+    /// would leave the three other rows showing points for ever.
+    band_asked_values: bool,
+
     /// The metadata of the file.
     pub meta: Option<FileMeta>,
+    /// `true` after Peruse asked for the metadata.
+    ///
+    /// The metadata describes the file, so one request is enough for the whole
+    /// session. Two parts ask for it: the metadata panel, and the compact band
+    /// over a Parquet file.
+    meta_asked: bool,
+    /// `true` after a request for the metadata failed.
+    ///
+    /// The band then measures the columns with a query. Without this, a band over
+    /// a Parquet file with a footer that Peruse cannot read would wait for an
+    /// answer that never comes, and it would show a row of points for ever.
+    meta_error: bool,
+    /// `true` after a band request failed or the user cancelled it.
+    ///
+    /// The band asks one time for each set of columns, and a request that never
+    /// answers would otherwise leave the band showing a row of points until the
+    /// view changes. This flag stops the automatic ask, so a failure that repeats
+    /// cannot make a storm of requests. The key `d` clears it, which gives the
+    /// user a way to try again.
+    band_error: bool,
+    /// `true` after a statistics request failed or the user cancelled it. It
+    /// works in the same way as [`App::band_error`], and the keys `i` and `M`
+    /// clear it.
+    stats_error: bool,
     /// The complete value in the cell inspector.
     pub cell_value: Option<String>,
     /// The first line that the cell inspector draws.
@@ -570,6 +1052,9 @@ impl App {
             top_row: 0,
             left_col: 0,
             viewport_rows: 20,
+            hit: Hit::default(),
+            overlay: None,
+            clicks: Clicks::default(),
 
             widths: vec![12; ncols],
             hidden: vec![false; ncols],
@@ -592,7 +1077,14 @@ impl App {
 
             stats_cache: std::collections::HashMap::new(),
             stats_pending: None,
+            band_cache: std::collections::HashMap::new(),
+            band_asked: std::collections::HashSet::new(),
+            band_asked_values: false,
             meta: None,
+            meta_asked: false,
+            meta_error: false,
+            band_error: false,
+            stats_error: false,
             cell_value: None,
             cell_scroll: 0,
             cell_from_record: false,
@@ -716,9 +1208,15 @@ impl App {
         self.page_limit = 0;
         self.requested = None;
         // The statistics describe the rows of one view. A new view therefore
-        // makes each answer wrong.
+        // makes each answer wrong. The facts of the band follow the same rule.
         self.stats_cache.clear();
         self.stats_pending = None;
+        // A new view is a new question, so a failure over the old view says
+        // nothing about it. The two parts ask again.
+        self.band_error = false;
+        self.stats_error = false;
+        self.band_cache.clear();
+        self.band_asked.clear();
         // A match offset has no meaning in a different view.
         self.hits.clear();
         self.hits_complete = false;
@@ -751,6 +1249,7 @@ impl App {
     /// the viewport is known only then.
     pub fn ensure_rows(&mut self) {
         self.ensure_stats();
+        self.ensure_band();
         if self.schema.is_empty() {
             return;
         }
@@ -783,6 +1282,11 @@ impl App {
         } else if self.cursor_row >= self.top_row + vis {
             self.top_row = self.cursor_row - vis + 1;
         }
+    }
+
+    /// Gives the number of rows or columns that one step moves.
+    pub fn step(&self) -> i64 {
+        step_of(self.config.step)
     }
 
     /// Moves the cursor `delta` rows. A negative value moves it up the view.
@@ -823,14 +1327,171 @@ impl App {
         }
     }
 
+    /// Clears the record of a statistics request that failed.
+    ///
+    /// A key that opens the statistics panel is the way back after a failure. The
+    /// press is a request from the user for the numbers, and the answer may
+    /// arrive this time.
+    fn retry_stats(&mut self) {
+        self.stats_error = false;
+    }
+
     /// Asks for what a new panel needs.
     ///
     /// The statistics come at the next frame, through
     /// [`App::ensure_stats`]. The metadata needs one request, and it needs it
     /// one time for the file.
     fn after_panel_change(&mut self) {
-        if self.panel.has_meta() && self.meta.is_none() {
-            self.worker.send(Request::Meta { epoch: self.epoch });
+        // A press of a panel key is a request from the user for the numbers, so
+        // it is also the way back after a request that failed.
+        self.retry_stats();
+        if self.panel.has_meta() {
+            // A user who opens the panel again asks for the metadata again. One
+            // request is enough while it can succeed, but a request that failed
+            // must not leave the panel empty for the whole session. The key is
+            // the second try.
+            if self.meta_error {
+                self.meta_asked = false;
+                self.meta_error = false;
+            }
+            self.request_meta();
+        }
+    }
+
+    /// Asks the worker for the metadata of the file, one time for the session.
+    ///
+    /// The metadata describes the file, and not the view, so one answer serves
+    /// each view. Without the guard, a caller that runs at each frame would
+    /// read the footer again and again.
+    fn request_meta(&mut self) {
+        if self.meta.is_some() || self.meta_asked {
+            return;
+        }
+        self.meta_asked = true;
+        self.worker.send(Request::Meta { epoch: self.epoch });
+    }
+
+    /// Gives the mode of the detail band.
+    ///
+    /// The setting is the only copy of this state, so the mode of the last
+    /// session is on the screen at the start with no more work. A name that
+    /// Peruse does not know leaves the band off: a setting is not a reason to
+    /// refuse to open a file. The settings page refuses a bad name while the
+    /// user types it.
+    pub fn band(&self) -> Band {
+        match &self.config.band {
+            Some(name) => Band::parse(name).unwrap_or(Band::Off),
+            None => Band::Off,
+        }
+    }
+
+    /// Gives the facts of one column for the detail band, when Peruse has them.
+    pub fn brief(&self, ci: usize) -> Option<&ColumnBrief> {
+        let name = &self.schema.columns.get(ci)?.name;
+        self.band_cache.get(name)
+    }
+
+    /// Asks for the facts of each column that the band draws.
+    ///
+    /// One request covers every column that the grid draws now. The width of the
+    /// terminal bounds that number, so the query stays small. One request for
+    /// each column would read the view again for each column.
+    ///
+    /// The caller runs this one time for each frame, after the frame. The list
+    /// of drawn columns comes from the frame, in [`Hit::cols`].
+    fn ensure_band(&mut self) {
+        if self.band() == Band::Off {
+            return;
+        }
+        // A request that failed, or that the user cancelled, must not start
+        // again at the next frame. The key `d` clears this flag.
+        if self.band_error {
+            return;
+        }
+        // A short grid gives the rows of the band back to the data, and the band
+        // is then not on the screen at all. A query for facts that nothing draws
+        // reads the whole file for nothing. The frame writes this count, so it
+        // holds the mode of this frame. Refer to [`crate::grid::band_rows`].
+        if self.hit.band == 0 {
+            return;
+        }
+        let drawn: Vec<peruse_core::Column> = self
+            .hit
+            .cols
+            .iter()
+            .filter_map(|(ci, _, _)| self.schema.columns.get(*ci))
+            .cloned()
+            .collect();
+        if drawn.is_empty() {
+            return;
+        }
+        // The cache answers first, because it answers in constant time. A column
+        // that Peruse asked about needs nothing more, whether the answer arrived
+        // or not.
+        let band = self.band();
+        // A request that has no answer yet counts as an answer, but only when it
+        // measures enough for the mode on the screen now. A compact request
+        // measures two counts, so a change to the detailed band must ask again.
+        let asked_enough = self.band_asked_values || !band.needs_values();
+        let missing = drawn.iter().any(|c| {
+            !brief_is_enough(self.band_cache.get(&c.name), band)
+                && !(asked_enough && self.band_asked.contains(&c.name))
+        });
+        if !missing {
+            return;
+        }
+        if !band.needs_values() && self.band_from_footer(&drawn) {
+            return;
+        }
+        // The set holds the columns of this request, and not the columns of each
+        // request of this view. The worker drops the older request, so its
+        // columns need an answer again. Refer to [`App::band_asked`].
+        self.band_asked = drawn.iter().map(|c| c.name.clone()).collect();
+        self.band_asked_values = band.needs_values();
+        self.worker.send(Request::Band {
+            epoch: self.epoch,
+            view: self.view.clone(),
+            columns: drawn,
+            // The compact band draws the share of NULL values alone. Each of the
+            // three other facts reads the whole column, so the mode has to travel
+            // with the request.
+            values: band.needs_values(),
+        });
+    }
+
+    /// Fills the band from the footer of a Parquet file, with no query.
+    ///
+    /// The footer holds the number of rows and the number of NULL values of each
+    /// column. The compact band shows the type and the NULL share only, so the
+    /// band over a plain Parquet file costs no query at all, also on a file of
+    /// some gigabytes.
+    ///
+    /// The function gives `true` when the caller must not ask the engine. That
+    /// covers the moment while the footer is on its way: the band shows a row of
+    /// points until it arrives, and a wrong number never appears.
+    fn band_from_footer(&mut self, drawn: &[peruse_core::Column]) -> bool {
+        if !footer_can_answer(self.band(), &self.view, self.source.format) {
+            return false;
+        }
+        if self.meta.is_none() {
+            self.request_meta();
+            // Wait for the footer. The band shows a row of points until it
+            // arrives, and a wrong number never appears. A request that failed
+            // gives no answer, so the caller then asks the engine.
+            return !self.meta_error;
+        }
+        let briefs = self.meta.as_ref().and_then(|m| footer_briefs(m, drawn));
+        match briefs {
+            Some(briefs) => {
+                for b in briefs {
+                    self.band_cache.insert(b.column.clone(), b);
+                }
+                true
+            }
+            // The footer cannot answer for each column. One reason is a column
+            // that holds a structure: the footer names each value inside it by
+            // its path, and not by the name of the column.
+            None => false,
         }
     }
 
@@ -850,6 +1511,11 @@ impl App {
     /// start a scan that nobody reads.
     fn ensure_stats(&mut self) {
         if !self.panel.has_stats() {
+            return;
+        }
+        // A request that failed, or that the user cancelled, must not start
+        // again at the next frame. The keys `i` and `M` clear this flag.
+        if self.stats_error {
             return;
         }
         let Some(col) = self.schema.columns.get(self.cursor_col).cloned() else {
@@ -872,19 +1538,24 @@ impl App {
     /// Fits each column width to the values on the screen.
     ///
     /// The width covers the name of the column, the type character, and the
-    /// widest value in the page. The width has a limit, so one long column of
-    /// text cannot push the other columns off the right edge.
+    /// widest value in the page. Refer to [`fitted_width`] for the room after
+    /// the name and for the limit.
     pub fn fit_widths(&mut self) {
         for (i, col) in self.schema.columns.iter().enumerate() {
-            let mut w = crate::text::width(&col.name).max(4);
+            let name = crate::text::width(&col.name);
+            // Start at zero. The floor of the name belongs to `fitted_width`, and
+            // a second floor here would only hide which rule set the width.
+            let mut w = 0usize;
             for r in 0..self.page.nrows {
                 let cell = self.page.cell(r, i).unwrap_or("NULL");
-                w = w.max(crate::text::width(cell));
+                // The loop needs to know whether the value reaches the limit,
+                // and not how wide it is. A cell can hold 4096 characters.
+                w = w.max(crate::text::width_capped(cell, MAX_COL_WIDTH as usize));
                 if w >= MAX_COL_WIDTH as usize {
                     break;
                 }
             }
-            self.widths[i] = (w as u16).clamp(MIN_COL_WIDTH, MAX_COL_WIDTH);
+            self.widths[i] = fitted_width(name, w);
         }
         self.widths_fitted = true;
     }
@@ -895,11 +1566,15 @@ impl App {
     ///
     /// The function discards each response with an old epoch, because the view
     /// changed after the request.
-    pub fn on_response(&mut self, resp: Response) {
+    pub fn on_response(&mut self, resp: Response) -> bool {
         // The response Busy is the one response with no view behind it.
         if let Response::Busy(b) = resp {
+            // A response that repeats the state that the screen shows already
+            // needs no frame. The worker reports Busy at the start and at the
+            // end of each request, and a group of keys makes many of them.
+            let changed = self.busy != b;
             self.busy = b;
-            return;
+            return changed;
         }
         // The index and the metadata describe the file, and not the view. A
         // change of the view must therefore not discard them. Without this
@@ -911,11 +1586,18 @@ impl App {
                 self.indexing = false;
                 self.seekable = true;
                 self.ok("indexed — jumping is now instant");
-                return;
+                return true;
             }
             Response::Meta { ref meta, .. } => {
                 self.meta = Some((**meta).clone());
-                return;
+                return true;
+            }
+            // A failure to read the metadata also describes the file, and not
+            // the view. The detail band waits for the footer of a Parquet file,
+            // so it must learn that no footer is coming, whatever the epoch of
+            // the answer is.
+            Response::Error { ref context, .. } if context == "metadata" => {
+                self.meta_error = true;
             }
             _ => {}
         }
@@ -924,6 +1606,7 @@ impl App {
             | Response::Page { epoch, .. }
             | Response::Count { epoch, .. }
             | Response::Stats { epoch, .. }
+            | Response::Band { epoch, .. }
             | Response::Cell { epoch, .. }
             | Response::RowJson { epoch, .. }
             | Response::Configured { epoch, .. }
@@ -934,7 +1617,9 @@ impl App {
             Response::Busy(_) => unreachable!(),
         };
         if epoch != self.epoch {
-            return; // a response for a view that the user left
+            // A response for a view that the user left changes nothing on the
+            // screen, so it needs no frame.
+            return false;
         }
 
         match resp {
@@ -984,12 +1669,17 @@ impl App {
                 }
                 self.stats_cache.insert(stats.column.clone(), *stats);
             }
+            Response::Band { briefs, .. } => {
+                for b in briefs {
+                    self.band_cache.insert(b.column.clone(), b);
+                }
+            }
             Response::RowJson { row, json, .. } => {
                 // The user can move to another row while this answer is on
                 // its way. The epoch cannot see that, because the view did
                 // not change, so the row itself is the test.
                 if Some(row) != self.record_row {
-                    return;
+                    return false;
                 }
                 match json {
                     // The lines that are open, and the rule about the empty
@@ -1016,6 +1706,25 @@ impl App {
             Response::Indexed { .. } | Response::Meta { .. } => {}
             Response::Error { context, message, .. } => {
                 self.indexing = false;
+                // A request that failed must not leave its part of the screen
+                // waiting for ever. Each of these two parts asks one time and
+                // then waits for the answer, so a failure has to say that no
+                // answer is coming. Without this, the band shows a row of points
+                // and the statistics panel says "computing" until the view
+                // changes.
+                //
+                // The flag stops the automatic ask, and it does not clear the
+                // record of what Peruse asked for. A clear would ask again at the
+                // next frame, and a request that fails every time would then make
+                // a storm. The key of each part clears the flag instead.
+                match context.as_str() {
+                    "column band" => self.band_error = true,
+                    "column stats" => {
+                        self.stats_error = true;
+                        self.stats_pending = None;
+                    }
+                    _ => {}
+                }
                 // The first line holds the useful part. DuckDB adds the full
                 // statement after it, and that text is too long for a status
                 // line of one row.
@@ -1023,6 +1732,7 @@ impl App {
                 self.error(format!("{context}: {first}"));
             }
         }
+        true
     }
 
     /// Finds the nearest known match in the given direction. The function does
@@ -1227,6 +1937,388 @@ impl App {
         }
     }
 
+    /// Gives one mouse event to the part of Peruse that has the focus.
+    ///
+    /// The function gives `true` when the event changed something. A mouse with
+    /// capture on also reports each movement of the pointer, and Peruse does
+    /// nothing with those. The caller draws no frame for them.
+    pub fn on_mouse(&mut self, ev: &MouseEvent) -> bool {
+        // Look for the double click first, and in each mode. A press that lands
+        // on nothing still ends the pair, so a press in a panel and a press in
+        // the grid can never join into one double click.
+        let double = ev.kind == MouseEventKind::Down(MouseButton::Left)
+            && self.clicks.press_now(ev.column, ev.row);
+        match self.mode {
+            Mode::Normal => self.grid_mouse(ev, double),
+            // A prompt keeps the grid on the screen, and a user who writes a
+            // filter looks at the data while doing it. The wheel therefore
+            // still moves the grid. The arrow keys stay with the history of
+            // the prompt, and a click does nothing.
+            Mode::Prompt(_) => self.wheel_grid(ev),
+            _ => self.overlay_mouse(ev, double),
+        }
+    }
+
+    /// Gives one key to the program, as a press with no modifier.
+    ///
+    /// The mouse uses this for each action that a key already has. The click
+    /// then runs the code of the key, so the two can never disagree.
+    fn key(&mut self, code: KeyCode) {
+        self.on_key(&KeyEvent::new(code, KeyModifiers::NONE));
+    }
+
+    /// Gives one mouse event to the overlay that is open.
+    ///
+    /// Each overlay has its own list, its own limits and its own preview. A
+    /// turn of the wheel therefore becomes presses of an arrow key, and a click
+    /// becomes the key that does the same thing. The code that handles the keys
+    /// stays the one place that acts.
+    fn overlay_mouse(&mut self, ev: &MouseEvent, double: bool) -> bool {
+        match ev.kind {
+            MouseEventKind::ScrollDown => return self.wheel_overlay(true),
+            MouseEventKind::ScrollUp => return self.wheel_overlay(false),
+            MouseEventKind::Down(MouseButton::Left) => {}
+            _ => return false,
+        }
+
+        // The frame writes where the box is. With no box, the mouse knows
+        // nothing about the screen, and it must not act.
+        let Some(hit) = self.overlay.as_ref() else {
+            return false;
+        };
+        if hit.mode != self.mode {
+            return false;
+        }
+        let inside = hit.holds(ev.column, ev.row);
+        let at = hit.line_at(ev.row);
+
+        if !inside {
+            self.close_overlay();
+            return true;
+        }
+        // A click on the border, on a prompt, on a heading or on the row of
+        // keys changes nothing. The caller then draws no frame.
+        let Some(at) = at else { return false };
+        // The second press of a double click acts on the line that the first
+        // press chose, and never on the line that `at` names now. A new
+        // selection moves the window of the list: a list keeps the selected
+        // line near the middle, so the frame between the two presses puts
+        // another line under the pointer. Without this rule, a double click in
+        // a long list runs a command that the user never pointed at. The two
+        // presses of a pair are at one position, so the line that the first
+        // press chose is the line that the user means.
+        match self.mode {
+            Mode::Record => self.record_click(at, double),
+            Mode::Palette => self.palette_click(at, double),
+            Mode::ThemePicker => self.theme_click(at, double),
+            Mode::Settings => self.settings_click(at, double),
+            Mode::FilterBuild => self.build_click(at, double),
+            // The help and the cell inspector hold text and no list. No key
+            // selects a line there, so no click does either.
+            _ => false,
+        }
+    }
+
+    /// Closes the open overlay and gives the grid back.
+    ///
+    /// A click outside a box means "leave this box", and it must leave in one
+    /// press. The key `Esc` cannot do that work here, although it looks like the
+    /// same thing:
+    ///
+    /// * In the record view, `Esc` first clears the text of the find line. A
+    ///   click on the grid behind an open find line then needed two clicks.
+    /// * In the filter builder, `Esc` goes back one step. From the step that
+    ///   chooses an operator, a click outside needed three.
+    /// * In the settings page, `Esc` first leaves the value that the user edits.
+    ///
+    /// The two states below need more than a change of the mode.
+    fn close_overlay(&mut self) {
+        match self.mode {
+            // The picker paints each theme while the user moves through the
+            // list. Leaving must put the theme of the user back, as `Esc` does,
+            // or a click outside would keep a theme that the user only looked at.
+            Mode::ThemePicker => {
+                self.theme = self.themes[self.theme_idx.min(self.themes.len() - 1)].clone();
+                self.mode = Mode::Normal;
+            }
+            // The cell inspector can come from the record view. Leaving it gives
+            // the record back, and not the grid.
+            Mode::Cell if self.cell_from_record => {
+                self.cell_from_record = false;
+                self.mode = Mode::Record;
+            }
+            Mode::Settings => {
+                self.settings_editing = false;
+                self.mode = Mode::Normal;
+            }
+            _ => self.mode = Mode::Normal,
+        }
+    }
+
+    /// Moves the list of the open overlay for one turn of the wheel.
+    ///
+    /// The turn becomes presses of an arrow key, so the wheel and the keys move
+    /// the same list, in the same way, with one piece of code.
+    ///
+    /// A box that takes text is the one place where that rule fails. The arrow
+    /// key belongs to the text there: it walks the history of the box and puts
+    /// an older line in it. A turn of the wheel must never write in a box, so
+    /// those three states move the list themselves, or move nothing.
+    fn wheel_overlay(&mut self, down: bool) -> bool {
+        match self.mode {
+            // The find box of the record view holds the focus, and the list of
+            // the fields is still on the screen under it. Move the list and
+            // leave the text of the box as the user typed it.
+            Mode::Record if self.record_finding => {
+                self.record_move(if down { WHEEL_ROWS } else { -WHEEL_ROWS });
+                true
+            }
+            // The value of a setting is being typed. The selection must stay
+            // where it is: Enter writes the text into the setting under the
+            // selection, so a wheel that moved it would write in another
+            // setting. This is the rule that a click there follows too.
+            Mode::Settings if self.settings_editing => false,
+            // The two value steps and the SQL step hold a prompt and no list,
+            // so there is nothing for the wheel to move.
+            Mode::FilterBuild
+                if matches!(self.build, Build::Value | Build::Value2 | Build::Raw) =>
+            {
+                false
+            }
+            _ => {
+                // Read the position of each list before and after. A wheel at
+                // the end of a list moves nothing, and the caller must then draw
+                // no frame: a user who holds the wheel at the bottom of the help
+                // would otherwise draw the same screen again and again.
+                let before = self.overlay_scroll();
+                let code = if down { KeyCode::Down } else { KeyCode::Up };
+                for _ in 0..WHEEL_ROWS {
+                    self.key(code);
+                }
+                self.overlay_scroll() != before
+            }
+        }
+    }
+
+    /// Gives the position of the list of each overlay, as one value.
+    ///
+    /// The wheel compares this before and after it moves, so it can say whether
+    /// anything changed. One value for every overlay keeps the comparison in one
+    /// place: a new overlay with a list adds its position here, and the wheel
+    /// needs no change.
+    fn overlay_scroll(&self) -> (u16, u16, usize, usize, usize, usize) {
+        (
+            self.help_scroll,
+            self.cell_scroll,
+            self.palette_sel,
+            self.theme_sel,
+            self.settings_sel,
+            self.record_sel,
+        )
+    }
+
+    /// Handles a click on a line of the record view.
+    ///
+    /// The rule is the rule of the grid: the first click on a line chooses it,
+    /// and a click on the line that is chosen already acts on it. A user who
+    /// only wants to read another line therefore never opens or closes a value
+    /// by accident, and a user who wants to open one still needs one click.
+    fn record_click(&mut self, at: usize, double: bool) -> bool {
+        if double {
+            // A double click does what Enter does: it opens a value that holds
+            // other values, and it shows a single value in full.
+            self.key(KeyCode::Enter);
+            return true;
+        }
+        if at >= self.record_lines().len() {
+            return false;
+        }
+        let same = self.record_sel == at && !self.record_finding;
+        // The pointer names a line, so the find box gives up the focus. The key
+        // Enter does the same in the find box, and it keeps the text.
+        self.record_finding = false;
+        self.record_sel = at;
+        if !same {
+            // The click only chose the line. The caller draws a frame, because
+            // the mark of the selection moved.
+            return true;
+        }
+        // The line was chosen already, so the click opens or closes the value,
+        // as the key Space does. A line that holds no other values does nothing,
+        // and the frame is then the same as the frame before it.
+        let before = self.record_lines().len();
+        self.key(KeyCode::Char(' '));
+        self.record_lines().len() != before
+    }
+
+    /// Handles a click on a line of the command palette.
+    fn palette_click(&mut self, at: usize, double: bool) -> bool {
+        // A double click runs the command, as Enter does.
+        if double {
+            self.key(KeyCode::Enter);
+            return true;
+        }
+        if at >= self.palette_items().len() {
+            return false;
+        }
+        self.palette_sel = at;
+        true
+    }
+
+    /// Handles a click on a line of the theme picker.
+    fn theme_click(&mut self, at: usize, double: bool) -> bool {
+        // A double click keeps the theme, as Enter does.
+        if double {
+            self.key(KeyCode::Enter);
+            return true;
+        }
+        if at >= self.themes.len() {
+            return false;
+        }
+        self.theme_preview(at);
+        true
+    }
+
+    /// Handles a click on a line of the settings page.
+    fn settings_click(&mut self, at: usize, double: bool) -> bool {
+        // The value has the focus while the user types it. A click on another
+        // setting would lose what the user typed, so the click does nothing.
+        // Esc and Enter leave the value, as they do for the keys.
+        if self.settings_editing {
+            return false;
+        }
+        // A double click starts to edit the setting, as Enter does.
+        if double {
+            self.key(KeyCode::Enter);
+            return true;
+        }
+        if at >= Setting::ALL.len() {
+            return false;
+        }
+        self.settings_sel = at;
+        true
+    }
+
+    /// Handles a click on a line of the filter builder.
+    fn build_click(&mut self, at: usize, double: bool) -> bool {
+        match self.build {
+            Build::List => {
+                // A double click edits the condition, as the key `e` does. The
+                // key Enter applies the filter, and a click that lands on the
+                // wrong row must not start a query of the whole file.
+                if double {
+                    self.key(KeyCode::Char('e'));
+                    return true;
+                }
+                if at >= self.fset.conditions.len() {
+                    return false;
+                }
+                self.build_sel = at;
+                true
+            }
+            Build::Column => {
+                if double {
+                    self.key(KeyCode::Enter);
+                    return true;
+                }
+                if at >= self.build_columns().len() {
+                    return false;
+                }
+                self.pick_sel = at;
+                true
+            }
+            Build::Op => {
+                if double {
+                    self.key(KeyCode::Enter);
+                    return true;
+                }
+                if at >= self.build_ops().len() {
+                    return false;
+                }
+                self.pick_sel = at;
+                true
+            }
+            // The two value steps and the SQL step hold a prompt and no list.
+            Build::Value | Build::Value2 | Build::Raw => false,
+        }
+    }
+
+    /// Moves the grid for a turn of the wheel. Gives `true` when the event was
+    /// a turn of the wheel.
+    fn wheel_grid(&mut self, ev: &MouseEvent) -> bool {
+        match wheel_of(ev) {
+            Wheel::Rows(n) => self.move_rows(n),
+            Wheel::Cols(n) => self.move_cols(n),
+            Wheel::None => return false,
+        }
+        true
+    }
+
+    /// Gives one mouse event to the grid.
+    fn grid_mouse(&mut self, ev: &MouseEvent, double: bool) -> bool {
+        if self.wheel_grid(ev) {
+            return true;
+        }
+        if ev.kind != MouseEventKind::Down(MouseButton::Left) {
+            return false;
+        }
+        // A panel at the side of the grid covers the same rows as the grid. A
+        // click in the panel must therefore not move the cursor of the grid.
+        if !self.hit.holds(ev.column) {
+            return false;
+        }
+        let on_labels = self.hit.on_labels(ev.row);
+        let row = self.hit.row_at(ev.row);
+        if !on_labels && row.is_none() {
+            return false;
+        }
+        // A grid with room for more rows than the file holds keeps the rows
+        // under the last one empty. There is no cell there, so a click must
+        // change nothing: without this, a click on the empty part of the
+        // screen would send the cursor to the last row of the file.
+        if let Some(off) = row
+            && self.top_row.saturating_add(off) > self.max_row()
+        {
+            return false;
+        }
+        // A click on the row of the names, or on the detail band, moves to that
+        // column and does not sort. A sort of a large file costs seconds, and a
+        // click that lands on the wrong column must not start that work. The key
+        // `s` sorts.
+        // The gutter of row numbers and the space after the last column hold
+        // no column. A click there moves nothing, and the caller draws no
+        // frame for it.
+        // A click on a cell that the cursor is on already opens the record view,
+        // and so does a double click. A click on any other cell moves the cursor
+        // and no more.
+        //
+        // The rule gives the two things that a user wants from one button. A
+        // click on a cell opens that record, which is what the user asked for. A
+        // user who only wants to choose a cell still can, because the first click
+        // on a cell never opens a box on top of the data. A file chooser of a
+        // desktop works in this way.
+        let was_here = row.is_some_and(|off| {
+            let target = self.top_row.saturating_add(off);
+            target == self.cursor_row
+                && self.hit.col_at(ev.column).is_none_or(|ci| ci == self.cursor_col)
+        });
+
+        let mut acted = false;
+        if let Some(ci) = self.hit.col_at(ev.column) {
+            self.cursor_col = ci;
+            acted = true;
+        }
+        if let Some(off) = row {
+            self.cursor_row = self.top_row.saturating_add(off).min(self.max_row());
+            self.follow_cursor();
+            if double || was_here {
+                self.open_record();
+            }
+            acted = true;
+        }
+        acted
+    }
+
     /// Handles a key in the help overlay or in the cell inspector.
     fn overlay_key(&mut self, key: &KeyEvent, mut scroll: impl FnMut(&mut App, i32)) {
         match key.code {
@@ -1308,12 +2400,10 @@ impl App {
                 self.mode = Mode::Normal;
             }
             KeyCode::Up | KeyCode::Char('k') => {
-                self.theme_sel = self.theme_sel.saturating_sub(1);
-                self.theme = self.themes[self.theme_sel].clone();
+                self.theme_preview(self.theme_sel.saturating_sub(1));
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                self.theme_sel = (self.theme_sel + 1).min(self.themes.len() - 1);
-                self.theme = self.themes[self.theme_sel].clone();
+                self.theme_preview(self.theme_sel + 1);
             }
             KeyCode::Enter => {
                 self.theme_idx = self.theme_sel;
@@ -1323,6 +2413,20 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    /// Selects a theme in the picker and paints with it at once.
+    ///
+    /// The preview is the reason that the picker exists: the name of a theme
+    /// says nothing about its colors. The arrow keys and a click both come
+    /// here, so the two always give the same result.
+    fn theme_preview(&mut self, at: usize) {
+        let at = at.min(self.themes.len().saturating_sub(1));
+        let Some(theme) = self.themes.get(at).cloned() else {
+            return;
+        };
+        self.theme_sel = at;
+        self.theme = theme;
     }
 
     /// Completes the column name that the user started to type.
@@ -1450,8 +2554,8 @@ impl App {
     /// The function gives the complete text of the line after the change, so
     /// that a caller which keeps its own copy of that text can follow it.
     fn take_ghost(&mut self, key: &KeyEvent) -> Option<String> {
-        let take =
-            key.code == KeyCode::Tab || (key.code == KeyCode::Right && self.input.cursor_at_end());
+        let take = key.code == KeyCode::Tab
+            || (key.code == KeyCode::Right && plain(key) && self.input.cursor_at_end());
         if !take {
             return None;
         }
@@ -1472,8 +2576,14 @@ impl App {
                 .iter()
                 .map(|s| s.to_string())
                 .collect(),
+            Setting::Band => ["off", "compact", "detailed"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
             Setting::NoIndex => vec!["yes".into(), "no".into()],
-            Setting::Threads | Setting::MemoryLimit | Setting::SampleSize => Vec::new(),
+            Setting::Threads | Setting::MemoryLimit | Setting::SampleSize | Setting::Step => {
+                Vec::new()
+            }
         }
     }
 
@@ -1540,11 +2650,12 @@ impl App {
         // The line editor has no list of columns, so the completion happens
         // here, in front of it.
         if matches!(kind, PromptKind::Filter | PromptKind::Sql) {
-            // The key Tab takes the completion. The key → also takes it, at
+            // The key Tab takes the completion. The key -> also takes it, at
             // the end of a line, where that key has nothing else to do. A
-            // user of a shell knows that second form.
+            // user of a shell knows that second form. Ctrl+-> and Alt+-> move
+            // one word, so those two forms keep that operation.
             let take = key.code == KeyCode::Tab
-                || (key.code == KeyCode::Right && self.ghost().is_some());
+                || (key.code == KeyCode::Right && plain(key) && self.ghost().is_some());
             if take {
                 self.complete_column();
                 return;
@@ -1552,6 +2663,17 @@ impl App {
         }
         match self.input.handle(key) {
             Action::Cancel => {
+                // Keep the line in the history before the prompt closes. The key
+                // `Esc` would otherwise throw away a statement of 200 characters
+                // with no way back, and the arrow key of the history is the way
+                // back that a user expects.
+                //
+                // A Mac makes this more than a convenience. A terminal with the
+                // setting "Option as Esc+" sends `Esc` in front of the arrow key,
+                // so `Option` with an arrow, which is the key for a jump of one
+                // word, arrives here as a cancel. Without this line, that jump
+                // deletes the work of the user.
+                self.input.remember();
                 self.mode = Mode::Normal;
                 self.prompt_error = None;
             }
@@ -1600,6 +2722,20 @@ impl App {
                 self.reload(true);
             }
             PromptKind::Sql => {
+                // The prompt opens with a statement that ends at the word WHERE,
+                // for the user to finish. A press of Enter on that text alone
+                // asks the database to read a condition that is not there, and
+                // the answer is a message from the parser of DuckDB.
+                //
+                // The cost is worse than the message: the code below clears the
+                // filter and the sort before it reads the answer, so `e` and then
+                // Enter would throw away the filter that the user is looking at.
+                // Keep the prompt open instead, and say what is missing.
+                if trimmed.ends_with("WHERE") || trimmed.ends_with("where") {
+                    self.prompt_error =
+                        Some("write a condition after WHERE, or press Esc".into());
+                    return;
+                }
                 if trimmed.is_empty() {
                     self.view.base = Base::Source;
                 } else {
@@ -1672,11 +2808,14 @@ impl App {
             PromptKind::Sql => {
                 let mut i = self.sql_input.clone();
                 let current = match &self.view.base {
+                    // Fill the prompt with the statement behind the grid. The
+                    // user then corrects that statement, and does not write it
+                    // again.
                     Base::Sql(s) => s.clone(),
-                    // Fill the prompt with the statement behind the grid.
-                    // The user then starts from a statement that works, and
-                    // not from an empty line.
-                    Base::Source => "SELECT * FROM src".to_string(),
+                    // The grid reads the file, so the prompt has no statement
+                    // of its own to show. It starts from the statement that
+                    // most users want. Refer to `query::PROMPT_START`.
+                    Base::Source => PROMPT_START.to_string(),
                 };
                 i.set(&current);
                 i
@@ -2075,6 +3214,8 @@ impl App {
                 None => String::new(),
             },
             Setting::Panels => self.config.panels.clone().unwrap_or_default(),
+            Setting::Band => self.config.band.clone().unwrap_or_default(),
+            Setting::Step => self.config.step.map(|v| v.to_string()).unwrap_or_default(),
         }
     }
 
@@ -2091,6 +3232,8 @@ impl App {
             Setting::SampleSize => "20,480 rows".into(),
             Setting::NoIndex => "yes, below 256 MB".into(),
             Setting::Panels => "none".into(),
+            Setting::Band => "off".into(),
+            Setting::Step => format!("{DEFAULT_STEP} rows or columns"),
         }
     }
 
@@ -2110,6 +3253,14 @@ impl App {
             self.ok(format!("theme: {name}"));
             return;
         };
+        // A file that Peruse cannot read gives the built-in settings and the
+        // reason. A write of those settings would replace the file, and each
+        // setting that the user wrote in it, plus every note, would be gone. The
+        // file therefore stays as it is, and the message says why.
+        if let Some(why) = write_blocked(&path) {
+            self.ok(format!("theme: {name} ({why})"));
+            return;
+        }
         let (mut on_disk, _) = Config::load_from(&path);
         if on_disk.theme.as_deref() == Some(name.as_str()) {
             self.ok(format!("theme: {name}"));
@@ -2123,11 +3274,49 @@ impl App {
         }
     }
 
+    /// Keeps the mode of the detail band in the settings file.
+    ///
+    /// The key `d` writes the mode at once, as the key `t` writes the theme. A
+    /// user who turns the band on wants it on at the next start as well, and a
+    /// second key to keep it is a key that the user forgets to press.
+    ///
+    /// The function reads the file again and changes one line of it, so a setting
+    /// that the user is testing in this session does not go into the file without
+    /// a request. It gives the text for the status line: nothing when the mode is
+    /// in the file, and the reason when it is not.
+    fn remember_band(&mut self) -> String {
+        let name = self.band().name();
+        let Some(path) = self.config_path.clone() else {
+            return String::new();
+        };
+        // A file that Peruse cannot read gives the built-in settings and the
+        // reason. A write of those settings would replace the file, and each
+        // setting that the user wrote in it, plus every note, would be gone. The
+        // key `d` is a key that a user presses often, so this is the more likely
+        // way to lose a file. The file therefore stays as it is.
+        if let Some(why) = write_blocked(&path) {
+            return format!(" ({why})");
+        }
+        let (mut on_disk, _) = Config::load_from(&path);
+        if on_disk.band.as_deref() == Some(name) {
+            return String::new();
+        }
+        on_disk.band = Some(name.to_string());
+        match on_disk.save_to(&path) {
+            Ok(_) => String::new(),
+            // A mode that Peruse cannot keep still works for this session.
+            Err(e) => format!(" (not kept: {e})"),
+        }
+    }
+
     /// Writes the settings to the file.
     fn save_config(&self) -> Result<(), String> {
         let Some(p) = &self.config_path else {
             return Err("this system gives no directory for settings".into());
         };
+        if let Some(why) = write_blocked(p) {
+            return Err(why);
+        }
         self.config.save_to(p).map(|_| ())
     }
 
@@ -2240,6 +3429,36 @@ impl App {
                         None => {
                             self.error(format!(
                                 "panels: write none, meta, stats or both (got {t:?})"
+                            ));
+                            return;
+                        }
+                    }
+                }
+            }
+            Setting::Band => {
+                if empty {
+                    self.config.band = None;
+                } else {
+                    match Band::parse(t) {
+                        Some(b) => self.config.band = Some(b.name().to_string()),
+                        None => {
+                            self.error(format!(
+                                "column details: write off, compact or detailed (got {t:?})"
+                            ));
+                            return;
+                        }
+                    }
+                }
+            }
+            Setting::Step => {
+                if empty {
+                    self.config.step = None;
+                } else {
+                    match t.replace([',', '_'], "").parse::<usize>() {
+                        Ok(n) if (1..=MAX_STEP).contains(&n) => self.config.step = Some(n),
+                        _ => {
+                            self.error(format!(
+                                "step: write a number from 1 to {MAX_STEP} (got {t:?})"
                             ));
                             return;
                         }
@@ -2718,7 +3937,7 @@ impl App {
     /// Handles a key in the step that takes a `WHERE` expression.
     fn build_raw_key(&mut self, key: &KeyEvent) {
         if key.code == KeyCode::Tab
-            || (key.code == KeyCode::Right && self.ghost().is_some())
+            || (key.code == KeyCode::Right && plain(key) && self.ghost().is_some())
         {
             self.complete_column();
             return;
@@ -2845,6 +4064,12 @@ impl App {
             Cmd::RowUp => self.move_rows(-1),
             Cmd::PageDown => self.move_rows(vis_rows),
             Cmd::PageUp => self.move_rows(-vis_rows),
+            Cmd::HalfPageDown => self.move_rows((vis_rows / 2).max(1)),
+            Cmd::HalfPageUp => self.move_rows(-(vis_rows / 2).max(1)),
+            Cmd::StepDown => self.move_rows(self.step()),
+            Cmd::StepUp => self.move_rows(-self.step()),
+            Cmd::StepRight => self.move_cols(self.step()),
+            Cmd::StepLeft => self.move_cols(-self.step()),
             Cmd::Top => {
                 self.cursor_row = 0;
                 self.follow_cursor();
@@ -2862,6 +4087,25 @@ impl App {
             Cmd::ColLeft => self.move_cols(-1),
             Cmd::ColFirst => self.move_cols(-(self.schema.len() as i64)),
             Cmd::ColLast => self.move_cols(self.schema.len() as i64),
+            Cmd::Origin => {
+                self.cursor_row = 0;
+                self.top_row = 0;
+                self.left_col = 0;
+                self.move_cols(-(self.schema.len() as i64));
+            }
+            Cmd::LastCell => {
+                // Test the count of rows before anything moves. A cursor that
+                // moved to the last column, under a message that says that
+                // nothing happened, reads as a fault in the program.
+                let max = self.max_row();
+                if max == u64::MAX {
+                    self.info("still counting — try again in a moment");
+                    return;
+                }
+                self.move_cols(self.schema.len() as i64);
+                self.cursor_row = max;
+                self.follow_cursor();
+            }
             Cmd::GotoRow => self.open_prompt(PromptKind::Goto),
 
             Cmd::SortCycle => {
@@ -2953,6 +4197,19 @@ impl App {
                 };
                 self.ok(name);
             }
+            // One key moves through the three modes of the band. The band is a
+            // second view of the facts that the statistics panel gives, and it
+            // covers every column on the screen at the same time.
+            Cmd::CycleBand => {
+                let next = self.band().next();
+                self.config.band = Some(next.name().to_string());
+                // The key is the way back after a request that failed. The band
+                // asks again for the columns on the screen.
+                self.band_error = false;
+                self.band_asked.clear();
+                let note = self.remember_band();
+                self.ok(format!("{}{note}", next.label()));
+            }
             Cmd::Record => self.open_record(),
             Cmd::InspectCell => {
                 let Some(col) = self.schema.columns.get(self.cursor_col) else {
@@ -2961,7 +4218,7 @@ impl App {
                 // A value that holds other values has no useful form as one
                 // piece of text. The text that DuckDB writes for a structure,
                 //
-                //   {'id': 665991, 'login': petroav, 'gravatar_id': '', …}
+                //   {'id': 665991, 'login': petroav, 'gravatar_id': '', ...}
                 //
                 // says what the value holds and nothing more: the user cannot
                 // read one field of it, cannot copy one field, and cannot
@@ -3071,6 +4328,35 @@ impl App {
     }
 }
 
+/// Gives `true` when the footer of the file can answer for the detail band, so
+/// that the band costs no query.
+///
+/// Three things must hold together:
+///
+/// * The mode needs the NULL share only. The footer holds no count of the
+///   different values and no true range.
+/// * The view reads the file itself, with no filter. The footer describes the
+///   whole file, so a filter or a statement of the user makes its counts wrong.
+/// * The format is Parquet. No other format that Peruse reads has a footer.
+fn footer_can_answer(band: Band, view: &View, format: Format) -> bool {
+    !band.needs_values() && view.is_unfiltered_source() && format == Format::Parquet
+}
+
+/// Gives `true` when the facts of a column answer everything that a mode of the
+/// detail band draws.
+///
+/// The compact band needs the share of NULL values only, and the footer of a
+/// Parquet file gives that share with no query. The detailed band also needs the
+/// count of the different values and the range, and the footer holds neither.
+/// The band must therefore ask the engine when the user moves from the compact
+/// mode to the detailed mode, and the answer of the footer is no longer enough.
+fn brief_is_enough(brief: Option<&ColumnBrief>, band: Band) -> bool {
+    match brief {
+        None => false,
+        Some(b) => !band.needs_values() || b.n_distinct.is_some(),
+    }
+}
+
 /// Gives the part of a name that the user did not type yet.
 ///
 /// The shortest name that starts with the text is the one that the user most
@@ -3130,5 +4416,500 @@ fn quote_if_needed(name: &str) -> String {
         name.to_string()
     } else {
         peruse_core::query::quote_ident(name)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Makes one turn of the wheel.
+    fn wheel(kind: MouseEventKind, mods: KeyModifiers) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column: 0,
+            row: 0,
+            modifiers: mods,
+        }
+    }
+
+    const NONE: KeyModifiers = KeyModifiers::NONE;
+
+    #[test]
+    fn the_plain_wheel_always_moves_up_and_down() {
+        // The wheel moves the view up and down in each other program. A user
+        // reads a file of rows with this one movement, so it must never change
+        // to a movement to the side.
+        assert_eq!(
+            wheel_of(&wheel(MouseEventKind::ScrollUp, NONE)),
+            Wheel::Rows(-WHEEL_ROWS)
+        );
+        // Read the number out of the result, and do not test the constant. The
+        // wheel down must move down the view, and by more than nothing.
+        let Wheel::Rows(down) = wheel_of(&wheel(MouseEventKind::ScrollDown, NONE)) else {
+            panic!("the wheel down must move rows");
+        };
+        assert!(down > 0, "the wheel down must move down the view, got {down}");
+    }
+
+    #[test]
+    fn the_wheel_with_the_control_key_moves_to_the_side() {
+        for mods in [KeyModifiers::CONTROL, KeyModifiers::SHIFT] {
+            assert_eq!(
+                wheel_of(&wheel(MouseEventKind::ScrollDown, mods)),
+                Wheel::Cols(WHEEL_COLS),
+                "{mods:?} with the wheel down"
+            );
+            assert_eq!(
+                wheel_of(&wheel(MouseEventKind::ScrollUp, mods)),
+                Wheel::Cols(-WHEEL_COLS),
+                "{mods:?} with the wheel up"
+            );
+        }
+        // The two keys together give the same result, and not two movements.
+        let both = KeyModifiers::CONTROL | KeyModifiers::SHIFT;
+        assert_eq!(
+            wheel_of(&wheel(MouseEventKind::ScrollDown, both)),
+            Wheel::Cols(WHEEL_COLS)
+        );
+    }
+
+    #[test]
+    fn a_wheel_that_turns_to_the_side_moves_to_the_side() {
+        assert_eq!(
+            wheel_of(&wheel(MouseEventKind::ScrollRight, NONE)),
+            Wheel::Cols(WHEEL_COLS)
+        );
+        assert_eq!(
+            wheel_of(&wheel(MouseEventKind::ScrollLeft, NONE)),
+            Wheel::Cols(-WHEEL_COLS)
+        );
+    }
+
+    #[test]
+    fn a_movement_of_the_pointer_moves_nothing() {
+        // The terminal reports each movement of the pointer while the mouse is
+        // on. Peruse does nothing with those events, and it draws no frame for
+        // them.
+        for kind in [
+            MouseEventKind::Moved,
+            MouseEventKind::Drag(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+            MouseEventKind::Down(MouseButton::Right),
+        ] {
+            assert_eq!(wheel_of(&wheel(kind, NONE)), Wheel::None, "{kind:?}");
+        }
+    }
+
+    /// Makes the positions of a grid of three columns.
+    ///
+    /// The gutter of row numbers takes the columns 0 to 3. The three columns of
+    /// data then start at the column 4.
+    fn hit() -> Hit {
+        Hit {
+            header_y: 1,
+            band: 0,
+            top: 2,
+            rows: 10,
+            cols: vec![(0, 4, 6), (1, 10, 6), (2, 16, 6)],
+            // The grid covers the columns 0 to 21. A panel would start at 22.
+            left: 0,
+            width: 22,
+        }
+    }
+
+    /// Makes the positions of the same grid with the detailed band on.
+    ///
+    /// The band takes four rows under the column names, so the first row of data
+    /// moves from the row 2 to the row 6.
+    fn hit_with_band() -> Hit {
+        Hit {
+            header_y: 1,
+            band: Band::DETAIL_ROWS,
+            top: 2 + Band::DETAIL_ROWS,
+            rows: 6,
+            ..hit()
+        }
+    }
+
+    #[test]
+    fn a_click_finds_the_row_and_the_column_under_the_pointer() {
+        let h = hit();
+        assert_eq!(h.row_at(2), Some(0), "the first row of data");
+        assert_eq!(h.row_at(11), Some(9), "the last row of data");
+        assert_eq!(h.col_at(4), Some(0), "the left edge of the first column");
+        assert_eq!(h.col_at(9), Some(0), "the right edge of the first column");
+        assert_eq!(h.col_at(10), Some(1), "the next column starts here");
+        assert_eq!(h.col_at(21), Some(2));
+    }
+
+    #[test]
+    fn a_click_outside_the_grid_finds_nothing() {
+        let h = hit();
+        assert_eq!(h.row_at(0), None, "the title bar");
+        assert_eq!(h.row_at(1), None, "the row of the column names");
+        assert_eq!(h.row_at(12), None, "the status line");
+        assert_eq!(h.col_at(0), None, "the gutter of row numbers");
+        assert_eq!(h.col_at(3), None, "the last column of the gutter");
+        assert_eq!(h.col_at(22), None, "the space after the last column");
+    }
+
+    #[test]
+    fn a_click_in_a_panel_at_the_side_finds_no_row_of_the_grid() {
+        // A panel covers the same rows as the grid, so the row of a click does
+        // not say that the click belongs to the grid. Without the test of the
+        // column, a click on the list of columns in the metadata panel moved the
+        // cursor of the grid to the row beside it.
+        let h = hit();
+        assert!(h.holds(0), "the gutter of row numbers is in the grid");
+        assert!(h.holds(21), "the last column of the grid");
+        assert!(!h.holds(22), "the first column of a panel");
+        assert!(!h.holds(60), "deep inside a panel");
+    }
+
+    #[test]
+    fn a_grid_with_no_room_holds_no_column() {
+        // The grid writes a width of zero when the terminal is too small. No
+        // click can then land on it.
+        let h = Hit { width: 0, ..hit() };
+        for x in 0..40 {
+            assert!(!h.holds(x), "column {x}");
+        }
+    }
+
+    #[test]
+    fn a_grid_with_no_room_finds_nothing() {
+        // The grid writes rows = 0 when the terminal is too small to hold one
+        // row of data. Without this, a click would use the positions of an
+        // older frame.
+        let h = Hit { rows: 0, ..hit() };
+        for y in 0..20 {
+            assert_eq!(h.row_at(y), None, "row {y}");
+        }
+    }
+
+    #[test]
+    fn the_last_column_of_the_screen_does_not_overflow_the_calculation() {
+        // A column that starts near the right edge of a very wide terminal can
+        // make the sum of its position and its width too large for 16 bits.
+        let h = Hit {
+            header_y: 0,
+            band: 0,
+            top: 1,
+            rows: 4,
+            left: u16::MAX - 4,
+            width: 4,
+            cols: vec![(0, u16::MAX - 2, 40)],
+        };
+        assert_eq!(h.col_at(u16::MAX - 1), Some(0));
+        assert_eq!(h.col_at(0), None);
+        // The width of the grid must not overflow the sum either.
+        assert!(h.holds(u16::MAX - 1));
+        assert!(!h.holds(0));
+    }
+
+    #[test]
+    fn a_click_under_the_band_finds_the_row_that_the_user_pointed_at() {
+        // The band takes rows from the data, so the first row of data is lower.
+        // Without the band in the calculation, each click would land four rows
+        // above the row that the user pointed at.
+        let h = hit_with_band();
+        assert_eq!(h.row_at(6), Some(0), "the first row of data");
+        assert_eq!(h.row_at(11), Some(5), "the last row of data");
+        assert_eq!(h.row_at(12), None, "below the last row of data");
+        // The band belongs to the header. A click there moves to the column and
+        // leaves the row where it is.
+        for y in 1..=5 {
+            assert_eq!(h.row_at(y), None, "row {y} is the header or the band");
+            assert!(h.on_labels(y), "row {y} must count as a label row");
+        }
+        assert!(!h.on_labels(0), "the title bar");
+        assert!(!h.on_labels(6), "the first row of data");
+    }
+
+    #[test]
+    fn with_no_band_only_the_row_of_the_names_is_a_label_row() {
+        let h = hit();
+        assert!(h.on_labels(1));
+        assert!(!h.on_labels(2), "the first row of data");
+        assert!(!h.on_labels(0));
+    }
+
+    #[test]
+    fn two_quick_presses_at_one_place_are_a_double_click() {
+        // A terminal reports no double click. Peruse finds it from two presses
+        // at the same position, inside a short time.
+        let t0 = Instant::now();
+        let mut c = Clicks::default();
+        assert!(!c.press(10, 5, t0), "one press alone is not a double click");
+        assert!(c.press(10, 5, t0 + Duration::from_millis(120)));
+    }
+
+    #[test]
+    fn a_third_press_is_not_a_second_double_click() {
+        // Without this rule, a user who clicks quickly three times would open
+        // the same thing two times.
+        let t0 = Instant::now();
+        let mut c = Clicks::default();
+        assert!(!c.press(4, 4, t0));
+        assert!(c.press(4, 4, t0 + Duration::from_millis(100)));
+        assert!(
+            !c.press(4, 4, t0 + Duration::from_millis(200)),
+            "the third press must start a new pair"
+        );
+        // The fourth press closes that new pair.
+        assert!(c.press(4, 4, t0 + Duration::from_millis(300)));
+    }
+
+    #[test]
+    fn two_presses_far_apart_in_time_are_two_clicks() {
+        let t0 = Instant::now();
+        let mut c = Clicks::default();
+        assert!(!c.press(2, 2, t0));
+        assert!(!c.press(2, 2, t0 + DOUBLE_CLICK + Duration::from_millis(1)));
+        // The limit itself still counts, so a press exactly at the limit opens
+        // the record and does not move the cursor only.
+        let mut c = Clicks::default();
+        assert!(!c.press(2, 2, t0));
+        assert!(c.press(2, 2, t0 + DOUBLE_CLICK));
+    }
+
+    #[test]
+    fn two_presses_at_different_positions_are_two_clicks() {
+        // A user who chooses one cell and then another one must not open the
+        // record view. The hand moves, so the position is the test.
+        let t0 = Instant::now();
+        for (x, y) in [(11u16, 5u16), (10, 6), (0, 0)] {
+            let mut c = Clicks::default();
+            assert!(!c.press(10, 5, t0));
+            assert!(
+                !c.press(x, y, t0 + Duration::from_millis(50)),
+                "a press at {x},{y} after one at 10,5"
+            );
+        }
+    }
+
+    /// Makes the positions of an overlay with a list of six lines.
+    ///
+    /// The box sits at the column 10 and the row 2, and it is 40 columns wide
+    /// and 12 rows high. The list starts under the border, and it shows the
+    /// lines 20 to 25 of a longer list.
+    fn overlay() -> OverlayHit {
+        let mut h = OverlayHit::new(
+            Mode::Record,
+            Rect {
+                x: 10,
+                y: 2,
+                width: 40,
+                height: 12,
+            },
+        );
+        for i in 0..6u16 {
+            h.line(3 + i, 20 + i as usize);
+        }
+        h
+    }
+
+    #[test]
+    fn a_click_inside_an_overlay_is_not_a_click_outside_it() {
+        // A click outside the box closes the overlay. A click inside it must
+        // therefore never count as outside, or the box would close under the
+        // hand of the user.
+        let h = overlay();
+        assert!(h.holds(10, 2), "the top left corner of the border");
+        assert!(h.holds(49, 13), "the bottom right corner of the border");
+        assert!(h.holds(30, 8), "the middle of the box");
+        assert!(!h.holds(9, 8), "one column to the left of the box");
+        assert!(!h.holds(50, 8), "one column to the right of the box");
+        assert!(!h.holds(30, 1), "one row above the box");
+        assert!(!h.holds(30, 14), "one row below the box");
+        assert!(!h.holds(0, 0), "the title bar of the screen");
+    }
+
+    #[test]
+    fn a_click_in_a_list_finds_the_line_under_the_pointer() {
+        // The record of one row can hold hundreds of lines, so the list
+        // scrolls. A click must find the line under the pointer, and not the
+        // line at that offset in the list.
+        let h = overlay();
+        assert_eq!(h.line_at(3), Some(20), "the first line on the screen");
+        assert_eq!(h.line_at(5), Some(22));
+        assert_eq!(h.line_at(8), Some(25), "the last line on the screen");
+        // The border, the row of keys and each row outside the list hold no
+        // line, so a click there changes nothing.
+        assert_eq!(h.line_at(2), None, "the top border");
+        assert_eq!(h.line_at(9), None, "under the last line");
+        assert_eq!(h.line_at(13), None, "the row of keys");
+    }
+
+    #[test]
+    fn an_overlay_with_no_list_answers_no_line() {
+        // The help and the cell inspector hold text and no list. A click inside
+        // them selects nothing.
+        let h = OverlayHit::new(Mode::Help, Rect::new(0, 0, 20, 10));
+        for y in 0..12 {
+            assert_eq!(h.line_at(y), None, "row {y}");
+        }
+        assert!(h.holds(0, 0));
+    }
+
+    #[test]
+    fn the_band_moves_through_off_compact_and_detailed() {
+        assert_eq!(Band::Off.next(), Band::Compact);
+        assert_eq!(Band::Compact.next(), Band::Detailed);
+        assert_eq!(Band::Detailed.next(), Band::Off);
+        // Three presses of the key come back to the start.
+        assert_eq!(Band::Off.next().next().next(), Band::Off);
+        assert_eq!(Band::Off.rows(), 0);
+        assert_eq!(Band::Compact.rows(), 1);
+        assert_eq!(Band::Detailed.rows(), Band::DETAIL_ROWS);
+        // Only the detailed band needs the values, so the compact band over a
+        // Parquet file can come from the footer.
+        assert!(!Band::Compact.needs_values());
+        assert!(Band::Detailed.needs_values());
+    }
+
+    #[test]
+    fn a_plain_parquet_file_needs_no_query_for_the_compact_band() {
+        // The footer of a Parquet file holds the number of rows and the number
+        // of NULL values of each column. The compact band needs nothing more, so
+        // it costs no query, also on a file of some gigabytes.
+        let plain = View::default();
+        assert!(footer_can_answer(Band::Compact, &plain, Format::Parquet));
+
+        // The detailed band needs the values, and the footer holds none.
+        assert!(!footer_can_answer(Band::Detailed, &plain, Format::Parquet));
+        // No other format has a footer.
+        for f in [Format::Csv, Format::Json, Format::Arrow] {
+            assert!(!footer_can_answer(Band::Compact, &plain, f), "{f:?}");
+        }
+        // The footer describes the whole file. A filter and a statement of the
+        // user both change the counts, so the engine must measure them.
+        let filtered = View {
+            filter: Some("id > 1".into()),
+            ..Default::default()
+        };
+        assert!(!footer_can_answer(Band::Compact, &filtered, Format::Parquet));
+        let sql = View {
+            base: Base::Sql("SELECT * FROM src".into()),
+            ..Default::default()
+        };
+        assert!(!footer_can_answer(Band::Compact, &sql, Format::Parquet));
+    }
+
+    #[test]
+    fn the_answer_of_the_footer_is_not_enough_for_the_detailed_band() {
+        // The footer of a Parquet file gives the NULL share and no more. A user
+        // who moves from the compact band to the detailed band must therefore
+        // start a query, and the two rows of the values must not stay as points.
+        let from_footer = ColumnBrief {
+            column: "id".into(),
+            n_total: 100,
+            n_present: 90,
+            n_distinct: None,
+            min: None,
+            max: None,
+        };
+        let measured = ColumnBrief {
+            n_distinct: Some(90),
+            ..from_footer.clone()
+        };
+        assert!(brief_is_enough(Some(&from_footer), Band::Compact));
+        assert!(!brief_is_enough(Some(&from_footer), Band::Detailed));
+        // A measured column answers each mode, so a move back to the compact
+        // band asks for nothing.
+        assert!(brief_is_enough(Some(&measured), Band::Compact));
+        assert!(brief_is_enough(Some(&measured), Band::Detailed));
+        // A column with no facts at all always needs an answer.
+        assert!(!brief_is_enough(None, Band::Compact));
+        assert!(!brief_is_enough(None, Band::Detailed));
+    }
+
+    #[test]
+    fn the_name_of_the_band_reads_back_from_the_settings_file() {
+        for b in [Band::Off, Band::Compact, Band::Detailed] {
+            assert_eq!(Band::parse(b.name()), Some(b), "{}", b.name());
+        }
+        assert_eq!(Band::parse(" Detailed "), Some(Band::Detailed));
+        assert_eq!(Band::parse(""), Some(Band::Off));
+        // A name that Peruse does not know is not a band.
+        assert_eq!(Band::parse("wide"), None);
+    }
+
+    #[test]
+    fn a_settings_file_with_a_fault_is_never_written_over() {
+        // `Config::to_toml` writes the whole file from the fields that Peruse
+        // holds, and a file that does not parse gives the built-in fields. A
+        // write would therefore replace each setting that the user wrote, and
+        // every note in the file. The key `d` writes the file at each press, so
+        // one character wrong in the file would cost the user the rest of it.
+        let dir = std::env::temp_dir().join("peruse-write-blocked");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let bad = dir.join("bad.toml");
+        std::fs::write(&bad, "theme =\n").unwrap();
+        let why = write_blocked(&bad).expect("a file that does not parse must block a write");
+        assert!(why.contains("nothing was written"), "{why}");
+
+        let good = dir.join("good.toml");
+        std::fs::write(&good, "theme = \"nord\"\nstep = 25\n").unwrap();
+        assert_eq!(write_blocked(&good), None, "a file that parses must not block");
+
+        // A file that is not there is not a fault. Peruse writes a new one.
+        let missing = dir.join("not-there.toml");
+        let _ = std::fs::remove_file(&missing);
+        assert_eq!(write_blocked(&missing), None);
+
+        // A name that Peruse does not know is a fault too, and it is the easy
+        // mistake to make by hand.
+        let unknown = dir.join("unknown.toml");
+        std::fs::write(&unknown, "thheme = \"nord\"\n").unwrap();
+        assert!(write_blocked(&unknown).is_some());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_step_stays_inside_its_limits() {
+        assert_eq!(step_of(None), DEFAULT_STEP as i64);
+        assert_eq!(step_of(Some(1)), 1);
+        assert_eq!(step_of(Some(25)), 25);
+        // A step of zero would give a key that does nothing.
+        assert_eq!(step_of(Some(0)), 1);
+        // A step of some million rows is a jump, and the key # does that.
+        assert_eq!(step_of(Some(usize::MAX)), MAX_STEP as i64);
+    }
+
+    #[test]
+    fn a_fitted_column_always_keeps_the_room_after_its_name() {
+        // A column whose values are as narrow as its name ends as wide as its
+        // name. The header then drops the type mark, and the band drops the
+        // type. Every fitted column therefore keeps NAME_HEADROOM after the
+        // name, and it still covers the widest value.
+        for name in [0usize, 1, 2, 6, 13, 40] {
+            for widest in [0usize, 1, 4, 9, 30, 55] {
+                let w = fitted_width(name, widest) as usize;
+                assert!(
+                    w >= name + NAME_HEADROOM,
+                    "a name of {name} with a value of {widest} got the width {w}"
+                );
+                assert!(
+                    w >= widest.min(MAX_COL_WIDTH as usize),
+                    "a value of {widest} does not fit in the width {w}"
+                );
+                assert!(w >= MIN_COL_WIDTH as usize && w <= MAX_COL_WIDTH as usize);
+            }
+        }
+    }
+
+    #[test]
+    fn a_very_long_name_stops_at_the_largest_width() {
+        // The room after the name never breaks the limit. One column with a
+        // long name must not push the other columns off the right edge.
+        assert_eq!(fitted_width(MAX_COL_WIDTH as usize, 0), MAX_COL_WIDTH);
+        assert_eq!(fitted_width(200, 4), MAX_COL_WIDTH);
+        // A name of some thousand characters does not fit in 16 bits, so the
+        // limit must apply before the cast.
+        assert_eq!(fitted_width(100_000, 0), MAX_COL_WIDTH);
     }
 }

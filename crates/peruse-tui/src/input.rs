@@ -10,6 +10,16 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::text;
 
+/// Gives `true` when the key carries no Ctrl key and no Alt key.
+///
+/// Ctrl and Alt with an arrow key move the cursor one word. A caller that
+/// reads a key in front of the editor, for the ghost completion, must let
+/// those two forms through to the editor.
+pub fn plain(key: &KeyEvent) -> bool {
+    !key.modifiers
+        .intersects(KeyModifiers::CONTROL.union(KeyModifiers::ALT))
+}
+
 /// What the editor did with a key.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Action {
@@ -154,6 +164,30 @@ impl LineInput {
         i
     }
 
+    /// Removes the word in front of the cursor.
+    ///
+    /// The function gives `Ignored` when the cursor is at the start, because
+    /// nothing changes then.
+    fn delete_word_left(&mut self) -> Action {
+        let start = self.word_start();
+        if start == self.cursor {
+            return Action::Ignored;
+        }
+        self.chars.drain(start..self.cursor);
+        self.cursor = start;
+        Action::Changed
+    }
+
+    /// Removes the word after the cursor. The cursor stays in position.
+    fn delete_word_right(&mut self) -> Action {
+        let end = self.word_end();
+        if end == self.cursor {
+            return Action::Ignored;
+        }
+        self.chars.drain(self.cursor..end);
+        Action::Changed
+    }
+
     /// Moves through the history. The value -1 moves to an older line, and the
     /// value 1 moves to a newer line.
     fn recall(&mut self, delta: i32) -> Action {
@@ -191,6 +225,20 @@ impl LineInput {
         Action::Changed
     }
 
+    /// Puts the cursor at a position, and says whether it moved.
+    ///
+    /// A key that moves the cursor to the position that it holds already changes
+    /// nothing on the screen. The caller draws a frame for `Changed`, so such a
+    /// key must give `Ignored`: a user who holds the left arrow at the start of a
+    /// line would otherwise draw the same screen again and again.
+    fn move_to(&mut self, to: usize) -> Action {
+        if to == self.cursor {
+            return Action::Ignored;
+        }
+        self.cursor = to;
+        Action::Changed
+    }
+
     /// Applies one key to the line and gives the result.
     pub fn handle(&mut self, key: &KeyEvent) -> Action {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
@@ -217,12 +265,7 @@ impl LineInput {
                 self.chars.truncate(self.cursor);
                 Action::Changed
             }
-            KeyCode::Char('w') if ctrl => {
-                let start = self.word_start();
-                self.chars.drain(start..self.cursor);
-                self.cursor = start;
-                Action::Changed
-            }
+            KeyCode::Char('w') if ctrl => self.delete_word_left(),
             KeyCode::Char('b') if alt => {
                 self.cursor = self.word_start();
                 Action::Changed
@@ -231,26 +274,43 @@ impl LineInput {
                 self.cursor = self.word_end();
                 Action::Changed
             }
+            // A terminal can send Ctrl+Backspace as the character 0x08. The
+            // parser of the terminal library reports that character as Ctrl+H,
+            // or, with the protocol of Kitty, as the character itself. Ctrl+H
+            // had no other function in this editor, so both forms delete a
+            // word.
+            KeyCode::Char('h') if ctrl => self.delete_word_left(),
+            KeyCode::Char('\u{8}') => self.delete_word_left(),
+            // Alt+d deletes the word that Alt+f moves over. A shell gives the
+            // same two operations to those two keys.
+            KeyCode::Char('d') if alt => self.delete_word_right(),
 
-            KeyCode::Left => {
-                self.cursor = self.cursor.saturating_sub(1);
+            // A user of Windows presses Ctrl with an arrow key. The Option key
+            // of a Mac sends Alt. Both forms move the cursor one word.
+            KeyCode::Left if ctrl || alt => {
+                self.cursor = self.word_start();
                 Action::Changed
             }
-            KeyCode::Right => {
-                self.cursor = (self.cursor + 1).min(self.chars.len());
+            KeyCode::Right if ctrl || alt => {
+                self.cursor = self.word_end();
                 Action::Changed
             }
-            KeyCode::Home => {
-                self.cursor = 0;
-                Action::Changed
-            }
-            KeyCode::End => {
-                self.cursor = self.chars.len();
-                Action::Changed
-            }
+            // Each of these four gives `Ignored` when the cursor is at that end
+            // already. The caller draws a frame for `Changed`, and a key that
+            // moves nothing must not draw the same screen again.
+            KeyCode::Left => self.move_to(self.cursor.saturating_sub(1)),
+            KeyCode::Right => self.move_to((self.cursor + 1).min(self.chars.len())),
+            // Home and End go to an end of the line with each modifier. The
+            // editor holds one line only, so Ctrl+Home has no other target.
+            KeyCode::Home => self.move_to(0),
+            KeyCode::End => self.move_to(self.chars.len()),
             KeyCode::Up => self.recall(-1),
             KeyCode::Down => self.recall(1),
 
+            // A terminal that knows the modifier sends Backspace or Delete
+            // with Ctrl or with Alt.
+            KeyCode::Backspace if ctrl || alt => self.delete_word_left(),
+            KeyCode::Delete if ctrl || alt => self.delete_word_right(),
             KeyCode::Backspace => {
                 if self.cursor == 0 {
                     return Action::Ignored;
@@ -286,6 +346,18 @@ mod tests {
     }
     fn ctrl(c: char) -> KeyEvent {
         KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+    fn alt(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::ALT)
+    }
+    /// A key such as an arrow key, with Ctrl. A user of Windows presses this.
+    fn ctrl_key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::CONTROL)
+    }
+    /// A key such as an arrow key, with Alt. The Option key of a Mac sends
+    /// this.
+    fn alt_key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::ALT)
     }
 
     fn typed(s: &str) -> LineInput {
@@ -347,6 +419,145 @@ mod tests {
         let mut i = typed("select a from   ");
         i.handle(&ctrl('w'));
         assert_eq!(i.text(), "select a ");
+    }
+
+    #[test]
+    fn a_word_jump_from_the_middle_of_a_word_stops_at_the_two_ends_of_it() {
+        let mut i = typed("select amount");
+        for _ in 0..3 {
+            i.handle(&key(KeyCode::Left));
+        }
+        assert_eq!(i.cursor_col(), 10, "the cursor is inside the word");
+        assert_eq!(i.handle(&ctrl_key(KeyCode::Left)), Action::Changed);
+        assert_eq!(i.cursor_col(), 7, "the start of the word");
+
+        for _ in 0..3 {
+            i.handle(&key(KeyCode::Right));
+        }
+        assert_eq!(i.handle(&ctrl_key(KeyCode::Right)), Action::Changed);
+        assert_eq!(i.cursor_col(), 13, "the end of the word");
+    }
+
+    #[test]
+    fn a_word_jump_from_a_space_steps_over_the_space_first() {
+        let mut i = typed("select amount");
+        for _ in 0..6 {
+            i.handle(&key(KeyCode::Left));
+        }
+        assert_eq!(i.cursor_col(), 7, "the cursor is after the space");
+        i.handle(&ctrl_key(KeyCode::Left));
+        assert_eq!(i.cursor_col(), 0, "the start of the word in front");
+
+        i.handle(&key(KeyCode::End));
+        for _ in 0..7 {
+            i.handle(&key(KeyCode::Left));
+        }
+        assert_eq!(i.cursor_col(), 6, "the cursor is on the space");
+        i.handle(&alt_key(KeyCode::Right));
+        assert_eq!(i.cursor_col(), 13, "the end of the word after");
+    }
+
+    #[test]
+    fn a_word_jump_at_an_end_of_the_line_does_not_move() {
+        let mut i = typed("select amount");
+        i.handle(&key(KeyCode::Home));
+        assert_eq!(i.handle(&ctrl_key(KeyCode::Left)), Action::Changed);
+        assert_eq!(i.cursor_col(), 0, "the first position holds");
+        i.handle(&key(KeyCode::End));
+        i.handle(&alt_key(KeyCode::Right));
+        assert_eq!(i.cursor_col(), 13, "the last position holds");
+
+        // An empty line must not panic.
+        let mut e = LineInput::default();
+        e.handle(&ctrl_key(KeyCode::Left));
+        e.handle(&ctrl_key(KeyCode::Right));
+        assert_eq!(e.handle(&ctrl_key(KeyCode::Backspace)), Action::Ignored);
+        assert_eq!(e.handle(&ctrl_key(KeyCode::Delete)), Action::Ignored);
+        assert_eq!(e.text(), "");
+    }
+
+    #[test]
+    fn alt_moves_by_a_word_as_ctrl_does_and_alt_b_and_alt_f_stay() {
+        let mut i = typed("select amount");
+        i.handle(&alt_key(KeyCode::Left));
+        assert_eq!(i.cursor_col(), 7);
+        i.handle(&alt_key(KeyCode::Right));
+        assert_eq!(i.cursor_col(), 13);
+        i.handle(&alt('b'));
+        assert_eq!(i.cursor_col(), 7);
+        i.handle(&alt('f'));
+        assert_eq!(i.cursor_col(), 13);
+    }
+
+    #[test]
+    fn a_word_jump_over_characters_of_more_than_one_byte_is_correct() {
+        // Each position counts characters. A jump that counts bytes would put
+        // the cursor in the middle of a character.
+        let mut i = typed("naïve café");
+        i.handle(&ctrl_key(KeyCode::Left));
+        i.handle(&key(KeyCode::Char('x')));
+        assert_eq!(i.text(), "naïve xcafé");
+        i.handle(&key(KeyCode::Home));
+        i.handle(&ctrl_key(KeyCode::Right));
+        i.handle(&key(KeyCode::Char('y')));
+        assert_eq!(i.text(), "naïvey xcafé");
+    }
+
+    #[test]
+    fn ctrl_and_alt_with_backspace_delete_the_word_in_front() {
+        let mut i = typed("select amount from t");
+        assert_eq!(i.handle(&ctrl_key(KeyCode::Backspace)), Action::Changed);
+        assert_eq!(i.text(), "select amount from ");
+        assert_eq!(i.handle(&alt_key(KeyCode::Backspace)), Action::Changed);
+        assert_eq!(i.text(), "select amount ");
+        // A terminal that sends the character 0x08 gives one of these two
+        // forms.
+        i.handle(&ctrl('h'));
+        assert_eq!(i.text(), "select ");
+        i.handle(&key(KeyCode::Char('\u{8}')));
+        assert_eq!(i.text(), "");
+        assert_eq!(i.handle(&ctrl_key(KeyCode::Backspace)), Action::Ignored);
+    }
+
+    #[test]
+    fn ctrl_and_alt_with_delete_remove_the_word_after_the_cursor() {
+        let mut i = typed("select amount from t");
+        i.handle(&key(KeyCode::Home));
+        assert_eq!(i.handle(&ctrl_key(KeyCode::Delete)), Action::Changed);
+        assert_eq!(i.text(), " amount from t");
+        assert_eq!(i.cursor_col(), 0, "the cursor stays in position");
+        assert_eq!(i.handle(&alt_key(KeyCode::Delete)), Action::Changed);
+        assert_eq!(i.text(), " from t");
+        i.handle(&alt('d'));
+        assert_eq!(i.text(), " t");
+        i.handle(&alt('d'));
+        assert_eq!(i.text(), "");
+        assert_eq!(i.handle(&ctrl_key(KeyCode::Delete)), Action::Ignored);
+    }
+
+    #[test]
+    fn a_key_with_ctrl_or_alt_is_not_a_plain_key() {
+        assert!(plain(&key(KeyCode::Right)));
+        assert!(plain(&KeyEvent::new(KeyCode::Right, KeyModifiers::SHIFT)));
+        assert!(!plain(&ctrl_key(KeyCode::Right)));
+        assert!(!plain(&alt_key(KeyCode::Right)));
+        assert!(!plain(&KeyEvent::new(
+            KeyCode::Right,
+            KeyModifiers::CONTROL.union(KeyModifiers::SHIFT)
+        )));
+    }
+
+    #[test]
+    fn ctrl_and_alt_with_home_and_end_go_to_the_ends_of_the_line() {
+        let mut i = typed("select amount");
+        i.handle(&ctrl_key(KeyCode::Home));
+        assert_eq!(i.cursor_col(), 0);
+        i.handle(&ctrl_key(KeyCode::End));
+        assert_eq!(i.cursor_col(), 13);
+        i.handle(&alt_key(KeyCode::Home));
+        assert_eq!(i.cursor_col(), 0);
+        i.handle(&alt_key(KeyCode::End));
+        assert_eq!(i.cursor_col(), 13);
     }
 
     #[test]

@@ -176,3 +176,28 @@ because DynamoDB reads by key only.
 The profile uses `View::scan_from`, so it measures the same rows that the grid
 shows. The options `--query` and `--filter` therefore change the statement, and
 a user can build a table for the result of a statement.
+
+## The name of the table
+
+The function `main::ddl_name` chooses the name in the `CREATE TABLE` statement.
+
+| The source | The name |
+|---|---|
+| A file | The option `--table`, or the name of the file with no extension |
+| A table of a database | The name of that table, in the spelling that the catalog holds |
+
+For a database, the option `--table` chose which table to read, so the name of
+that table is the name of the statement. `--table orders` and `--table ORDERS`
+therefore both give the name that the database uses.
+
+A name that a database rejects is no use, so each character that is not a
+letter, a digit or `_` becomes `_`, and a name that starts with a digit gets
+`t_` in front of it. The file `2024-sales.csv` gives the table `t_2024_sales`.
+
+That clean-up runs on a name that Peruse takes from the file or from the catalog.
+A name that the user writes with `--table` for a file goes into the statement as
+the user typed it, because the user asked for that name in this call.
+
+A database with more than one table needs `--table` for `--ddl`. A silently
+arbitrary choice of table would give a wrong answer, so Peruse asks instead of
+guessing.

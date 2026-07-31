@@ -3,7 +3,7 @@
 
 /// The largest number of characters that Peruse keeps for one cell.
 ///
-/// DuckDB changes each value into text with `CAST(… AS VARCHAR)`. This limit
+/// DuckDB changes each value into text with `CAST(... AS VARCHAR)`. This limit
 /// then cuts the text. One JSON value of 40 megabytes can therefore not stop a
 /// redraw. The cell inspector asks the engine for the complete value.
 pub const MAX_CELL_CHARS: usize = 4096;
@@ -95,13 +95,22 @@ impl CellKind {
     }
 
     /// Gives the character that shows this family in a column header.
+    ///
+    /// No mark is a letter or a digit, and that rule is not free to break. The
+    /// mark comes after the name of the column, so a letter reads as the last
+    /// letter of that name: the mark for text was `a`, and a column called
+    /// `customer_name` then showed as `customer_name a`, which a user reads as a
+    /// spelling mistake and not as a type. A mark of punctuation cannot be read
+    /// in that way. The test `no_mark_is_a_letter_or_a_digit` holds the rule.
     pub fn badge(self) -> char {
         match self {
             CellKind::Number => '#',
-            CellKind::Text => 'a',
+            // A pair of quotation marks is the sign for text in every language
+            // that Peruse reads, so one of them says "text" with no legend.
+            CellKind::Text => '"',
             CellKind::Bool => '?',
             CellKind::Temporal => '@',
-            CellKind::Binary => 'b',
+            CellKind::Binary => '~',
             CellKind::Nested => '{',
         }
     }
@@ -407,6 +416,38 @@ mod tests {
     #[test]
     fn arrays_of_numbers_are_nested_not_numeric() {
         assert_eq!(CellKind::from_sql_type("BIGINT[3]"), CellKind::Nested);
+    }
+
+    #[test]
+    fn no_mark_is_a_letter_or_a_digit() {
+        // The mark comes after the name of the column. A letter therefore reads
+        // as the last letter of that name: the mark for text was `a`, and a
+        // column called `customer_name` showed as `customer_name a`. A user
+        // reads that as a spelling mistake and not as a type, and one did.
+        use CellKind::*;
+        for kind in [Number, Text, Bool, Temporal, Binary, Nested] {
+            let mark = kind.badge();
+            assert!(
+                !mark.is_alphanumeric(),
+                "the mark {mark:?} of {kind:?} is a letter or a digit, so it reads \
+                 as part of the name of the column"
+            );
+            assert!(
+                !mark.is_whitespace() && !mark.is_control(),
+                "the mark of {kind:?} must be a character that the user can see"
+            );
+        }
+        // Two families with the same mark would say nothing.
+        let marks: Vec<char> = [Number, Text, Bool, Temporal, Binary, Nested]
+            .iter()
+            .map(|k| k.badge())
+            .collect();
+        for (i, a) in marks.iter().enumerate() {
+            assert!(
+                !marks[i + 1..].contains(a),
+                "the mark {a:?} belongs to more than one family"
+            );
+        }
     }
 
     #[test]

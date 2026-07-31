@@ -9,7 +9,7 @@
 //!    write, and DuckDB never opens the files for write access.
 //! 2. The words of the statement. This module does that work. It rejects each
 //!    statement that is not a plain query. The statements that can still write
-//!    to the disk are `COPY … TO`, `EXPORT DATABASE`, `ATTACH` and `INSTALL`.
+//!    to the disk are `COPY ... TO`, `EXPORT DATABASE`, `ATTACH` and `INSTALL`.
 //!    None of them reaches the engine.
 //!
 //! This module removes the comments, the values in quotation marks and the
@@ -84,7 +84,7 @@ const ALLOWED_LEADING: &[&str] = &[
 /// The keywords that must not occur in a statement, at any position.
 ///
 /// A check of the first word alone is not sufficient. The statements
-/// `WITH … INSERT` and `EXPLAIN COPY …` both start with an allowed word, but
+/// `WITH ... INSERT` and `EXPLAIN COPY ...` both start with an allowed word, but
 /// both of them write.
 const FORBIDDEN_ANYWHERE: &[&str] = &[
     "INSERT",

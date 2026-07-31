@@ -55,7 +55,11 @@ impl Depth {
 ///
 /// A gray color uses the group of 24 grays. That group has more steps than the
 /// cube of 6 by 6 by 6 colors, and it therefore gives a better gray.
-fn to_256(c: CoreColor) -> u8 {
+///
+/// The cube is coarse, so two colors that are near each other give one number.
+/// A part of the program that must keep two colors apart on such a terminal
+/// therefore needs this number. Refer to [`crate::grid::band_focus`].
+pub fn to_256(c: CoreColor) -> u8 {
     let (r, g, b) = (c.r as i32, c.g as i32, c.b as i32);
     let spread = r.max(g).max(b) - r.min(g).min(b);
     if spread < 10 {

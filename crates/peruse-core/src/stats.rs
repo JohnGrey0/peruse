@@ -163,6 +163,55 @@ impl ColumnStats {
         }
         r
     }
+
+    /// Gives the number of rows that [`ColumnStats::rows`] writes.
+    ///
+    /// A panel needs this count to know its own height. The function `rows`
+    /// builds each text, and two of those texts need a format of a
+    /// floating-point value. The height needs none of that work, and the panel
+    /// asks for the height at each frame.
+    ///
+    /// The test `the_count_of_rows_agrees_with_the_rows` keeps the two in step.
+    pub fn row_count(&self) -> usize {
+        // The type, the count, the nulls and the distinct values are always
+        // there. Each of the other four is there when the column has it.
+        4 + usize::from(self.min.is_some())
+            + usize::from(self.max.is_some())
+            + usize::from(self.avg.is_some())
+            + usize::from(self.std.is_some())
+    }
+}
+
+#[cfg(test)]
+mod row_count_tests {
+    use super::*;
+
+    #[test]
+    fn the_count_of_rows_agrees_with_the_rows() {
+        // A panel asks for the count to know its height, and then writes the
+        // rows. A count that does not agree with the rows gives a panel with an
+        // empty row at the bottom, or a panel that cuts its last row.
+        let base = ColumnStats {
+            column: "c".into(),
+            sql_type: "BIGINT".into(),
+            n_total: 10,
+            n_present: 9,
+            n_distinct: 8,
+            ..Default::default()
+        };
+        // Each combination of the four values that a column may or may not
+        // have.
+        for bits in 0..16u8 {
+            let s = ColumnStats {
+                min: (bits & 1 != 0).then(|| "1".to_string()),
+                max: (bits & 2 != 0).then(|| "9".to_string()),
+                avg: (bits & 4 != 0).then(|| "4.5".to_string()),
+                std: (bits & 8 != 0).then(|| "2.5".to_string()),
+                ..base.clone()
+            };
+            assert_eq!(s.row_count(), s.rows().len(), "bits {bits:04b}");
+        }
+    }
 }
 
 /// Cuts a floating-point value to six decimal places, and removes the zeros at

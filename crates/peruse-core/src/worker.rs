@@ -17,7 +17,7 @@ use duckdb::InterruptHandle;
 use std::sync::Arc;
 use std::thread;
 
-use crate::engine::{Engine, OpenOptions};
+use crate::engine::{ColumnBrief, Engine, OpenOptions};
 use crate::meta::FileMeta;
 use crate::model::{Column, RowPage, Schema};
 use crate::query::{Base, View};
@@ -49,6 +49,21 @@ pub enum Request {
         view: View,
         column: Column,
         top_k: u32,
+    },
+    /// Measure each column that the detail band draws. One request covers every
+    /// column, because the band draws them all at the same time.
+    Band {
+        epoch: u64,
+        view: View,
+        columns: Vec<Column>,
+        /// `true` to measure the count of the different values and the range as
+        /// well as the count of the NULL values.
+        ///
+        /// The compact band draws the share of NULL values alone. The three
+        /// other facts each read the whole column, so the mode has to travel
+        /// with the request. Without this, the compact band pays the price of
+        /// the detailed band on every file that has no Parquet footer.
+        values: bool,
     },
     /// Read one cell in full.
     Cell {
@@ -105,6 +120,7 @@ impl Request {
             Request::SetView { epoch, .. }
             | Request::Page { epoch, .. }
             | Request::Stats { epoch, .. }
+            | Request::Band { epoch, .. }
             | Request::Cell { epoch, .. }
             | Request::RowJson { epoch, .. }
             | Request::Configure { epoch, .. }
@@ -128,7 +144,8 @@ impl Request {
             Request::Index { .. } => 6,
             Request::RowJson { .. } => 7,
             Request::Configure { .. } => 8,
-            Request::Shutdown => 9,
+            Request::Band { .. } => 9,
+            Request::Shutdown => 10,
         }
     }
 }
@@ -145,6 +162,8 @@ pub enum Response {
     Count { epoch: u64, total: u64 },
     /// The statistics of one column.
     Stats { epoch: u64, stats: Box<ColumnStats> },
+    /// The facts of each column that the detail band draws.
+    Band { epoch: u64, briefs: Vec<ColumnBrief> },
     /// The complete value of one cell.
     Cell { epoch: u64, row: u64, column: String, value: Option<String> },
     /// One complete row as JSON.
@@ -349,9 +368,19 @@ fn handle(engine: &mut Engine, req: Request, tx: &Sender<Response>) -> Result<()
             // The guard runs two times. The user interface checks the text
             // while the user types it. This check makes sure that no view
             // reaches the engine without a check, whatever the caller does.
+            //
+            // A view holds text of the user in two places. The statement is a
+            // complete query, and `query.rs` puts the filter into a
+            // `WHERE (...)` part of a statement that Peruse builds. The two
+            // places therefore need two different checks, and a check of the
+            // statement alone leaves the filter open.
             if let Base::Sql(sql) = &view.base
                 && let Err(e) = sql_guard::ensure_read_only(sql) {
                     return fail(tx, epoch, "query", e);
+                }
+            if let Some(filter) = &view.filter
+                && let Err(e) = sql_guard::ensure_safe_predicate(filter) {
+                    return fail(tx, epoch, "filter", e);
                 }
             let schema = match engine.describe(&view) {
                 Ok(s) => s,
@@ -387,6 +416,13 @@ fn handle(engine: &mut Engine, req: Request, tx: &Sender<Response>) -> Result<()
                 Err(e) => fail(tx, epoch, "column stats", e),
             }
         }
+
+        Request::Band { epoch, view, columns, values } => match engine
+            .column_band(&view, &columns, values)
+        {
+            Ok(briefs) => tx.send(Response::Band { epoch, briefs }).map_err(|_| ()),
+            Err(e) => fail(tx, epoch, "column band", e),
+        },
 
         Request::Configure { epoch, threads, memory_limit } => {
             match engine.apply_settings(threads, memory_limit.as_deref()) {
@@ -525,6 +561,26 @@ mod tests {
     }
 
     #[test]
+    fn a_band_request_replaces_only_an_older_band_request() {
+        // A scroll to the side gives a new set of columns, and only the newest
+        // set is on the screen. The page request must survive beside it: the
+        // rows and the band are two different answers.
+        let band = |epoch: u64, name: &str| Request::Band {
+            epoch,
+            view: View::default(),
+            columns: vec![Column::new(name, "BIGINT", false)],
+            values: false,
+        };
+        let out = coalesce(vec![page(4, 0), band(4, "a"), band(4, "b")]);
+        assert_eq!(out.len(), 2);
+        assert!(matches!(out[0], Request::Page { .. }));
+        match &out[1] {
+            Request::Band { columns, .. } => assert_eq!(columns[0].name, "b", "newest wins"),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
     fn shutdown_pre_empts_everything() {
         let out = coalesce(vec![page(9, 0), Request::Shutdown, page(9, 50)]);
         assert_eq!(out.len(), 1);
@@ -535,5 +591,61 @@ mod tests {
     fn shutdown_alone_does_not_filter_itself_out() {
         let out = coalesce(vec![Request::Shutdown]);
         assert_eq!(out.len(), 1);
+    }
+
+    /// Writes a small CSV file and starts a worker on it.
+    fn worker_on_csv(tag: &str) -> Worker {
+        let dir = std::env::temp_dir().join(format!("peruse-worker-{tag}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.csv");
+        std::fs::write(&path, "id,name\n1,alice\n2,bob\n").unwrap();
+        Worker::spawn(path.to_str().unwrap(), OpenOptions::default())
+            .expect("the worker did not open the file")
+            .0
+    }
+
+    #[test]
+    fn a_filter_that_writes_never_reaches_the_engine() {
+        // The front end checks the filter while the user types it. This test
+        // goes past the front end, as a caller of the library can, and the
+        // worker must still refuse the filter. The filter goes into a
+        // `WHERE (...)` part, so the guard for a statement does not see it.
+        let worker = worker_on_csv("filter-guard");
+        worker.send(Request::SetView {
+            epoch: 1,
+            view: View {
+                filter: Some("id IN (DELETE FROM src RETURNING id)".into()),
+                ..View::default()
+            },
+            limit: 50,
+        });
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let mut failure = None;
+        loop {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            match worker.responses().recv_timeout(left) {
+                Ok(Response::Error { context, message, .. }) => {
+                    failure = Some((context, message));
+                }
+                // The worker answers a view that it accepts with these three.
+                // None of them can come, because the guard stops the request
+                // before the worker gives the view to the engine.
+                Ok(Response::Schema { .. } | Response::Page { .. } | Response::Count { .. }) => {
+                    panic!("the worker gave the view to the engine");
+                }
+                Ok(Response::Busy(false)) => break,
+                Ok(_) => {}
+                Err(e) => panic!("the worker gave no answer: {e}"),
+            }
+        }
+
+        // The user sees `context: message` on the status line, so the message
+        // must name the word that Peruse refuses.
+        let (context, message) = failure.expect("the worker accepted a filter that writes");
+        assert_eq!(context, "filter");
+        assert!(message.contains("DELETE"), "{message}");
+        assert!(message.contains("read-only"), "{message}");
     }
 }

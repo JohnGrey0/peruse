@@ -140,26 +140,89 @@ fn column_rows(app: &App) -> (Vec<ColRow>, usize) {
     (rows, at)
 }
 
+/// Gives a count of rows as a `u16`, for the arithmetic of the layout.
+///
+/// A screen has fewer than 65536 rows, so a count above that limit stays at the
+/// limit. The layout then gives the part all the room there is.
+fn as_rows(n: usize) -> u16 {
+    u16::try_from(n).unwrap_or(u16::MAX)
+}
+
+/// The rows that the metadata panel keeps for the list of columns.
+///
+/// The list is the part that the user reads at each move of the cursor, so it
+/// takes these rows before the summary takes any.
+const COLUMN_LIST_MIN: u16 = 4;
+/// The rows above the list of columns: one blank row and the title.
+const COLUMN_LIST_HEAD: u16 = 2;
+
+/// How the metadata panel divides the rows inside its border.
+struct MetaPlan {
+    /// The count of rows of the summary to write.
+    summary: u16,
+    /// The rows for the list of columns. The row that says how many columns
+    /// are outside the window is one of them.
+    list: u16,
+    /// `true` when rows stay free after the list, for the read expression.
+    reads_as: bool,
+}
+
+/// Divides the rows inside the border of the metadata panel.
+///
+/// The summary and the read expression have an end, and the list of columns has
+/// none. A short panel therefore gives the list its minimum first, and a tall
+/// panel writes the whole summary and the read expression as well.
+fn plan_meta(height: u16, summary: u16, columns: u16, read_lines: u16) -> MetaPlan {
+    let room = height.saturating_sub(COLUMN_LIST_HEAD + COLUMN_LIST_MIN);
+    let summary = summary.min(room);
+    let list = height.saturating_sub(summary + COLUMN_LIST_HEAD);
+    // The read expression needs a blank row, a title and one row of its own.
+    // It comes last, so it appears only when the whole list of columns is on
+    // the screen and rows stay free after it.
+    let reads_as = read_lines > 0 && list >= columns.saturating_add(3);
+    MetaPlan {
+        summary,
+        list: if reads_as { columns } else { list },
+        reads_as,
+    }
+}
+
 /// Draws the metadata panel.
 ///
-/// With `compact`, the panel gives its room to the list of columns: it writes
-/// fewer rows of the summary and no read expression. The stacked view uses
-/// that form, because the statistics take the lower half of the side pane.
-pub fn draw_meta(buf: &mut Buffer, area: Rect, app: &App, p: &Paint, compact: bool) {
+/// The panel divides the room it has: see [`plan_meta`]. A short panel writes
+/// fewer rows of the summary and no read expression, and a tall panel writes
+/// each part in full.
+pub fn draw_meta(buf: &mut Buffer, area: Rect, app: &App, p: &Paint) {
+    // The layout gives an area with no room when the terminal is very small.
+    // Peruse cannot draw in such an area.
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
     let inner = frame(buf, area, "metadata", app, p);
     let t = &app.theme;
     let mut y = inner.y;
 
     let Some(meta) = &app.meta else {
-        buf.set_stringn(inner.x, y, "reading…", inner.width as usize, p.on(t.dim, t.bg));
+        // The border takes two rows, so a panel area of one row leaves an inside
+        // area of no rows, and `inner.y` is then the row below the panel. The
+        // other writers in this module test the row already.
+        if y < inner.bottom() {
+            buf.set_stringn(inner.x, y, "reading…", inner.width as usize, p.on(t.dim, t.bg));
+        }
         return;
     };
 
-    // A short panel shows the first rows of the summary only. The list of
-    // columns is the part that the user reads at each move of the cursor.
     let summary = meta.summary_rows();
-    let take = if compact { 4.min(summary.len()) } else { summary.len() };
-    for (k, v) in summary.into_iter().take(take) {
+    let (rows, at) = column_rows(app);
+    let read_lines = text::wrap(&app.read_expr, inner.width as usize);
+    let plan = plan_meta(
+        inner.height,
+        as_rows(summary.len()),
+        as_rows(rows.len()),
+        as_rows(read_lines.len()),
+    );
+
+    for (k, v) in summary.into_iter().take(plan.summary as usize) {
         kv(buf, inner, y, &k, &v, p, app);
         y += 1;
     }
@@ -172,12 +235,17 @@ pub fn draw_meta(buf: &mut Buffer, area: Rect, app: &App, p: &Paint, compact: bo
     // keys of its own: the keys h and l scroll the panel and the grid.
     //
     // The read expression takes the last rows, so the list stops above it.
-    let reserve = if compact { 0 } else { 2 };
-    let bottom = inner.bottom().saturating_sub(reserve);
-    let (rows, at) = column_rows(app);
+    let bottom = y.saturating_add(plan.list).min(inner.bottom());
     let rows_left = bottom.saturating_sub(y) as usize;
     let n = rows.len();
-    let window = rows_left.min(n);
+    // A list that is longer than the room keeps its last row for the count of
+    // the columns that are outside the window. With one row only, the name of
+    // the column is more use than that count.
+    let window = if n > rows_left && rows_left > 1 {
+        rows_left.saturating_sub(1)
+    } else {
+        n.min(rows_left)
+    };
     let start = at.saturating_sub(window / 2).min(n.saturating_sub(window));
 
     let num_rows = meta.parquet.as_ref().map(|pq| pq.num_rows).unwrap_or(0);
@@ -256,24 +324,66 @@ pub fn draw_meta(buf: &mut Buffer, area: Rect, app: &App, p: &Paint, compact: bo
     // The call that reads the same rows outside Peruse. The user can look at
     // the data and then write a script with these options. The user does not
     // need to find the options of the sniffer again.
-    if !compact {
+    if plan.reads_as {
         y += 1;
         if y + 1 < inner.bottom() {
             section(buf, inner, y, "reads as", p, app);
             y += 1;
-            for line in text::wrap(&app.read_expr, inner.width as usize) {
+            for line in &read_lines {
                 if y >= inner.bottom() {
                     break;
                 }
-                buf.set_stringn(inner.x, y, &line, inner.width as usize, p.on(t.lit, t.bg));
+                buf.set_stringn(inner.x, y, line, inner.width as usize, p.on(t.lit, t.bg));
                 y += 1;
             }
         }
     }
 }
 
+/// Gives the rows that the statistics of the column under the cursor need,
+/// inside the border of the panel.
+///
+/// The stacked view asks for this count before it divides the side pane. The
+/// statistics have an end, so the metadata can keep each row that is left.
+///
+/// This function must agree with [`draw_stats`]: a row that one of the two adds
+/// the other one adds as well.
+pub fn stats_content_height(app: &App) -> u16 {
+    let Some(s) = app.stats() else {
+        // The answer of the engine is not here yet, and the panel shows the
+        // word "computing" on one row.
+        return 1;
+    };
+    // Ask for the count, and do not build the rows. This function runs at each
+    // frame, and `rows` allocates a text for each row.
+    let mut h = as_rows(s.row_count());
+    // A blank row, the title, the chart, and the two ends of the range.
+    if s.histogram.is_some() {
+        h = h.saturating_add(4);
+    }
+    if !s.top.is_empty() {
+        h = if s.top.iter().all(|(_, n)| *n <= 1) {
+            // A blank row and the note that each value occurs one time.
+            h.saturating_add(2)
+        } else {
+            // A blank row, the title, and one row for each value.
+            h.saturating_add(2).saturating_add(as_rows(s.top.len()))
+        };
+    }
+    // A blank row and the note about the filter.
+    if app.view.filter.is_some() {
+        h = h.saturating_add(2);
+    }
+    h
+}
+
 /// Draws the column statistics panel.
 pub fn draw_stats(buf: &mut Buffer, area: Rect, app: &App, p: &Paint) {
+    // The layout gives an area with no room when the terminal is very small.
+    // Peruse cannot draw in such an area.
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
     let title = app
         .schema
         .columns
@@ -285,7 +395,11 @@ pub fn draw_stats(buf: &mut Buffer, area: Rect, app: &App, p: &Paint) {
     let mut y = inner.y;
 
     let Some(s) = app.stats() else {
-        buf.set_stringn(inner.x, y, "computing…", inner.width as usize, p.on(t.dim, t.bg));
+        // The border takes two rows, so a panel area of one row leaves an inside
+        // area of no rows, and `inner.y` is then the row below the panel.
+        if y < inner.bottom() {
+            buf.set_stringn(inner.x, y, "computing…", inner.width as usize, p.on(t.dim, t.bg));
+        }
         return;
     };
 
@@ -334,6 +448,9 @@ pub fn draw_stats(buf: &mut Buffer, area: Rect, app: &App, p: &Paint) {
                 inner.width as usize,
                 p.on(t.dim, t.bg),
             );
+            // Step past the note. The note about the filter comes after it,
+            // and that note needs a blank row above it.
+            y += 1;
         }
     } else if !s.top.is_empty() {
         y += 1;
@@ -392,5 +509,50 @@ pub fn draw_stats(buf: &mut Buffer, area: Rect, app: &App, p: &Paint) {
                 p.on(t.warn, t.bg),
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_tall_panel_writes_the_whole_summary_and_the_read_expression() {
+        // 41 rows inside the border, a summary of 8 rows, 4 columns, and a read
+        // call of 3 lines.
+        let plan = plan_meta(41, 8, 4, 3);
+        assert_eq!(plan.summary, 8, "a tall panel cuts nothing");
+        assert_eq!(plan.list, 4, "the list needs no more rows than it has columns");
+        assert!(plan.reads_as, "rows stay free, so the read call fits");
+    }
+
+    #[test]
+    fn a_short_panel_keeps_rows_for_the_list_of_columns() {
+        let plan = plan_meta(8, 8, 40, 3);
+        assert_eq!(plan.summary, 2, "the summary gives its rows to the list");
+        assert_eq!(plan.list, COLUMN_LIST_MIN);
+        assert!(!plan.reads_as, "no room for the read call");
+    }
+
+    #[test]
+    fn a_long_list_of_columns_takes_the_rows_of_the_read_expression() {
+        let plan = plan_meta(20, 4, 400, 3);
+        assert_eq!(plan.summary, 4);
+        assert_eq!(plan.list, 14, "the list takes each row after the summary");
+        assert!(!plan.reads_as);
+    }
+
+    #[test]
+    fn a_panel_of_no_rows_plans_no_row() {
+        let plan = plan_meta(0, 8, 4, 3);
+        assert_eq!(plan.summary, 0);
+        assert_eq!(plan.list, 0);
+        assert!(!plan.reads_as);
+    }
+
+    #[test]
+    fn a_count_above_the_height_of_a_screen_stays_inside_a_u16() {
+        assert_eq!(as_rows(12), 12);
+        assert_eq!(as_rows(usize::MAX), u16::MAX);
     }
 }

@@ -37,7 +37,7 @@ pub fn sanitize(s: &str) -> String {
         .collect()
 }
 
-/// Cuts a text to `max` screen columns. The character `…` shows the cut.
+/// Cuts a text to `max` screen columns. The character `...` shows the cut.
 pub fn truncate(s: &str, max: usize) -> String {
     if max == 0 {
         return String::new();
@@ -59,6 +59,22 @@ pub fn truncate(s: &str, max: usize) -> String {
     }
     out.push('…');
     out
+}
+
+/// Gives the width of a text on the screen, and stops at `cap` screen columns.
+///
+/// A caller that compares a width with a limit does not need the full width. A
+/// cell can hold 4096 characters, and a comparison with a limit of 60 columns
+/// must not walk each of them.
+pub fn width_capped(s: &str, cap: usize) -> usize {
+    let mut used = 0usize;
+    for c in s.chars() {
+        used += c.width().unwrap_or(0);
+        if used >= cap {
+            return used;
+        }
+    }
+    used
 }
 
 /// Cuts a text and then adds spaces, until the text has the width `w`.
@@ -193,6 +209,28 @@ mod tests {
         // A character of two screen columns must not lose one half.
         let t = truncate("日本語", 4);
         assert!(width(&t) <= 4, "got {t:?} width {}", width(&t));
+    }
+
+    #[test]
+    fn a_capped_width_agrees_with_the_full_width_below_the_limit() {
+        // The caller compares the result with the limit, so the two functions
+        // must give the same answer for each text that is inside the limit.
+        for s in ["", "a", "hello", "日本語", "naïve café", "a\u{130}b"] {
+            let full = width(s);
+            assert_eq!(width_capped(s, 100), full, "text {s:?}");
+            // At the limit the result is only known to have reached it.
+            assert!(width_capped(s, 1) >= full.min(1), "text {s:?}");
+        }
+    }
+
+    #[test]
+    fn a_capped_width_stops_at_the_limit() {
+        let long = "x".repeat(4096);
+        assert_eq!(width_capped(&long, 60), 60);
+        // A character of two screen columns can pass the limit by one column.
+        let wide = "日".repeat(100);
+        let w = width_capped(&wide, 61);
+        assert!((61..=62).contains(&w), "got {w}");
     }
 
     #[test]

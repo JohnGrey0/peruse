@@ -2,20 +2,23 @@
 
 **A fast, read-only viewer for data files, in your terminal.**
 
-Peruse opens Parquet, CSV, TSV and JSON files and shows you the data. It is one
-program file. It needs no runtime, no plugin, no notebook and no editor. Give
-it a file, and look at the data.
+Peruse opens Parquet, CSV, TSV and JSON files and DuckDB databases, and shows
+you the data. It is one program file. It needs no runtime, no plugin, no
+notebook and no editor. Give it a file, and look at the data.
 
 ```sh
 peruse trips.parquet
 peruse 'data/*.parquet'
 peruse events.ndjson
+peruse shop.duckdb --table orders
 peruse big.csv --filter "amount > 100"
 peruse sales.csv -q "SELECT region, sum(amount) FROM src GROUP BY 1"
 ```
 
 Peruse never writes to your data. It refuses each query that would change
-anything, and it refuses the query before the query reaches the database.
+anything, and it refuses the query before the query reaches the database. A
+DuckDB database is stronger still: Peruse opens it read-only, so DuckDB itself
+refuses a write.
 
 ---
 
@@ -26,12 +29,15 @@ anything, and it refuses the query before the query reaches the database.
 - [The first five minutes](#the-first-five-minutes)
 - [What Peruse does](#what-peruse-does)
   - [The grid](#the-grid)
+  - [The detail band](#the-detail-band)
   - [The record view](#the-record-view)
   - [The filter builder](#the-filter-builder)
   - [The metadata panel](#the-metadata-panel)
   - [The column statistics](#the-column-statistics)
   - [SQL](#sql)
   - [Search](#search)
+  - [DuckDB databases](#duckdb-databases)
+  - [The mouse](#the-mouse)
   - [Themes](#themes)
 - [Completion](#completion)
 - [Settings](#settings)
@@ -82,7 +88,7 @@ brew tap JohnGrey0/peruse
 brew install peruse           # macOS, Linux
 ```
 
-**A prebuilt program — nothing to compile.** Take the archive for your machine
+**A prebuilt program, with nothing to compile.** Take the archive for your machine
 from the [releases](https://github.com/JohnGrey0/peruse/releases), unpack it,
 and put `peruse` somewhere on your `PATH`. Each archive has a `.sha256` file
 beside it.
@@ -102,7 +108,7 @@ cargo install --locked peruse-tui
 ```
 
 This compiles DuckDB into the program, so the first build takes several
-minutes and needs a C++ compiler. There is no runtime dependency afterwards —
+minutes and needs a C++ compiler. There is no runtime dependency afterwards:
 the result is one file.
 
 - **Windows**: the Visual Studio Build Tools, with the C++ workload.
@@ -160,11 +166,16 @@ Then:
 |---|---|
 | `?` | the full list of keys |
 | `j` `k` `h` `l` or the arrow keys | move around the grid |
+| `d` | column details under the names: press once for the type and the NULL share, twice for four rows of facts |
 | `r` | the current row as a vertical record, one column on each line |
-| `f` | build a filter from menus — no SQL needed |
+| `f` | build a filter from menus. No SQL needed |
 | `i` | the statistics of the column under the cursor |
 | `m` | what the file itself says: row groups, codecs, the writer |
+| `:` or `p` | run any command by name |
 | `q` | quit |
+
+The mouse works too: the wheel scrolls, `Ctrl` or `Shift` with the wheel moves
+across the columns, and a click puts the cursor on that cell.
 
 ### Or start with no file at all
 
@@ -192,8 +203,9 @@ With no file, Peruse shows you what is around instead of a page of help:
 ```
 
 Files you have opened before come first. `/` filters as you type, `h` goes up
-a directory, `~` goes home, and `a` shows every file — not just the ones Peruse
-recognises. See [`docs/chooser.md`](https://github.com/JohnGrey0/peruse/blob/main/docs/chooser.md).
+a directory, `~` goes home, and `a` shows every file, and not only the files
+whose extension Peruse knows. See
+[`docs/chooser.md`](https://github.com/JohnGrey0/peruse/blob/main/docs/chooser.md).
 
 `peruse --help` still prints the help, and so does a bare `peruse` in a
 pipeline, where there is no terminal to draw on.
@@ -214,12 +226,64 @@ size of the file.
 
 - Each family of values gets its own colour: numbers, text, dates, true/false,
   bytes and nested values.
+- A dim mark after each column name gives that family: `#` a number, `"` text,
+  `?` true/false, `@` a date or a time, `~` bytes, `{` a structure, a list or a
+  map. Press `?` for the legend.
 - A NULL value looks different from an empty text, because the two are not the
   same thing.
 - The key `Enter` opens the cell inspector, which shows a value that is too
   wide or too long for the grid.
 - The keys `x` and `X` hide a column and show every column again. The keys `<`,
   `>` and `w` change the widths.
+
+### The detail band
+
+Press `d`.
+
+The first question about a new file is "what is in each column?". The band
+answers it for every column on the screen at once, between the names and the
+first row of data. The key moves through three modes: off, compact, detailed.
+
+Compact is one row: the type at the left, and the share of NULL values at the
+right, so the shares line up down the grid:
+
+```
+ peruse  wide.csv  5 × 5  247 B  csv                                 peruse-dark
+      order_id customer_name amount_paid ordered_at        @ region              ›
+            0% VARCHAR    0% DOUBLE  20% TIMESTAMP        0%     0%
+    1     1001 alice                10.5 2024-01-01 09:15:00 EU
+    2     1002 bob                  NULL 2024-01-02 11:20:00 US
+```
+
+A column too narrow for both keeps the share, as `order_id` does above. The
+header already shows the family of the values with its own mark.
+
+Detailed is four rows, and every column gives the same fact on the same row:
+
+```
+      order_id customer_name amount_paid ordered_at        @ region
+      BIGINT   VARCHAR       DOUBLE      TIMESTAMP           VARCH…
+      0% null  0% null       20% null    0% null             0%
+      ~5       ~5 distinct   ~3 distinct ~5 distinct         ~3
+      1… → 10… alice → erin  7.0 → 4000… 2024-01… → 2024-01… … → US
+    1     1001 alice                10.5 2024-01-01 09:15:00 EU
+    2     1002 bob                  NULL 2024-01-02 11:20:00 US
+```
+
+The `~` says that a count is an estimate. A column with no facts yet shows a
+dim `·`, never a blank and never a stale number.
+
+**It is cheap on Parquet.** A footer already holds the row count and the NULL
+count of each column, so the compact band over a plain Parquet file runs no
+query at all, also on a file of some gigabytes. Peruse asks the engine in five
+cases: a source that is not a plain Parquet file, such as a file of text or a
+database; a filtered view; your own SQL; a column that the footer cannot name,
+such as a structure; and the detailed mode. One query then measures every column
+on the screen.
+
+On a short terminal the band gives its rows back to the data, so the grid
+always keeps half its rows. The setting `band` keeps your choice for the next
+start.
 
 ### The record view
 
@@ -230,33 +294,32 @@ needs 300 presses of a key to read one row. The record view puts the columns
 under each other instead:
 
 ```
-┌ record 12,481 of 3,102,556 ───────────────────────┐
-│ column          type       value                  │
-│ id              BIGINT     88134221               │
-│ pickup_time     TIMESTAMP  2024-03-01 08:14:22    │
-│ vendor          VARCHAR    CMT                    │
-│ passenger_cnt   INTEGER    2                      │
-│ fare_amount     DOUBLE     12.50                  │
-│ tip_amount      DOUBLE     NULL                   │
-│ store_and_fwd   VARCHAR    (empty)                │
-└ field 6/62 · j/k move · n/p record · / find ──────┘
+┌ record 12,481 of 3,102,556 ────────────────────────────────────────┐
+│   id              BIGINT     88134221                              │
+│   pickup_time     TIMESTAMP  2024-03-01 08:14:22                   │
+│   vendor          VARCHAR    CMT                                   │
+│   passenger_cnt   INTEGER    2                                     │
+│   fare_amount     DOUBLE     12.50                                 │
+│   tip_amount      DOUBLE     NULL                                  │
+│   store_and_fwd   VARCHAR    (empty)                               │
+└ 6/62 · Enter full value · a open all · z hides empty · n/p row · / ┘
 ```
 
 A field that holds other values opens, so you can drill into a JSON object or
 a Parquet structure:
 
 ```
-┌ record 1 of 11,351 ──────────────────────────────────────────┐
-│   id                VARCHAR   2489651045                     │
-│   type              VARCHAR   CreateEvent                    │
-│ ▾ actor             struct    {5 fields}                     │
-│     id              number    665991                         │
-│     login           text      petroav                        │
-│     gravatar_id     text      (empty)                        │
-│ ▸ repo              struct    {3 fields}                     │
-│ ▸ payload           struct    {5 of 20 fields}               │
-│   org               null      NULL                           │
-└ field 3/9 · l open · h close · / find · z shows the empty ───┘
+┌ record 1 of 11,351 ────────────────────────────────────────────────┐
+│   id                VARCHAR   2489651045                           │
+│   type              VARCHAR   CreateEvent                          │
+│ ▾ actor             struct    {5 fields}                           │
+│     id              number    665991                               │
+│     login           text      petroav                              │
+│     gravatar_id     text      (empty)                              │
+│ ▸ repo              struct    {3 fields}                           │
+│ ▸ payload           struct    {5 of 20 fields}                     │
+│   org               null      NULL                                 │
+└ 3/9 · l/h open · a open all · z hides empty · n/p row · / find · y ┘
 ```
 
 Inside the record view:
@@ -264,7 +327,7 @@ Inside the record view:
 | Key | Action |
 |---|---|
 | `j` `k`, `↑` `↓` | move to another line |
-| `PgUp` `PgDn`, `g` `G` | move by ten lines, or to the ends |
+| `PgUp` `PgDn`, `g` `G`, `Home` `End` | move by ten lines, or to the ends |
 | `l` `→`, `h` `←` | open a field, close a field |
 | `Space` | open a field, or close it |
 | `Enter` | open a field, or show one value in full |
@@ -292,18 +355,18 @@ The grid can only show such a value as one long text:
 ```
 
 The record view is the way into it. Press `r`, then `l` on any field with a
-`▸` mark — or just press `Enter` on the cell in the grid, which opens the
-record view with that column already expanded:
+`▸` mark. The key `Enter` on the cell in the grid does the same, and it opens the
+record view with that column already open:
 
 ```
-┌ record 1 of 11,351 ──────────────────────────────────────────┐
-│   id                BIGINT      2489651045                   │
-│ ▾ actor             struct      {5 fields}                   │
-│     id              number      665991                       │
-│     login           text        petroav                      │
-│     gravatar_id     text        (empty)                      │
-│     url             text        https://api.github.com/user… │
-└──────────────────────────────────────────────────────────────┘
+┌ record 1 of 11,351 ────────────────────────────────────────────────┐
+│   id                BIGINT      2489651045                         │
+│ ▾ actor             struct      {5 fields}                         │
+│     id              number      665991                             │
+│     login           text        petroav                            │
+│     gravatar_id     text        (empty)                            │
+│     url             text        https://api.github.com/user…       │
+└ 3/9 · l/h open · a open all · z hides empty · n/p row · / find · y ┘
 ```
 
 `Enter` on a cell that holds one value still opens the cell inspector.
@@ -351,9 +414,10 @@ to.
 
 | Key | Action |
 |---|---|
-| `a` | add a condition |
+| `j` `k`, `↑` `↓` | move to another condition |
+| `a` or `+` | add a condition |
 | `e` | edit the selected condition |
-| `d` | delete the selected condition |
+| `d`, `Delete`, `Backspace` | delete the selected condition |
 | `o` | change the word in front of a condition between `AND` and `OR` |
 | `c` | remove every condition |
 | `r` | type one condition as a `WHERE` expression |
@@ -372,17 +436,18 @@ and not the SQL order in which `AND` binds first. What you read is what runs.
 
 **Three ways to filter, one filter.** All of them build the same list:
 
-- `f` — the builder, described above.
-- `E` — a `WHERE` expression that you type. It checks the expression while you
+- `f`: the builder, described above.
+- `E`: a `WHERE` expression that you type. It checks the expression while you
   type it, colours the SQL, remembers your history on `↑` and `↓`, and writes
   the rest of a column name after the cursor as you type. See
   [Completion](#completion).
-- `=` and `!` — the quickest way. They keep, or remove, the rows that hold the
+- `=` and `!`: the quickest way. They keep, or remove, the rows that hold the
   value in the cell under the cursor. A missing value gives `IS NULL` or
   `IS NOT NULL`, not a comparison against the word "NULL".
 
-An expression that you type becomes one condition in the same list, so a quick
-filter adds to it and does not replace it. The key `F` clears the filter.
+An expression that you type with `E` becomes the whole filter, as one condition
+of the same list. The builder can then show it, and `=` or `!` adds a condition
+beside it instead of replacing it. The key `F` clears the filter.
 
 ### The metadata panel
 
@@ -393,17 +458,25 @@ Press `m`. For a Parquet file the panel shows:
 - the encodings
 - the name of the program that wrote the file
 - the key/value pairs in the footer
-- the exact number of NULL values in each column
+- the number of NULL values in each column, as the footer records it
 
 Each fact comes from the footer, so the panel costs almost no time on a file of
 50 GB.
 
-For a CSV file the panel shows the results of the DuckDB sniffer: the
-delimiter, the quote character, the header row and the date formats. A wrong
-delimiter is the usual reason for a CSV file that looks wrong.
+For a CSV file the panel shows what the DuckDB sniffer found: the delimiter, the
+quote character, the header row and the date formats. A wrong delimiter is the
+usual reason for a CSV file that looks wrong. Peruse asks the sniffer once when
+it opens the file, so the panel costs nothing.
 
-The panel also shows the `read_parquet` or `read_csv` call behind the view. You
-can copy that text into a script and get the same rows outside Peruse.
+The panel also shows the read call behind the view: `read_parquet`, `read_csv`,
+`read_json_auto`, or the two `ATTACH` statements of a database. You can copy that
+text into a script, or into the DuckDB command line, and get the same rows
+outside Peruse.
+
+The column under the cursor opens if it holds a structure, so the panel shows
+its fields one level deep. The list follows the cursor, so `h` and `l` scroll the
+panel and the grid together. A file with 400 columns therefore needs no keys of
+its own.
 
 ### The column statistics
 
@@ -413,9 +486,16 @@ Press `i` for the column under the cursor:
 - the number of different values, and what that number says about the column
 - the smallest value, the largest value, the mean and the standard deviation
 - a small chart of the distribution, for a column of numbers
-- the most frequent values, for each other column
+- the most frequent values, with a bar for each count
+
+Above 100,000 rows, a column where almost every value is different gets no list
+of frequent values. That query groups every row of the view, and a list where
+each value occurs one time says nothing.
 
 The statistics follow the filter. If a filter is active, the panel says so.
+
+The panel describes one column. Press `d` for a band that describes every column
+on the screen at once. See [The detail band](#the-detail-band).
 
 ### SQL
 
@@ -430,6 +510,12 @@ GROUP BY 1
 ORDER BY 2 DESC
 ```
 
+The prompt opens with `SELECT * FROM src WHERE `, with the cursor after the
+space, because a part of the file is what you usually want. Type the condition
+and press `Enter`. `^U` clears the line if you want something else, and `Esc`
+leaves the grid as it was. Over a statement, the prompt opens with that
+statement, so you correct it instead of writing it again.
+
 The prompt colours the SQL, checks it while you type, and completes a column
 name on `Tab`. The key `R` goes back to the whole file.
 
@@ -443,12 +529,78 @@ matches.
 
 The search works one part of the file at a time, so a match near the cursor
 comes back immediately and `Esc` can stop a search that finds nothing. The
-status line shows the progress.
+status line shows the progress. Each part after the first is twice the size of
+the one before, so a large file needs about six parts and not forty.
+
+### DuckDB databases
+
+```sh
+peruse shop.duckdb
+```
+
+A database holds many tables, so Peruse asks which one before it draws the grid.
+A database with one table asks nothing, and `--table orders` also skips the
+question:
+
+```
+ peruse  shop.duckdb · which table?
+
+ tables
+  main.customers                                             table          ~12,480 rows
+ views
+  main.recent_orders                                          view
+
+
+ j/k move · Enter open · / find a table · q quit
+```
+
+That list comes from the catalog of the database, so it costs no scan. The `~`
+says that the database estimated the count.
+
+From there everything works as it does for a file: the filter, the sort, the
+search, the statistics, the band, the record view and `--ddl`. Jumps are
+instant, and there is nothing to index.
+
+Peruse attaches the file with `READ_ONLY`, so DuckDB itself refuses a write. The
+metadata panel shows the two statements it ran, and your own SQL can reach a
+second table through the same alias:
+
+```sql
+SELECT o.id, c.name FROM src o JOIN __peruse_db.main.customers c ON c.id = o.customer
+```
+
+A SQLite file is not a DuckDB database. Peruse knows one from its first bytes
+and says how to write a table out with `sqlite3` instead of failing on binary
+data.
+
+### The mouse
+
+The wheel scrolls the rows. `Ctrl` or `Shift` with the wheel moves across the
+columns, and so does a wheel that turns sideways. Some terminals keep `Ctrl` and
+the wheel for the size of the text, and Peruse then never sees it; `Shift` is
+the form that always works. A click puts the cursor on that cell, and
+a click on a column name moves to that column. A click never sorts, because a
+sort of a large file costs seconds and a click can land on the wrong column. A
+click on the cell that the cursor is on opens that row in the record view, as
+the key `r` does, and so does a double click. The first click on a cell only
+chooses it, so a user who wants to read another cell never gets a box on top of
+the data.
+
+In an overlay the wheel moves the selection, a click selects the line under the
+pointer, and a double click opens it, runs it or applies it, as `Enter` does. A
+click outside the box closes the overlay, as `Esc` does. The chooser takes the
+mouse too: the wheel moves the list, a click selects an entry, and a double
+click goes into a directory or chooses a file.
+
+A terminal that gives the mouse to a program does not select text with the
+mouse in the usual way. If you copy out of the grid with the mouse, start with
+`--no-mouse` or set `mouse = false`. That covers the chooser as well.
 
 ### Themes
 
-Peruse holds nine themes. The key `t` moves to the next one, and `T` opens the
-picker, which previews each theme as you move through it.
+Peruse holds 25 themes, 16 dark and 9 light. The key `t` moves to the next one,
+and `T` opens the picker, which previews each theme as you move through it. The
+choice keeps itself, so you set it once.
 
 Peruse reads your own themes from TOML files in `<config>/peruse/themes`. Run
 `peruse --list-themes` to see the names and the directory. A theme needs about
@@ -488,8 +640,9 @@ filter › actor.login
 ```
 
 You get suggestions in the filter prompt, the SQL prompt, the filter builder's
-SQL step, the record view's find box, and the value of a setting. The search
-prompt has none — Peruse cannot know what you are looking for.
+SQL step, the record view's find box, the chooser's find box, and the value of a
+setting. The search prompt has none, because Peruse cannot know what you look
+for. A prompt that takes a number gets none for the same reason.
 
 The shortest matching name wins, so a file with `amount` and `amount_tax` gives
 you `amount` for `am`. One more character reaches the longer one.
@@ -501,25 +654,42 @@ you `amount` for `am`. One more character reaches the longer one.
 Press `,`.
 
 Peruse keeps your settings in `<config>/peruse/config.toml` and writes each
-change as soon as you make it — there is no key to press to save. Changing the
-theme with `t` or `T` saves it too, so you set it once.
+change as soon as you make it. There is no key to press to save. The theme
+keys `t` and `T`, and the band key `d`, write their choice too, so you set each
+one once.
 
-| Setting | What it does | With no value |
+| On the page | In `config.toml` | What it does | With no value |
+|---|---|---|---|
+| theme | `theme` | the colours | `peruse-dark` |
+| threads | `threads` | threads for DuckDB | one for each core |
+| memory limit | `memory_limit` | whole gigabytes, nothing else | half of your machine, three tenths of a machine of 8 GB or less |
+| sample size | `sample_size` | rows the sniffer reads. `-1` reads the whole file | 20,480 |
+| index at open | `no_index` | index a file of text at the start | yes, below 64 MB and 256 columns |
+| panels | `panels` | `none`, `meta`, `stats` or `both` | `none` |
+| column details | `band` | the band under the names: `off`, `compact` or `detailed` | `off` |
+| step | `step` | rows or columns that `J`, `K`, `H` and `L` move, 1 to 1000 | 10 |
+
+The row `index at open` takes `yes` or `no`, and the file holds `no_index` the
+other way round: the page asks the question that you have, and the file carries
+the name of the option `--no-index`.
+
+Two more settings live in the file and not on the page:
+
+| In `config.toml` | What it does | With no value |
 |---|---|---|
-| theme | the colours | `peruse-dark` |
-| threads | threads for DuckDB | one for each core |
-| memory limit | whole gigabytes, nothing else | half of your machine |
-| sample size | rows the sniffer reads | 20,480 |
-| index at open | index a file of text at the start | yes, below 256 MB |
-| panels | `none`, `meta`, `stats` or `both` | `none` |
+| `mouse = false` | make Peruse ignore the mouse | the mouse is on |
+| `recent` | the files you opened, for the chooser. Peruse writes it | empty |
 
-The page also shows what your machine gives — cores, processor, free and total
-memory, the spill directory — and what DuckDB is using **right now**. A memory
-limit is a guess without those numbers.
+The page also shows what your machine gives: the cores, the processor, the free
+and the total memory, and the spill directory. It also shows what DuckDB is using
+**right now**. A memory limit is a guess without those numbers.
 
-Threads and the memory limit take effect immediately; DuckDB changes both while
-it runs. The sample size and the index apply to the next file you open, and the
-page says so.
+Inside the page: `j` `k` move, `Enter` or `e` edits, `d` goes back to the
+built-in value, `m` takes the value of your machine for the threads and the
+memory, `T` opens the theme picker, and `Esc` closes.
+
+Six settings take effect immediately. The sample size and the index apply to
+the next file you open, and the page says so.
 
 Command-line options always win over the file, so you can try something once
 without changing anything permanently.
@@ -527,12 +697,18 @@ without changing anything permanently.
 ### The side panels
 
 `m` adds the metadata, `i` adds the column statistics, and each keeps the
-other — so pressing both gives you both, stacked with the metadata on top. `M`
+other, so pressing both gives you both, stacked with the metadata on top. `M`
 cycles all four states. Set `panels = "both"` to get them at every start.
+
+With both open, the line between them moves. The statistics take exactly the
+rows their own content needs, and the metadata keeps the rest, because it holds
+the list of columns and that list has no end. A column of numbers therefore asks
+for four more rows than a column of text, for the chart.
 
 The statistics of a column cost a scan, so Peruse remembers the answer for
 every column of the current view and asks at most once per frame. Holding `l`
-down across a wide file therefore does not queue a scan per column.
+down across a wide file therefore does not queue a scan per column. The detail
+band works the same way.
 
 ---
 
@@ -573,8 +749,8 @@ CREATE INDEX "ix_orders_customer_id" ON "orders" ("customer_id");  -- the name s
 
 The databases that `--ddl` knows:
 
-`oracle`, `mysql` (also `mariadb`), `postgres`, `snowflake`, `bigquery`,
-`sqlserver` (also `mssql`), `duckdb`, `dynamodb`.
+`oracle`, `mysql` (also `mariadb`), `postgres` (also `postgresql`),
+`snowflake`, `bigquery`, `sqlserver` (also `mssql`), `duckdb`, `dynamodb`.
 
 ### What it works out
 
@@ -598,10 +774,10 @@ The generator reads the data, and the data does not hold everything:
 
 - **Uniqueness today is not a key.** A column can be unique by accident,
   especially in a small file. Below a thousand rows the output says so.
-- **A measure is not a key.** A price or a quantity is never proposed as a
-  primary key, even when it happens to be unique.
-- **Foreign keys.** It sees that a column is named `customer_id`. It cannot see
-  the table that it points to.
+- **A measure is not a key.** Peruse never proposes a price or a quantity as a
+  primary key, even when that column happens to be unique.
+- **Foreign keys.** It sees the name `customer_id` on a column. It cannot see
+  the table that the column points to.
 - **Your queries decide your indexes.** The suggestions come from the shape of
   the data alone.
 
@@ -620,6 +796,12 @@ peruse trips.parquet \
   --ddl snowflake --table trip_daily
 ```
 
+For a file, `--table` gives the name of the new table, and the default is the
+name of the file. For a database, `--table` chooses which table to read, and the
+statement takes the name of that table in the spelling that the catalog holds. A
+database with more than one table therefore needs `--table` for `--ddl`: Peruse
+asks rather than pick a table for you.
+
 ### DynamoDB
 
 DynamoDB takes no SQL. The option writes the JSON request for
@@ -635,8 +817,8 @@ aws dynamodb create-table --cli-input-json file://create-table.json
 
 ## Every key
 
-Press `?` inside Peruse for this list. Press `:` to run any command by its
-name, so no command is behind a key that you must know first.
+Press `?` inside Peruse for this list. Press `:` or `p` to run any command by
+its name, so no command is behind a key that you must know first.
 
 ### Move
 
@@ -646,13 +828,27 @@ name, so no command is behind a key that you must know first.
 | `k`, `↑` | previous row |
 | `PgDn`, `Ctrl-F` | page down |
 | `PgUp`, `Ctrl-B` | page up |
-| `g`, `Home` | first row |
-| `G`, `End` | last row |
+| `Ctrl-D` | down half a page |
+| `Ctrl-U` | up half a page |
+| `J` | down one step of rows |
+| `K` | up one step of rows |
+| `L` | right one step of columns |
+| `H` | left one step of columns |
+| `g` | first row |
+| `G` | last row |
 | `l`, `→`, `Tab` | next column |
 | `h`, `←`, `Shift-Tab` | previous column |
-| `^` | first column |
-| `$` | last column |
+| `a`, `0`, `^`, `Home` | first column of this row |
+| `z`, `$`, `End` | last column of this row |
+| `o`, `Ctrl-Home` | back to the start: first row and first column |
+| `O`, `Ctrl-End` | the far corner: last row and last column |
 | `#` | jump to a row number |
+
+Many laptops have no `Home`, `End`, `PgUp` or `PgDn` key, so every movement
+also has a letter or a chord. `Home` and `End` reach the two ends of the row,
+as they do in a spreadsheet; `a` and `z` do the same and need no shift key. One
+key, `o`, comes all the way back to the first row and the first column. A step
+is 10 rows or columns, and the setting `step` changes it.
 
 ### Query
 
@@ -680,6 +876,7 @@ name, so no command is behind a key that you must know first.
 | `m` | the file metadata panel |
 | `i` | the statistics of this column |
 | `M` | cycle the side panels: none, metadata, statistics, both |
+| `d` | column details under the headers: off, compact, detailed |
 | `Enter` | show this cell in full |
 | `r` | show this row as a vertical record |
 
@@ -704,9 +901,31 @@ name, so no command is behind a key that you must know first.
 | `T` | choose a theme |
 | `,` | settings, and what this machine gives |
 | `?`, `F1` | the help |
-| `:`, `Ctrl-P` | run a command by name |
+| `:`, `p` | run a command by name |
 | `Esc` | stop the query that runs now |
 | `q`, `Ctrl-C` | quit |
+
+`Ctrl-P` is deliberately not the palette: Visual Studio Code takes that chord
+for its own file finder, and Peruse never sees it inside that terminal.
+
+### The mouse
+
+| Event | Action |
+|---|---|
+| wheel | up and down the rows |
+| `Shift` or `Ctrl` and wheel | across the columns |
+| wheel sideways | the same |
+| click | put the cursor on that cell |
+| click that cell again | open that row in the record view, as `r` does |
+| double click | the same |
+| click a column name | go to that column. A click never sorts. |
+| wheel in an overlay | move the selection |
+| click in an overlay | select that line |
+| click that line again | on a value, open or close it |
+| double click in an overlay | open, run or apply, as `Enter` does |
+| click outside an overlay | close it, as `Esc` does |
+
+`--no-mouse`, or `mouse = false`, turns all of that off, in the chooser too.
 
 ### In any prompt
 
@@ -719,6 +938,9 @@ name, so no command is behind a key that you must know first.
 | `Ctrl-W` | delete the word in front of the cursor |
 | `Ctrl-U` `Ctrl-K` | delete to the start, or to the end |
 | `Ctrl-A` `Ctrl-E` | go to the start, or to the end |
+| `Ctrl-←` `Ctrl-→` | move one word |
+| `Alt-←` `Alt-→` | the same, for the Option key of a Mac |
+| `Alt-B` `Alt-F` | the same |
 
 Copying uses OSC 52, so it works through SSH.
 
@@ -742,7 +964,7 @@ does not expand it first. With no `FILE`, Peruse opens the
 | `-t`, `--theme` | `NAME` | The name of a theme, or the path of a `.toml` theme file. The default is `peruse-dark`. |
 | `--list-themes` | | Print the theme names and the directory for your own themes, then exit. |
 | `--ddl` | `DIALECT` | Print a `CREATE TABLE` statement for this file and exit. See [Generate a table](#generate-a-table). |
-| `--table` | `NAME` | The table name for `--ddl`. The default is the name of the file. |
+| `--table` | `NAME` | For a database: which table to read, as `orders` or `main.orders`. For a file: the table name that `--ddl` writes. The default for `--ddl` is the table, or the name of the file. |
 | `--delimiter` | `CHAR` | The CSV delimiter. The words `tab` and `space`, and the two characters `\t`, also work. Without it, the DuckDB sniffer finds the delimiter. |
 | `--no-header` | | Read the first CSV row as data, and not as the column names. |
 | `--all-varchar` | | Read every CSV column as text. Use this when the type detection guesses wrong, or when you want to see the raw text of the file. |
@@ -751,6 +973,7 @@ does not expand it first. With no `FILE`, Peruse opens the
 | `--threads` | `N` | The number of worker threads. The default is one for each core. |
 | `--memory-limit` | `SIZE` | The memory ceiling before DuckDB writes to the disk, for example `4GB`. |
 | `--no-index` | | Never index a file of text when Peruse opens it. See [File formats](#file-formats). |
+| `--no-mouse` | | Ignore the mouse, so the terminal selects text with it as usual. |
 | `-h`, `--help` | | Print the help. |
 | `-V`, `--version` | | Print the version. |
 
@@ -758,25 +981,29 @@ does not expand it first. With no `FILE`, Peruse opens the
 
 ## File formats
 
-Peruse finds the format in three steps: the extension of the file, then the
-first bytes of the file, then CSV as the last choice. A file `data.dat` that
-holds values with commas therefore opens correctly.
+Peruse finds the format in four steps: the first bytes for a database, then the
+extension of the file, then the first bytes again for Parquet, Arrow or JSON,
+then CSV as the last choice. A file `data.dat` that holds values with commas
+therefore opens correctly, and a database called `sales.db` gets a message about
+a database and not a parse failure.
 
 | Format | Extensions | Notes |
 |---|---|---|
 | Parquet | `.parquet` `.parq` `.pq` | Full footer metadata. Jumps are instant. |
 | CSV and friends | `.csv` `.tsv` `.tab` `.psv` | The extension gives the delimiter. The sniffer finds the rest. |
 | JSON | `.json` `.ndjson` `.jsonl` | One object for each row, one list of objects, or one object with a list inside it. The reader finds the form. |
+| DuckDB database | `.duckdb` `.ddb`, or any name | Opened read-only. Peruse shows one table of it. Jumps are instant. See [DuckDB databases](#duckdb-databases). |
 
 Add `.gz`, `.zst` or `.bz2` to any text format: `events.ndjson.gz` works.
 
 A glob opens many files as one table. When the files hold their columns in a
-different order, Peruse matches them by name.
+different order, Peruse matches them by name. A glob cannot open two databases:
+name the one database file instead.
 
 ### Formats that Peruse does not read yet
 
-**Arrow IPC** (`.arrow`, `.ipc`, `.feather`). Peruse knows the format from the
-first bytes of the file, and it says what to do:
+**Arrow IPC** (`.arrow`, `.ipc`, `.feather`, `.arrows`). Peruse knows the format
+from the first bytes of the file, and it says what to do:
 
 ```
 $ peruse data.arrow
@@ -790,21 +1017,39 @@ file. Its `arrow_scan` functions take a pointer to data that is in memory
 already, which is a different thing. A future version can read the file in Rust
 and give the blocks to DuckDB.
 
+**SQLite** (any name). No extension puts a file in this group: Peruse knows the
+format from the first bytes only. The reader is a DuckDB extension, and Peruse
+refuses `INSTALL` and `LOAD` on purpose, so it cannot fetch one. Peruse therefore
+says what to do:
+
+```
+$ peruse shop.db
+Error: shop.db: this is a SQLite database, and Peruse cannot read one yet.
+Write a table out first, for example:
+  sqlite3 shop.db -header -csv "SELECT * FROM your_table" > out.csv
+```
+
 **XML.** DuckDB has no XML reader in its core, and Peruse refuses `INSTALL` and
 `LOAD` on purpose, so it cannot fetch one. XML also has no one row shape, so a
-viewer must be told which element is a row. Change the file first, for example
-with `xq`, and then open the result.
+viewer needs the name of the element that is a row. Change the file first, for
+example with `xq`, and then open the result.
 
 ### Indexing a file of text
 
-A Parquet file and an Arrow file hold their rows in blocks, and each block
-knows its own count. A jump to the last row is therefore instant.
+A Parquet file, an Arrow file and a DuckDB table hold their rows in blocks, and
+each block knows its own count. A jump to the last row is therefore instant.
 
 A CSV file and a JSON file have no such structure. A jump to row 8,000,000
 must read each row in front of it. Peruse therefore copies such a file into a
-table in memory when it opens the file, if the file is below 256 MB. For a
-larger file the footer shows a note, and Peruse waits for the key `I`. You
-never wait for a scan that you did not ask for.
+table in memory when it opens the file, if the file is below 64 MB and has 256
+columns or fewer. Above either limit the footer shows a note, and Peruse waits
+for the key `I`. You never wait for a scan that you did not ask for.
+
+Both limits come from a measurement. The index takes about one and a third times
+the size of the file, so 64 MB is about 85 MB of memory, which is one percent of
+a machine with 8 GB. And a file of 170 MB with 10,000 columns is under a size
+limit but costs 21 seconds and 2.7 GB to index, so the columns need their own
+limit.
 
 Peruse does not write to your file. The index is a table in memory, and DuckDB
 writes the remainder to a temporary directory when the table does not fit.
@@ -824,6 +1069,13 @@ peruse trips.parquet
 
 ```sh
 peruse 'year=2024/month=*/part-*.parquet'
+```
+
+**Look at one table of a DuckDB database.**
+
+```sh
+peruse shop.duckdb                    # Peruse asks which table
+peruse shop.duckdb --table main.orders
 ```
 
 **Start with a filter.**
@@ -846,7 +1098,7 @@ peruse trips.parquet -q "
 peruse export.csv --delimiter ';' --no-header
 ```
 
-**Open a CSV whose types are guessed wrong, as plain text.**
+**Open a CSV whose types the sniffer guesses wrong, as plain text.**
 
 ```sh
 peruse messy.csv --all-varchar --ignore-errors
@@ -884,10 +1136,17 @@ Peruse gives you one promise: it does not change your data. Two layers keep
 that promise.
 
 **The structure of the connection.** The database is always in memory. Peruse
-reaches your files only through the table functions `read_parquet`, `read_csv`
-and `read_json_auto`. These functions read, and they cannot write.
-Peruse never opens your files for write access, and it never installs or loads
+reaches your data files only through the table functions `read_parquet`,
+`read_csv`, `read_json` and `read_json_auto`. These functions read, and they
+cannot write.
+Peruse never opens a data file for write access, and it never installs or loads
 an extension, so it cannot reach the network.
+
+A DuckDB database is the one file that DuckDB itself opens, and Peruse attaches
+it with `ATTACH … (READ_ONLY)`. The promise is stronger there than anywhere
+else: the storage engine refuses the write, so the promise does not rest on the
+words of a statement at all. A test writes through the connection, past the
+guard, and the database refuses it.
 
 **The words of the statement.** A statement from you must be one statement. It
 must start with a word that only reads, and it must hold no word that writes,
@@ -922,18 +1181,22 @@ wrote.
 ## Speed
 
 These times come from a file of 10 million rows and 9 columns, with a release
-build, on a usual laptop:
+build, on a desktop with 16 cores and 93 GB of memory. A machine with fewer
+cores gives larger numbers. Read the table as a comparison between the
+operations, and not as a promise about your machine.
 
 | | 67 MB Parquet | 1.27 GB CSV |
 |---|---|---|
-| open, until the schema arrives | 16 ms | 131 ms |
-| the first screen | 20 ms | 89 ms |
-| `count(*)` | 5 ms | 437 ms |
-| move to the last row | 22 ms | 4 ms *(after the index)* |
-| filter and count again | 21 / 18 ms | 5 / 3 ms |
-| sort on a column | 34 ms | 11 ms |
-| column statistics and histogram | 247 ms | 214 ms |
-| search every column | 225 ms | 226 ms |
+| open, until the schema arrives | 13.7 ms | 55.5 ms |
+| the first screen, 50 rows | 15.1 ms | 10.3 ms |
+| `count(*)` | 2.6 ms | 373.5 ms |
+| index the file of text | - | 1389.0 ms |
+| move to the last screen | 17.0 ms | 6.5 ms *(after the index)* |
+| filter, and count the filtered rows | 15.3 / 14.3 ms | 4.8 / 2.5 ms |
+| sort on a column | 25.9 ms | 7.6 ms |
+| statistics of a column of numbers | 42.4 ms | 23.4 ms |
+| search every column | 15.0 ms | 7.4 ms |
+| the metadata panel | 35.5 ms | 0.1 ms |
 
 To measure the times on your own machine:
 
@@ -942,12 +1205,19 @@ cargo run --release -p peruse-core --example make-sample -- ./sample 10000000
 cargo run --release -p peruse-core --example bench -- ./sample/sample.parquet
 ```
 
-Three decisions give these times.
+The times come from eight decisions. These four matter most, and the document
+below holds all eight.
 
 **Peruse reads only the rows that it shows.** A page is a `LIMIT` and an
 `OFFSET` against the file. The cost therefore follows the size of your
 terminal, and not the size of the file. A count of a Parquet file comes from
 the footer.
+
+**Peruse examines a file of text once.** A CSV file holds no schema, so DuckDB
+looks for the delimiter and the types, and it did that again for every
+statement. Peruse now asks once, at open, and writes the answer into the read
+call. On a 258 MB CSV file one page of 50 rows cost 100 ms, and 92 of those were
+the examination; the same page now costs 8 ms.
 
 **The user interface thread never blocks.** The engine runs on its own thread.
 A group of scroll events becomes one request for the newest page. Each response
@@ -957,13 +1227,22 @@ replace the current count. The key `Esc` stops a query that runs now.
 **Peruse indexes a file of text.** See
 [Indexing a file of text](#indexing-a-file-of-text).
 
+The search got two changes of its own. It reads a window of a few thousand rows
+in front of the cursor before the rest of its part, and a match there answers
+the usual search: over 250,000 rows that scan cost 90 ms, and over the window it
+costs 2 ms. And the test on each column is now `contains(lower(…), …)` and not
+`ILIKE`, which needed 265 ms for the same answer that `contains` gives in 91.
+
+[`docs/performance.md`](https://github.com/JohnGrey0/peruse/blob/main/docs/performance.md)
+gives the whole list, with the cost of the detail band on files up to 2.7 GB.
+
 ---
 
 ## How it is built
 
 ```
 crates/peruse-core   the engine, the queries, the filter model, the metadata,
-                     the statistics and the themes — no terminal code
+                     the statistics and the themes. No terminal code.
 crates/peruse-tui    the terminal front end
 ```
 
@@ -977,9 +1256,10 @@ filter from the builder and a sort from the key `s` therefore work together,
 and the code needs no special case for them.
 
 The directory [`docs/`](https://github.com/JohnGrey0/peruse/blob/main/docs/README.md) holds one document for each part of the
-system: the architecture, the engine, the query generation, the read-only
-guard, the worker and the concurrency, the user interface, the keys and the
-commands, the themes, and the performance.
+system: the architecture, the engine, the query generation, the filter, the
+table generator, the nested values, the read-only guard, the worker and the
+concurrency, the user interface, the keys and the commands, the chooser, the
+settings, the themes, the performance and the releases.
 
 ```sh
 cargo test --workspace
@@ -1013,6 +1293,20 @@ part of a value.
 Your terminal may not report 24-bit colour. Peruse falls back to 256 colours.
 Try another theme with `t`, or set `COLORTERM=truecolor` if your terminal does
 support it.
+
+**I cannot select text with the mouse any more.**
+A terminal that gives the mouse to a program stops selecting text in the usual
+way. Start with `--no-mouse`, or put `mouse = false` in the settings file.
+
+**A `.db` file will not open.**
+Look at the message. Peruse reads the first bytes, so it knows a DuckDB database
+from a SQLite one and says which it found. It reads the first, and it tells you
+how to write a table out of the second.
+
+**The band shows `·` and nothing else.**
+The facts are on their way. For a filtered view or a file of text they need a
+scan of the view, and on a file of some gigabytes that takes a moment. Press `d`
+twice to turn the band off.
 
 **The build fails on the first try.**
 It is almost always the C++ toolchain. See [Install](#install).

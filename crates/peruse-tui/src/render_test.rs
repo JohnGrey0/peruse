@@ -15,7 +15,7 @@ use peruse_core::{OpenOptions, Worker};
 use ratatui::backend::TestBackend;
 use ratatui::Terminal;
 
-use crate::app::{App, Build, Mode, Panel};
+use crate::app::{App, Band, Build, Mode, Panel, PromptKind};
 use crate::colors::Depth;
 use crate::commands::Cmd;
 use crate::ui;
@@ -239,6 +239,74 @@ fn a_sql_query_replaces_the_grid_contents() {
 }
 
 #[test]
+fn the_query_prompt_opens_with_a_statement_that_the_user_finishes() {
+    let p = write_sample("sql-prompt", SAMPLE, "csv");
+    let (mut app, mut term) = open(&p);
+    settle(&mut app, &mut term);
+
+    // The key `e` opens the prompt with the start of a statement, and the
+    // cursor comes after the last character. A user who wants a part of the
+    // file types the condition and nothing else.
+    press_char(&mut app, 'e');
+    assert_eq!(app.mode, Mode::Prompt(PromptKind::Sql));
+    assert_eq!(app.input.text(), peruse_core::query::PROMPT_START);
+    assert_eq!(app.input.cursor_col(), app.input.text().chars().count());
+    // The text reads and does not write, so the prompt reports no error for it.
+    assert_eq!(app.prompt_error, None, "the prompt must not open with an error");
+    settle(&mut app, &mut term);
+    assert!(
+        screen(&term).contains("SELECT * FROM src WHERE"),
+        "the statement is not on the screen\n{}",
+        screen(&term)
+    );
+
+    type_text(&mut app, "region = 'EU'");
+    assert_eq!(app.prompt_error, None, "a statement that reads is not an error");
+    press(&mut app, ratatui::crossterm::event::KeyCode::Enter);
+    settle(&mut app, &mut term);
+    let s = screen(&term);
+    assert!(s.contains("3 × 4"), "the statement did not run\n{s}");
+    assert!(!s.contains("dave"), "a row outside the EU is still there\n{s}");
+}
+
+#[test]
+fn the_query_prompt_opens_with_the_statement_that_the_grid_shows() {
+    let p = write_sample("sql-prompt-again", SAMPLE, "csv");
+    let (mut app, mut term) = open(&p);
+    app.view.base = Base::Sql("SELECT id, name FROM src".into());
+    app.run_startup_view();
+    settle(&mut app, &mut term);
+
+    // The grid holds a statement already, so the prompt opens with it. The user
+    // corrects that statement, and does not write it again.
+    press_char(&mut app, 'e');
+    assert_eq!(app.input.text(), "SELECT id, name FROM src");
+}
+
+#[test]
+fn the_key_ctrl_u_empties_the_query_prompt_and_esc_leaves_the_grid_alone() {
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    let p = write_sample("sql-prompt-clear", SAMPLE, "csv");
+    let (mut app, mut term) = open(&p);
+    settle(&mut app, &mut term);
+    // The title bar, the column names and the five rows of data.
+    let before = lines(&term)[..7].to_vec();
+
+    // The key ^U is the way out for a user who wants another statement.
+    press_char(&mut app, 'e');
+    app.on_key(&KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+    assert!(app.input.is_empty(), "^U must give an empty line");
+
+    // Esc changes nothing: the grid still reads the file.
+    type_text(&mut app, "SELECT 1 AS x");
+    press(&mut app, KeyCode::Esc);
+    assert_eq!(app.mode, Mode::Normal);
+    assert_eq!(app.view.base, Base::Source, "Esc must not run the statement");
+    settle(&mut app, &mut term);
+    assert_eq!(lines(&term)[..7], before[..], "Esc changed the grid");
+}
+
+#[test]
 fn hiding_a_column_removes_it_and_the_title_says_how_many() {
     let p = write_sample("hide", SAMPLE, "csv");
     let (mut app, mut term) = open(&p);
@@ -319,6 +387,57 @@ fn metadata_panel_reports_the_sniffed_csv_dialect() {
     assert!(s.contains("metadata"), "panel title missing\n{s}");
     assert!(s.contains("delimiter"), "dialect not reported\n{s}");
     assert!(s.contains("read_csv"), "reproducible read call missing\n{s}");
+}
+
+#[test]
+fn the_height_of_the_statistics_agrees_with_the_rows_that_it_draws() {
+    // `stats_content_height` and `draw_stats` walk the same list of sections,
+    // and until now they agreed only by a comment. A disagreement gives the
+    // stacked view a panel with an empty row at the bottom, or a panel that cuts
+    // its last row, and the whole test suite could not fail on it. One such
+    // disagreement was real: a branch of `draw_stats` did not step past the row
+    // that it wrote.
+    //
+    // The test draws the panel into an area that is taller than any content, so
+    // nothing is cut, and then compares the last row that holds a character with
+    // the height that the function reports.
+    let p = write_sample("stats-height", SAMPLE, "csv");
+    let (mut app, mut term) = open(&p);
+    app.panel = Panel::Stats;
+    settle(&mut app, &mut term);
+
+    let paint = crate::paint::Paint::new(Depth::True);
+    for filter in [None, Some("region = 'EU'".to_string())] {
+        app.view.filter = filter.clone();
+        settle(&mut app, &mut term);
+        // Walk every column, because each family of values gives the panel a
+        // different set of sections: only a column of numbers has a chart.
+        for col in 0..app.schema.len() {
+            app.cursor_col = col;
+            settle(&mut app, &mut term);
+            let name = app.schema.columns[col].name.clone();
+
+            let area = ratatui::layout::Rect { x: 0, y: 0, width: 46, height: 60 };
+            let mut buf = ratatui::buffer::Buffer::empty(area);
+            crate::panels::draw_stats(&mut buf, area, &app, &paint);
+
+            // The border takes the first row and the last row, and it writes a
+            // line across the whole width of each of them. The content is
+            // therefore inside the rows 1 to height - 2.
+            let last_written = (1..area.height - 1)
+                .rev()
+                .find(|y| {
+                    (1..area.width - 1).any(|x| buf[(x, *y)].symbol().trim() != "")
+                })
+                .expect("the panel wrote nothing");
+            let want = crate::panels::stats_content_height(&app);
+            assert_eq!(
+                last_written, want,
+                "column {name}, filter {filter:?}: the panel wrote up to the row \
+                 {last_written} and the height says {want}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -581,6 +700,15 @@ fn dump_screen() {
     println!("\n--- column stats ---\n{}", screen(&term));
 
     app.run(Cmd::ToggleStats);
+    // Write the mode of the band into the settings of this application only.
+    // The key `d` would write the settings file of the user who runs the test.
+    for mode in ["compact", "detailed"] {
+        app.config.band = Some(mode.to_string());
+        settle(&mut app, &mut term);
+        println!("\n--- band, {mode} ---\n{}", screen(&term));
+    }
+    app.config.band = None;
+
     app.run(Cmd::Help);
     settle(&mut app, &mut term);
     println!("\n--- help ---\n{}", screen(&term));
@@ -851,6 +979,18 @@ fn tiny_terminals_still_draw_without_panicking() {
             settle(&mut app, &mut term);
         }
 
+        // The band of facts takes its rows from the data, and it colors the
+        // column under the cursor. A grid of four rows has room for no band at
+        // all, so each mode must still draw.
+        app.mode = Mode::Normal;
+        for mode in ["compact", "detailed"] {
+            app.config.band = Some(mode.to_string());
+            settle(&mut app, &mut term);
+            app.run(Cmd::ColRight);
+            settle(&mut app, &mut term);
+        }
+        app.config.band = None;
+
         app.run(Cmd::Cancel);
         app.mode = Mode::Normal;
         app.panel = Panel::None;
@@ -951,7 +1091,16 @@ fn the_settings_page_shows_the_settings_and_the_machine() {
     settle(&mut app, &mut term);
     let s = screen(&term);
 
-    for label in ["theme", "threads", "memory limit", "sample size"] {
+    // The last setting of the list must be on the screen as well. A new setting
+    // must not push another one off the page.
+    for label in [
+        "theme",
+        "threads",
+        "memory limit",
+        "sample size",
+        "column details",
+        "step",
+    ] {
         assert!(s.contains(label), "setting {label} missing\n{s}");
     }
     // The page says what the machine gives. A user who sets a memory limit
@@ -1258,6 +1407,110 @@ fn both_panels_stack_with_metadata_above_the_statistics() {
 }
 
 #[test]
+fn a_tall_side_pane_shows_the_whole_metadata_beside_the_statistics() {
+    // The statistics of a column end after some rows. The metadata keeps each
+    // row that is left, so a tall screen shows every part of it. The panel
+    // wrote four rows of the summary before, whatever the height was.
+    let p = write_sample("panels-tall", SAMPLE, "csv");
+    let (mut app, _) = open(&p);
+    let mut term = Terminal::new(TestBackend::new(200, 60)).unwrap();
+
+    app.run(Cmd::ToggleMeta);
+    app.run(Cmd::ToggleStats);
+    assert_eq!(app.panel, Panel::Both);
+    settle(&mut app, &mut term);
+    let s = screen(&term);
+    let rows = lines(&term);
+
+    // The summary of this file has eight rows, and each of them is there.
+    let summary = [
+        "format",
+        "files",
+        "size on disk",
+        "delimiter",
+        "quote",
+        "escape",
+        "line ending",
+        "header row",
+    ];
+    for label in summary {
+        assert!(s.contains(label), "summary row {label} missing\n{s}");
+    }
+    let written = summary
+        .iter()
+        .filter(|label| rows.iter().any(|l| l.contains(**label)))
+        .count();
+    assert!(written > 4, "the summary still stops at four rows\n{s}");
+
+    // Rows stay free after the list of columns, so the read call is there too.
+    assert!(s.contains("reads as"), "no read call\n{s}");
+    assert!(s.contains("read_csv"), "no read call\n{s}");
+
+    // The statistics keep their own place below the metadata, and they are
+    // complete: the metadata does not take the rows that they need.
+    let meta_at = rows.iter().position(|l| l.contains("metadata"));
+    let stats_at = rows.iter().position(|l| l.contains("stddev"));
+    // A panel that is not there gives no position, and one position that is
+    // absent is smaller than any other. Test for the two panels first.
+    assert!(meta_at.is_some(), "no metadata panel\n{s}");
+    assert!(stats_at.is_some(), "no statistics panel\n{s}");
+    assert!(
+        meta_at < stats_at,
+        "the metadata must be above the statistics\n{s}"
+    );
+    assert!(s.contains("distribution"), "no chart in the statistics\n{s}");
+}
+
+#[test]
+fn the_note_about_the_filter_keeps_a_blank_row_above_it() {
+    // The statistics panel asks the layout for a height, and it must then use
+    // the rows that it asked for. A column of unique values ends with two
+    // notes: one note about the values, and one note about the filter.
+    let p = write_sample("panels-filter-note", SAMPLE, "csv");
+    let (mut app, _) = open(&p);
+    let mut term = Terminal::new(TestBackend::new(200, 60)).unwrap();
+    settle(&mut app, &mut term);
+
+    app.run(Cmd::ColLast); // the column `region`, value EU on the first row
+    app.run(Cmd::FilterThisValue);
+    settle(&mut app, &mut term);
+    app.run(Cmd::ColFirst); // the column `id`, and each of its values is unique
+    app.run(Cmd::ToggleMeta);
+    app.run(Cmd::ToggleStats);
+    settle(&mut app, &mut term);
+
+    let s = screen(&term);
+    let rows = lines(&term);
+    let once = rows.iter().position(|l| l.contains("value occurs once"));
+    let filter = rows.iter().position(|l| l.contains("over filtered rows only"));
+    assert!(once.is_some(), "no note about the values\n{s}");
+    assert!(filter.is_some(), "no note about the filter\n{s}");
+    assert_eq!(
+        filter,
+        once.map(|y| y + 2),
+        "the two notes need a blank row between them\n{s}"
+    );
+}
+
+#[test]
+fn a_list_of_columns_that_is_too_long_says_how_many_are_outside_it() {
+    // A short panel cannot show sixty columns. The user must know that the
+    // list goes on, so the list keeps its last row for the count.
+    let p = write_sample("panels-more", &wide_sample(), "csv");
+    let (mut app, mut term) = open(&p);
+    settle(&mut app, &mut term);
+
+    app.run(Cmd::ToggleMeta);
+    app.run(Cmd::ToggleStats);
+    settle(&mut app, &mut term);
+    assert!(
+        screen(&term).contains("more below"),
+        "the panel does not say how many columns are outside the list\n{}",
+        screen(&term)
+    );
+}
+
+#[test]
 fn the_two_panel_keys_add_and_remove_one_panel_each() {
     let p = write_sample("panels-keys", SAMPLE, "csv");
     let (mut app, mut term) = open(&p);
@@ -1356,6 +1609,449 @@ fn moving_across_the_columns_asks_for_each_column_one_time() {
     assert_eq!(app.stats().map(|s| s.column.as_str()), Some("id"));
 }
 
+// ------------------------------------------------- the detail band
+
+/// A file with column names that are wide enough for the band to write a word
+/// beside each of its numbers.
+///
+/// The names of [`SAMPLE`] are two to six characters wide, and the band drops a
+/// word or a type on the narrow ones.
+const BAND_SAMPLE: &str = "customer_id,customer_name,amount_paid,region\n\
+                           1,alice,10.5,EU\n\
+                           2,bob,,US\n\
+                           3,carol,30.25,EU\n\
+                           4,dave,4000.75,APAC\n\
+                           5,erin,7.0,EU\n";
+
+/// The row of the terminal that holds the column names.
+///
+/// The title bar is above it, on the row 0. The band starts on the row after it,
+/// and the first row of data comes after the band.
+const HEADER_ROW: usize = 1;
+
+/// Gives the rows of the detail band from the screen.
+fn band(term: &Terminal<TestBackend>, rows: usize) -> Vec<String> {
+    lines(term)[HEADER_ROW + 1..HEADER_ROW + 1 + rows].to_vec()
+}
+
+/// Makes a click of the left button at a position of the terminal.
+fn click(app: &mut App, column: u16, row: u16) -> bool {
+    use ratatui::crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+    app.on_mouse(&MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column,
+        row,
+        modifiers: KeyModifiers::NONE,
+    })
+}
+
+#[test]
+fn the_key_d_moves_through_the_three_modes_of_the_band() {
+    let p = write_sample("band-key", BAND_SAMPLE, "csv");
+    let (mut app, mut term) = open(&p);
+    settle(&mut app, &mut term);
+
+    // With no band, the first row of data comes straight after the names.
+    assert_eq!(app.band(), Band::Off);
+    let rows = lines(&term);
+    assert!(rows[HEADER_ROW].contains("customer_id"), "no names\n{}", screen(&term));
+    assert!(rows[HEADER_ROW + 1].contains("alice"), "no data\n{}", screen(&term));
+    let all_rows = app.viewport_rows;
+
+    // The compact band: one row for each column, with the type and the share of
+    // NULL values.
+    press_char(&mut app, 'd');
+    settle(&mut app, &mut term);
+    assert_eq!(app.band(), Band::Compact);
+    let b = band(&term, 1);
+    assert!(b[0].contains("BIGINT"), "no type in the band\n{}", screen(&term));
+    assert!(b[0].contains("VARCHAR"), "no type in the band\n{}", screen(&term));
+    assert!(b[0].contains("20%"), "no NULL share of amount_paid\n{}", screen(&term));
+    assert!(
+        lines(&term)[HEADER_ROW + 2].contains("alice"),
+        "the data did not move down one row\n{}",
+        screen(&term)
+    );
+    assert_eq!(app.viewport_rows, all_rows - 1, "the band takes one row");
+
+    // The detailed band: four rows for each column.
+    press_char(&mut app, 'd');
+    settle(&mut app, &mut term);
+    assert_eq!(app.band(), Band::Detailed);
+    let b = band(&term, Band::DETAIL_ROWS as usize);
+    assert!(b[0].contains("BIGINT"), "row 1 is the type\n{}", screen(&term));
+    assert!(b[1].contains("0% null"), "row 2 is the NULL share\n{}", screen(&term));
+    assert!(b[1].contains("20% null"), "amount_paid holds one NULL\n{}", screen(&term));
+    assert!(b[2].contains("~5 distinct"), "row 3 is the count\n{}", screen(&term));
+    assert!(b[3].contains("1 → 5"), "row 4 is the range\n{}", screen(&term));
+    assert!(
+        lines(&term)[HEADER_ROW + 1 + Band::DETAIL_ROWS as usize].contains("alice"),
+        "the data must start under the band\n{}",
+        screen(&term)
+    );
+    assert_eq!(
+        app.viewport_rows,
+        all_rows - Band::DETAIL_ROWS as usize,
+        "the band takes four rows from the data"
+    );
+
+    // The third press turns the band off, and the grid is as it was.
+    press_char(&mut app, 'd');
+    settle(&mut app, &mut term);
+    assert_eq!(app.band(), Band::Off);
+    assert!(lines(&term)[HEADER_ROW + 1].contains("alice"), "{}", screen(&term));
+    assert_eq!(app.viewport_rows, all_rows);
+}
+
+#[test]
+fn the_band_of_the_settings_file_is_on_the_screen_at_the_start() {
+    // The setting is the only copy of the mode, so the band of the last session
+    // is on the screen with no key.
+    let p = write_sample("band-setting", BAND_SAMPLE, "csv");
+    let (mut app, mut term) = open(&p);
+    app.config.band = Some("compact".into());
+    settle(&mut app, &mut term);
+    assert_eq!(app.band(), Band::Compact);
+    assert!(band(&term, 1)[0].contains("BIGINT"), "{}", screen(&term));
+
+    // A name that Peruse does not know leaves the band off. A setting is not a
+    // reason to refuse to open a file.
+    app.config.band = Some("nonsense".into());
+    settle(&mut app, &mut term);
+    assert_eq!(app.band(), Band::Off);
+    assert!(lines(&term)[HEADER_ROW + 1].contains("alice"), "{}", screen(&term));
+}
+
+#[test]
+fn a_fitted_column_keeps_room_for_its_type_mark_and_for_the_band() {
+    // A column whose name is as wide as its widest value ended exactly as wide
+    // as the name. The header then dropped the type mark, and the band fell back
+    // to the share of NULL values alone.
+    let p = write_sample("fit-headroom", SAMPLE, "csv");
+    let (mut app, mut term) = open(&p);
+    app.config.band = Some("compact".into());
+    settle(&mut app, &mut term);
+
+    // Each column shows the mark of its family. The mark of a column of numbers
+    // goes in front of the name, on the side of the digits.
+    marks_are_all_on_the_screen(&app, &term);
+
+    // The band writes the type beside the share, and no longer the share alone.
+    let b = band(&term, 1);
+    assert!(b[0].contains("DOUBLE"), "no type for amount\n{}", b[0]);
+    assert!(b[0].contains("VARCHAR"), "no type for region\n{}", b[0]);
+    assert!(b[0].contains("20%"), "no share for amount\n{}", b[0]);
+
+    // A sort adds an arrow in front of the name, which costs one screen column.
+    // The room after the name covers that arrow as well, so a sorted column
+    // keeps its mark.
+    app.run(Cmd::SortCycle);
+    settle(&mut app, &mut term);
+    assert!(!app.view.sort.is_empty(), "the column is not sorted");
+    marks_are_all_on_the_screen(&app, &term);
+}
+
+/// Reads the mark of the family at the exact screen position of each column of
+/// the frame, and compares it with the mark of that column.
+fn marks_are_all_on_the_screen(app: &App, term: &Terminal<TestBackend>) {
+    let head: Vec<char> = lines(term)[HEADER_ROW].chars().collect();
+    for &(ci, x, w) in &app.hit.cols {
+        let col = &app.schema.columns[ci];
+        let at = match col.kind.align() {
+            peruse_core::model::Align::Left => x + w - 1,
+            peruse_core::model::Align::Right => x,
+        };
+        assert_eq!(
+            head[at as usize],
+            col.kind.badge(),
+            "the column {} lost its type mark\n{}",
+            col.name,
+            screen(term)
+        );
+    }
+}
+
+#[test]
+fn the_name_of_the_column_under_the_cursor_is_stronger_than_its_band() {
+    // The header shows three levels: the name of the column under the cursor,
+    // the facts of that column, and the facts of each other column. Without the
+    // middle level, the name and its facts read as one block.
+    use ratatui::style::Modifier;
+    let p = write_sample("band-levels", BAND_SAMPLE, "csv");
+    let (mut app, mut term) = open(&p);
+    app.config.band = Some("detailed".into());
+    // The column `customer_name` holds text, so its name starts at the left
+    // edge of the column.
+    app.run(Cmd::ColRight);
+    settle(&mut app, &mut term);
+
+    let t = app.theme.clone();
+    let (cursor_ci, cursor_x, _) = app.hit.cols[1];
+    let (other_ci, other_x, _) = app.hit.cols[2];
+    // Read the two columns from the frame and not from a count. A frame that
+    // scrolled to the right would otherwise compare two columns that are not the
+    // two that this test names.
+    assert_eq!(cursor_ci, app.cursor_col, "the cursor is on another column");
+    assert_ne!(other_ci, app.cursor_col, "the second column is the cursor column");
+    let y = HEADER_ROW as u16;
+    let paint = |c| crate::colors::conv(c, Depth::True);
+    let buf = term.backend().buffer();
+    let name = &buf[(cursor_x, y)];
+    let facts = &buf[(cursor_x, y + 1)];
+    let other = &buf[(other_x, y + 1)];
+
+    assert_eq!(name.fg, paint(t.accent), "the name keeps the accent color");
+    assert!(
+        name.modifier.contains(Modifier::BOLD),
+        "the name keeps its thick letters"
+    );
+    assert_eq!(
+        facts.fg,
+        paint(crate::grid::band_focus(&t)),
+        "the band under the name must be quieter than the name"
+    );
+    assert!(
+        !facts.modifier.contains(Modifier::BOLD),
+        "thin letters keep the name the stronger of the two"
+    );
+    assert_eq!(other.fg, paint(t.dim), "the band of another column stays dim");
+    assert_ne!(name.fg, facts.fg, "the name and its facts are one block");
+    assert_ne!(facts.fg, other.fg, "the column under the cursor does not stand out");
+}
+
+#[test]
+fn a_click_under_the_band_lands_on_the_row_that_the_user_pointed_at() {
+    let p = write_sample("band-click", BAND_SAMPLE, "csv");
+    let (mut app, mut term) = open(&p);
+    app.config.band = Some("detailed".into());
+    settle(&mut app, &mut term);
+
+    // The third row of data on the screen holds carol. A click on it must move
+    // the cursor to that row, and not to a row four rows above it.
+    let y = HEADER_ROW + 1 + Band::DETAIL_ROWS as usize + 2;
+    assert!(
+        lines(&term)[y].contains("carol"),
+        "the test points at the wrong row\n{}",
+        screen(&term)
+    );
+    assert!(click(&mut app, 20, y as u16));
+    assert_eq!(app.cursor_row, 2, "the click landed on another row");
+
+    // A click on a row of the band moves to that column, as a click on the row
+    // of the names does. The band describes a column and not a row.
+    let x = lines(&term)[HEADER_ROW].find("region").expect("no column region") as u16;
+    assert!(click(&mut app, x, (HEADER_ROW + 2) as u16));
+    assert_eq!(app.cursor_col, 3, "the click did not reach the column");
+    assert_eq!(app.cursor_row, 2, "a click on the band must not move the row");
+}
+
+#[test]
+fn a_terminal_too_short_for_the_band_still_draws_the_data() {
+    let p = write_sample("band-tiny", BAND_SAMPLE, "csv");
+    let (worker, opened) = Worker::spawn(p.to_str().unwrap(), OpenOptions::default()).unwrap();
+    let mut app = App::new(worker, opened, peruse_core::theme::Theme::default(), false);
+    // Write no settings file: this application has the path of the user.
+    app.config.band = Some("detailed".into());
+
+    for (w, h) in [(10u16, 4u16), (20, 6), (40, 8), (110, 24)] {
+        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+        settle(&mut app, &mut term);
+        // The band gives its rows back to the data. A band with rows on the
+        // screen therefore always has a row of data under it.
+        assert!(
+            app.hit.band == 0 || app.hit.rows >= 1,
+            "{w}x{h}: the band pushed the data off the screen\n{}",
+            screen(&term)
+        );
+        assert!(
+            app.viewport_rows >= 1,
+            "{w}x{h}: no room for a row of data\n{}",
+            screen(&term)
+        );
+        if h >= 6 {
+            // A terminal of this height holds the names, one row of the band and
+            // one row of data.
+            let rows = lines(&term);
+            assert!(
+                rows[HEADER_ROW].contains("customer_id"),
+                "{w}x{h}: no column names\n{}",
+                screen(&term)
+            );
+            assert!(app.hit.band >= 1, "{w}x{h}: no band at all");
+            // A narrow terminal holds the first column only, so the number of
+            // the row is the mark of a row of data.
+            assert!(
+                rows.iter().any(|l| l.trim_start().starts_with('1')),
+                "{w}x{h}: no row of data\n{}",
+                screen(&term)
+            );
+        }
+    }
+}
+
+#[test]
+fn the_band_over_a_filtered_view_reports_the_filtered_rows() {
+    // The band describes what the grid shows. A share over the whole file would
+    // be a lie under a filter.
+    let p = write_sample("band-filter", BAND_SAMPLE, "csv");
+    let (mut app, mut term) = open(&p);
+    app.config.band = Some("detailed".into());
+    settle(&mut app, &mut term);
+    assert!(
+        band(&term, 4)[1].contains("20% null"),
+        "one row in five holds no amount\n{}",
+        screen(&term)
+    );
+
+    // The one row of bob holds no amount, so the column is then all NULL.
+    app.view.filter = Some("customer_name = 'bob'".into());
+    app.run_startup_view();
+    settle(&mut app, &mut term);
+    let b = band(&term, 4);
+    assert!(
+        b[1].contains("100% null"),
+        "the band did not follow the filter\n{}",
+        screen(&term)
+    );
+    assert!(!b[1].contains("20% null"), "an old number stayed\n{}", screen(&term));
+    assert!(
+        b[3].contains("all null"),
+        "a column of NULL values has no range\n{}",
+        screen(&term)
+    );
+}
+
+#[test]
+fn a_band_answer_from_an_old_view_changes_nothing() {
+    use peruse_core::engine::ColumnBrief;
+    let p = write_sample("band-stale", BAND_SAMPLE, "csv");
+    let (mut app, mut term) = open(&p);
+    app.config.band = Some("compact".into());
+    settle(&mut app, &mut term);
+    assert!(band(&term, 1)[0].contains("BIGINT"), "{}", screen(&term));
+
+    // An answer for a view that the user left must not reach the screen. The
+    // epoch 0 is older than any view that Peruse asked for.
+    let changed = app.on_response(peruse_core::Response::Band {
+        epoch: 0,
+        briefs: vec![ColumnBrief {
+            column: "customer_id".into(),
+            n_total: 100,
+            n_present: 1,
+            n_distinct: Some(1),
+            min: None,
+            max: None,
+        }],
+    });
+    assert!(!changed, "a stale answer asked for a new frame");
+    settle(&mut app, &mut term);
+    let b = band(&term, 1);
+    assert!(b[0].contains("BIGINT"), "the type went away\n{}", screen(&term));
+    assert!(!b[0].contains("99%"), "a stale number reached the band\n{}", screen(&term));
+    // The facts of the view that the user is on are still there. The compact
+    // band measures the two counts only, so the count of the rows is the fact to
+    // test here.
+    assert_eq!(app.brief(0).map(|b| b.n_total), Some(5));
+    assert_eq!(app.brief(0).map(|b| b.n_present), Some(5));
+}
+
+#[test]
+fn the_band_over_a_file_of_text_measures_the_columns_with_one_query() {
+    // A CSV file has no footer, so the engine must measure the columns.
+    //
+    // The mode of the band decides what the query measures. The compact band
+    // draws the share of NULL values alone, and each of the three other facts
+    // reads the whole column, so compact must leave them unknown. The detailed
+    // band then asks again and gets them.
+    let p = write_sample("band-query", BAND_SAMPLE, "csv");
+    let (mut app, mut term) = open(&p);
+    app.config.band = Some("compact".into());
+    settle(&mut app, &mut term);
+
+    assert_eq!(app.brief(0).map(|b| b.n_total), Some(5), "no query ran");
+    assert_eq!(
+        app.brief(0).and_then(|b| b.n_distinct),
+        None,
+        "compact must not pay for the count of the different values"
+    );
+
+    app.config.band = Some("detailed".into());
+    settle(&mut app, &mut term);
+    assert_eq!(
+        app.brief(0).and_then(|b| b.n_distinct),
+        Some(5),
+        "the detailed band must ask again for the three other facts"
+    );
+    app.config.band = Some("compact".into());
+    settle(&mut app, &mut term);
+    // A move across the columns must not ask again. The answer covers each
+    // column that the grid draws.
+    for _ in 0..3 {
+        app.run(Cmd::ColRight);
+    }
+    app.ensure_rows();
+    assert!(app.brief(3).is_some(), "the answer covered one column only");
+    assert!(!app.busy, "a move across the columns started a new query");
+}
+
+#[test]
+fn the_band_asks_again_for_the_columns_of_a_request_that_the_worker_dropped() {
+    // The worker keeps one band request only. A move to the side gives a new
+    // request, the worker drops the older one, and the answer of the older one
+    // never arrives. The band must ask again for those columns when the user
+    // comes back to them. Without this, they show a row of points until the user
+    // changes the view.
+    let p = write_sample("band-dropped", &wide_sample(), "csv");
+    let (mut app, mut term) = open(&p);
+    app.config.band = Some("compact".into());
+
+    // One frame asks the engine about the first columns. The test then drops
+    // every answer of the band, exactly as the worker drops the request itself.
+    let rx = app.worker.responses().clone();
+    for _ in 0..8 {
+        term.draw(|f| ui::draw(f, &mut app, Depth::True)).unwrap();
+        app.ensure_rows();
+        while let Ok(r) = rx.recv_timeout(Duration::from_millis(75)) {
+            if !matches!(r, peruse_core::Response::Band { .. }) {
+                app.on_response(r);
+            }
+        }
+    }
+    assert!(app.brief(0).is_none(), "the test kept an answer of the band");
+
+    // The last columns get their own request, and this one arrives.
+    app.run(Cmd::ColLast);
+    settle(&mut app, &mut term);
+    let last = app.schema.len() - 1;
+    assert!(app.brief(last).is_some(), "no answer for the last column");
+
+    // Back to the first columns. No answer for them ever arrived, so the band
+    // must ask again.
+    app.run(Cmd::ColFirst);
+    settle(&mut app, &mut term);
+    assert!(app.brief(0).is_some(), "the band never asked again");
+}
+
+#[test]
+fn a_grid_with_no_room_for_the_band_asks_the_engine_nothing() {
+    // The band gives its rows back to the data on a short grid, so a short grid
+    // shows no band at all. A query for facts that nothing draws reads the whole
+    // file for nothing.
+    let p = write_sample("band-noroom", BAND_SAMPLE, "csv");
+    let (worker, opened) = Worker::spawn(p.to_str().unwrap(), OpenOptions::default()).unwrap();
+    let mut app = App::new(worker, opened, peruse_core::theme::Theme::default(), false);
+    // Write no settings file: this application has the path of the user.
+    app.config.band = Some("detailed".into());
+    let mut term = Terminal::new(TestBackend::new(40, 2)).unwrap();
+    settle(&mut app, &mut term);
+
+    assert_eq!(app.hit.band, 0, "the grid has room for a band\n{}", screen(&term));
+    assert!(
+        app.brief(0).is_none(),
+        "the band measured a column that it cannot draw"
+    );
+}
+
 #[test]
 fn the_filter_prompt_shows_the_rest_of_a_column_name_as_you_type() {
     let p = write_sample("ghost", SAMPLE, "csv");
@@ -1385,6 +2081,26 @@ fn the_key_right_also_takes_the_ghost_at_the_end_of_a_line() {
     app.run(Cmd::Filter);
     type_text(&mut app, "reg");
     press(&mut app, ratatui::crossterm::event::KeyCode::Right);
+    assert_eq!(app.input.text(), "region");
+}
+
+#[test]
+fn ctrl_and_alt_with_the_key_right_move_a_word_and_do_not_take_the_ghost() {
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    let p = write_sample("ghost-word-right", SAMPLE, "csv");
+    let (mut app, mut term) = open(&p);
+    settle(&mut app, &mut term);
+
+    app.run(Cmd::Filter);
+    type_text(&mut app, "reg");
+    // These two forms move the cursor one word. The cursor is at the end of
+    // the line, so the line does not change.
+    app.on_key(&KeyEvent::new(KeyCode::Right, KeyModifiers::CONTROL));
+    assert_eq!(app.input.text(), "reg", "Ctrl and the key right move a word");
+    app.on_key(&KeyEvent::new(KeyCode::Right, KeyModifiers::ALT));
+    assert_eq!(app.input.text(), "reg", "Alt and the key right move a word");
+    // The key right alone still takes the ghost completion.
+    press(&mut app, KeyCode::Right);
     assert_eq!(app.input.text(), "region");
 }
 
@@ -1563,4 +2279,699 @@ fn enter_on_a_plain_cell_still_opens_the_cell_inspector() {
     settle(&mut app, &mut term);
     assert_eq!(app.mode, Mode::Cell);
     assert!(screen(&term).contains("alice"), "{}", screen(&term));
+}
+
+/// Writes a DuckDB database file in a new directory and gives its path.
+///
+/// A database is the one source that DuckDB itself opens, so a test of the whole
+/// program needs a true file. The test writes it with a connection of its own,
+/// and it closes that connection before Peruse attaches the file.
+fn write_database(tag: &str, sql: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("peruse-render-{tag}"));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let p = dir.join("shop.duckdb");
+    let conn = duckdb::Connection::open(&p).unwrap();
+    conn.execute_batch(sql).unwrap();
+    drop(conn);
+    p
+}
+
+/// Opens one table of a database, with the index at open turned on.
+fn open_table(path: &Path, table: &str) -> (App, Terminal<TestBackend>) {
+    let opts = OpenOptions {
+        table: Some(table.to_string()),
+        ..Default::default()
+    };
+    let (worker, opened) = Worker::spawn(path.to_str().unwrap(), opts).unwrap();
+    // The last argument turns the index at open on. A database needs no index,
+    // and this test proves that Peruse builds none.
+    let mut app = App::new(
+        worker,
+        opened,
+        peruse_core::theme::builtin("peruse-dark").unwrap(),
+        true,
+    );
+    app.config_path = path.parent().map(|d| d.join("config.toml"));
+    let terminal = Terminal::new(TestBackend::new(110, 24)).unwrap();
+    (app, terminal)
+}
+
+#[test]
+fn a_table_of_a_database_draws_as_a_file_does_and_needs_no_index() {
+    let p = write_database(
+        "duckdb",
+        "CREATE TABLE customers AS SELECT 1 AS id, 'ann' AS name;\n\
+         CREATE TABLE orders AS SELECT i AS id, ('c' || i) AS code, \
+                (i * 1.25) AS total FROM range(6) t(i);",
+    );
+    let (mut app, mut term) = open_table(&p, "orders");
+
+    // A table of a database gives direct access already, so `App::new` must
+    // start no index. The test reads this before the first frame: after the
+    // index of a small file arrives, both values say the same thing again.
+    assert!(app.seekable, "a database table gives direct access");
+    assert!(!app.indexing, "the program started an index for nothing");
+
+    settle(&mut app, &mut term);
+    let s = screen(&term);
+
+    // The title bar names the file and the table. The name of the file alone
+    // would not say which rows the grid shows.
+    assert!(s.contains("shop.duckdb"), "no file name\n{s}");
+    assert!(s.contains("main.orders"), "no table name\n{s}");
+    assert!(s.contains("6 × 3"), "no shape\n{s}");
+    assert!(s.contains("duckdb"), "no format\n{s}");
+    for value in ["id", "code", "total", "c3"] {
+        assert!(s.contains(value), "missing {value}\n{s}");
+    }
+
+    // The note that asks for the key I must stay away, and no message may say
+    // that Peruse copied the table.
+    assert!(!s.contains("press I"), "the note asks for an index\n{s}");
+    assert!(!s.contains("indexed"), "the program copied the table\n{s}");
+
+    // The metadata panel shows the two statements that open the table. A user
+    // can paste them into another program and read the same rows.
+    app.run(Cmd::ToggleMeta);
+    settle(&mut app, &mut term);
+    let s = screen(&term);
+    assert!(s.contains("ATTACH"), "no attach statement\n{s}");
+    assert!(s.contains("READ_ONLY"), "the panel hides the read-only flag\n{s}");
+}
+
+#[test]
+fn a_statement_over_a_database_reaches_a_second_table() {
+    let p = write_database(
+        "duckdb-join",
+        "CREATE TABLE customers AS SELECT 1 AS id, 'ann' AS name;\n\
+         CREATE TABLE orders AS SELECT 1 AS customer, 5 AS qty;",
+    );
+    let (mut app, mut term) = open_table(&p, "orders");
+    settle(&mut app, &mut term);
+
+    // The alias of the attached database is in the metadata panel, so a user
+    // can join the table on the screen with another table of the same file.
+    app.view.base = Base::Sql(
+        "SELECT c.name, o.qty FROM src o \
+         JOIN __peruse_db.main.customers c ON c.id = o.customer"
+            .into(),
+    );
+    app.run_startup_view();
+    settle(&mut app, &mut term);
+    let s = screen(&term);
+    assert!(s.contains("ann"), "the second table did not arrive\n{s}");
+}
+
+// ------------------------------------------------------------- the mouse
+
+/// Gives one mouse event that is not a press of the left button.
+fn mouse(app: &mut App, kind: ratatui::crossterm::event::MouseEventKind, x: u16, y: u16) -> bool {
+    use ratatui::crossterm::event::{KeyModifiers, MouseEvent};
+    app.on_mouse(&MouseEvent {
+        kind,
+        column: x,
+        row: y,
+        modifiers: KeyModifiers::NONE,
+    })
+}
+
+/// Gives one turn of the wheel at a position of the terminal.
+fn wheel(
+    app: &mut App,
+    kind: ratatui::crossterm::event::MouseEventKind,
+    mods: ratatui::crossterm::event::KeyModifiers,
+    x: u16,
+    y: u16,
+) -> bool {
+    use ratatui::crossterm::event::MouseEvent;
+    app.on_mouse(&MouseEvent {
+        kind,
+        column: x,
+        row: y,
+        modifiers: mods,
+    })
+}
+
+/// Draws one frame, as the loop of the program does after an event.
+fn frame(app: &mut App, term: &mut Terminal<TestBackend>) {
+    term.draw(|f| ui::draw(f, app, Depth::True)).unwrap();
+}
+
+/// Gives the box of the overlay that the last frame drew.
+fn overlay_box(app: &App) -> ratatui::layout::Rect {
+    app.overlay
+        .as_ref()
+        .expect("the frame wrote no box for the overlay")
+        .area
+}
+
+/// Gives the row of the terminal of one line of the list of the overlay, with
+/// the position of that line in the list.
+fn overlay_line(app: &App, n: usize) -> (u16, usize) {
+    let hit = app.overlay.as_ref().expect("no box for the overlay");
+    *hit.lines.get(n).expect("the overlay drew no such line")
+}
+
+/// Gives the row of the terminal that holds a text.
+fn row_of(term: &Terminal<TestBackend>, text: &str) -> u16 {
+    lines(term)
+        .iter()
+        .position(|l| l.contains(text))
+        .unwrap_or_else(|| panic!("no row holds {text:?}"))
+        as u16
+}
+
+#[test]
+fn a_click_on_the_cell_of_the_cursor_opens_the_record_view() {
+    use ratatui::crossterm::event::KeyCode;
+    let p = write_sample("mouse-double", SAMPLE, "csv");
+    let (mut app, mut term) = open(&p);
+    settle(&mut app, &mut term);
+
+    let y = row_of(&term, "carol");
+    let (_, x, _) = app.hit.cols[1];
+
+    // The first click on a cell chooses it and no more. A user who only wants to
+    // read another cell must not get a large box on top of the data.
+    assert!(click(&mut app, x, y));
+    assert_eq!(app.mode, Mode::Normal, "the first click opened a box");
+    assert_eq!(app.cursor_row, 2, "the click landed on another row");
+    assert_eq!(app.cursor_col, 1, "the click landed on another column");
+
+    // A click on the cell that the cursor is on opens the record view, as the
+    // key `r` does. This is the rule that a user asked for: a click on a cell
+    // opens that record.
+    assert!(click(&mut app, x, y));
+    assert_eq!(app.mode, Mode::Record);
+    settle(&mut app, &mut term);
+    assert!(
+        screen(&term).contains("carol"),
+        "the record view shows another row\n{}",
+        screen(&term)
+    );
+
+    // A click on a different cell chooses that cell and opens nothing, whatever
+    // came before it.
+    press(&mut app, KeyCode::Esc);
+    assert_eq!(app.mode, Mode::Normal);
+    // Draw the grid again. The record view covered it, and the next position
+    // must come from the grid and not from the box that was on top of it.
+    settle(&mut app, &mut term);
+    let other = row_of(&term, "alice");
+    assert!(click(&mut app, x, other));
+    assert_eq!(
+        app.mode,
+        Mode::Normal,
+        "a click on another cell opened the record"
+    );
+    assert_eq!(app.cursor_row, 0, "the click landed on another row");
+
+    // The same cell again, and it opens.
+    assert!(click(&mut app, x, other));
+    assert_eq!(app.mode, Mode::Record);
+}
+
+#[test]
+fn a_click_outside_an_overlay_closes_it_and_a_click_inside_does_not() {
+    let p = write_sample("mouse-outside", SAMPLE, "csv");
+    let (mut app, mut term) = open(&p);
+    settle(&mut app, &mut term);
+
+    // Each box that covers the grid. A click outside gives the grid back, as
+    // Esc does, so the user never has to look for a key to leave.
+    for cmd in [
+        Cmd::Record,
+        Cmd::Help,
+        Cmd::InspectCell,
+        Cmd::Palette,
+        Cmd::ThemePicker,
+        Cmd::Settings,
+        Cmd::FilterBuild,
+    ] {
+        app.run(cmd);
+        settle(&mut app, &mut term);
+        assert_ne!(app.mode, Mode::Normal, "{cmd:?} opened no box");
+        let area = overlay_box(&app);
+
+        // The border is inside the box.
+        click(&mut app, area.x, area.y);
+        assert_ne!(app.mode, Mode::Normal, "{cmd:?} closed on a click inside it");
+        click(
+            &mut app,
+            area.x + area.width / 2,
+            area.y + area.height.saturating_sub(1),
+        );
+        assert_ne!(app.mode, Mode::Normal, "{cmd:?} closed on a click inside it");
+
+        // The title bar of the screen is outside each box.
+        assert!(click(&mut app, 0, 0), "{cmd:?} did nothing for a click outside");
+        assert_eq!(app.mode, Mode::Normal, "{cmd:?} stayed open");
+        settle(&mut app, &mut term);
+        assert!(
+            app.overlay.is_none(),
+            "{cmd:?} left its box behind after it closed"
+        );
+    }
+}
+
+#[test]
+fn a_click_in_the_record_view_selects_the_line_under_the_pointer() {
+    // The record of a row with 60 fields is longer than the box, so the list
+    // scrolls. A click must find the line under the pointer, and not the line
+    // at that offset in the list.
+    let p = write_sample("mouse-record-scroll", &wide_sample(), "csv");
+    let (mut app, mut term) = open(&p);
+    settle(&mut app, &mut term);
+    app.run(Cmd::Record);
+    settle(&mut app, &mut term);
+
+    press_char(&mut app, 'G');
+    settle(&mut app, &mut term);
+    assert!(app.record_sel > 0, "the list did not move to the last field");
+
+    let (y, _) = overlay_line(&app, 0);
+    let row = lines(&term)[y as usize].clone();
+    let area = overlay_box(&app);
+    assert!(click(&mut app, area.x + 3, y));
+
+    let line = app.record_line().expect("no line under the pointer");
+    assert!(
+        row.contains(&line.label),
+        "the click selected another line: the row {row:?} against the field {:?}",
+        line.label
+    );
+    assert!(
+        app.record_sel > 0,
+        "the click used the offset on the screen as the position in the list"
+    );
+}
+
+#[test]
+fn a_click_opens_and_closes_a_value_that_holds_other_values() {
+    let body = "[{\"id\":1,\"actor\":{\"login\":\"petroav\",\"site\":\"github\"}}]";
+    let p = write_sample("mouse-drill", body, "json");
+    let (mut app, mut term) = open(&p);
+    settle(&mut app, &mut term);
+    app.run(Cmd::Record);
+    settle(&mut app, &mut term);
+
+    let y = row_of(&term, "actor");
+    let area = overlay_box(&app);
+
+    // The first click chooses the line. A user who only wants to read another
+    // line must not open or close a value by accident, so the value stays shut.
+    assert!(click(&mut app, area.x + 3, y));
+    settle(&mut app, &mut term);
+    assert!(
+        !screen(&term).contains("login"),
+        "the first click opened the value\n{}",
+        screen(&term)
+    );
+
+    // A click on the line that is chosen already opens the value, as the key
+    // Space does. The click lands on another column of that line: two presses at
+    // one position inside a short time are a double click, and a double click
+    // does what Enter does.
+    assert!(click(&mut app, area.x + 6, y));
+    settle(&mut app, &mut term);
+    assert!(
+        screen(&term).contains("login"),
+        "the click did not open the value\n{}",
+        screen(&term)
+    );
+
+    // The next click on that line closes it again.
+    assert!(click(&mut app, area.x + 9, y));
+    settle(&mut app, &mut term);
+    assert!(
+        !screen(&term).contains("login"),
+        "the click did not close the value\n{}",
+        screen(&term)
+    );
+
+    // A double click on the line opens it and leaves it open.
+    click(&mut app, area.x + 3, y);
+    click(&mut app, area.x + 3, y);
+    settle(&mut app, &mut term);
+    assert!(
+        screen(&term).contains("login"),
+        "the double click left the value closed\n{}",
+        screen(&term)
+    );
+}
+
+#[test]
+fn a_double_click_on_a_field_of_the_record_shows_the_value_in_full() {
+    // The record view cuts a long value at the right edge. Enter opens the
+    // inspector on a single value, and the double click does the same.
+    let p = write_sample("mouse-inspect", SAMPLE, "csv");
+    let (mut app, mut term) = open(&p);
+    settle(&mut app, &mut term);
+    app.run(Cmd::Record);
+    settle(&mut app, &mut term);
+
+    let y = row_of(&term, "alice");
+    let area = overlay_box(&app);
+    click(&mut app, area.x + 3, y);
+    assert_eq!(app.mode, Mode::Record, "one click opened the inspector");
+    click(&mut app, area.x + 3, y);
+    assert_eq!(app.mode, Mode::Cell);
+    settle(&mut app, &mut term);
+    assert!(
+        screen(&term).contains("alice"),
+        "the inspector shows another value\n{}",
+        screen(&term)
+    );
+
+    // The inspector came from the record view, so a click outside it goes back
+    // to the record view, exactly as Esc does.
+    click(&mut app, 0, 0);
+    assert_eq!(app.mode, Mode::Record);
+}
+
+#[test]
+fn a_click_previews_a_theme_and_a_double_click_keeps_it() {
+    let p = write_sample("mouse-theme", SAMPLE, "csv");
+    let (mut app, mut term) = open(&p);
+    settle(&mut app, &mut term);
+    app.run(Cmd::ThemePicker);
+    settle(&mut app, &mut term);
+
+    let (y, at) = overlay_line(&app, 2);
+    let want = app.themes[at].name.clone();
+    assert_ne!(want, app.theme.name, "the test points at the current theme");
+    let area = overlay_box(&app);
+
+    assert!(click(&mut app, area.x + 3, y));
+    assert_eq!(app.theme_sel, at);
+    assert_eq!(app.theme.name, want, "the click did not preview the theme");
+    assert_eq!(app.mode, Mode::ThemePicker, "one click closed the picker");
+
+    // The second press keeps the theme, as Enter does.
+    assert!(click(&mut app, area.x + 3, y));
+    assert_eq!(app.mode, Mode::Normal);
+    assert_eq!(app.theme.name, want);
+    assert_eq!(app.themes[app.theme_idx].name, want, "the theme came back");
+}
+
+#[test]
+fn a_click_selects_a_setting_and_a_double_click_starts_to_edit_it() {
+    let p = write_sample("mouse-settings", SAMPLE, "csv");
+    let (mut app, mut term) = open(&p);
+    settle(&mut app, &mut term);
+    app.run(Cmd::Settings);
+    settle(&mut app, &mut term);
+
+    let (first_y, _) = overlay_line(&app, 0);
+    let (y, at) = overlay_line(&app, 3);
+    let area = overlay_box(&app);
+    assert!(click(&mut app, area.x + 3, y));
+    assert_eq!(app.settings_sel, at);
+    assert!(!app.settings_editing, "one click started an edit");
+
+    assert!(click(&mut app, area.x + 3, y));
+    assert!(app.settings_editing, "the double click started no edit");
+
+    // The value has the focus while the user types it. A click on another
+    // setting must not lose what the user typed.
+    assert!(!click(&mut app, area.x + 3, first_y));
+    assert!(app.settings_editing);
+    assert_eq!(app.settings_sel, at);
+}
+
+#[test]
+fn a_click_selects_a_command_of_the_palette_and_a_double_click_runs_it() {
+    let p = write_sample("mouse-palette", SAMPLE, "csv");
+    let (mut app, mut term) = open(&p);
+    settle(&mut app, &mut term);
+    app.run(Cmd::Palette);
+    type_text(&mut app, "settings");
+    settle(&mut app, &mut term);
+
+    let want = app
+        .palette_items()
+        .iter()
+        .position(|c| *c == Cmd::Settings)
+        .expect("the query found no settings command");
+    let hit = app.overlay.as_ref().expect("no box for the palette");
+    let (y, at) = *hit
+        .lines
+        .iter()
+        .find(|(_, i)| *i == want)
+        .expect("the command is not on the screen");
+    let area = overlay_box(&app);
+
+    assert!(click(&mut app, area.x + 3, y));
+    assert_eq!(app.palette_sel, at);
+    assert_eq!(app.mode, Mode::Palette, "one click ran a command");
+
+    assert!(click(&mut app, area.x + 3, y));
+    assert_eq!(app.mode, Mode::Settings, "the double click ran no command");
+}
+
+#[test]
+fn a_movement_of_the_pointer_draws_no_frame() {
+    use ratatui::crossterm::event::{MouseButton, MouseEventKind};
+    // The terminal reports each movement of the pointer while the mouse is on.
+    // A frame for each of them would spend the processor of the user to draw
+    // the same screen again.
+    let p = write_sample("mouse-moved", SAMPLE, "csv");
+    let (mut app, mut term) = open(&p);
+    settle(&mut app, &mut term);
+
+    let quiet = [
+        MouseEventKind::Moved,
+        MouseEventKind::Drag(MouseButton::Left),
+        MouseEventKind::Up(MouseButton::Left),
+        MouseEventKind::Down(MouseButton::Right),
+    ];
+    for kind in quiet {
+        assert!(!mouse(&mut app, kind, 20, 4), "the grid moved for {kind:?}");
+    }
+
+    app.run(Cmd::Record);
+    settle(&mut app, &mut term);
+    let area = overlay_box(&app);
+    for kind in quiet {
+        assert!(
+            !mouse(&mut app, kind, area.x + 3, area.y + 2),
+            "the record view moved for {kind:?}"
+        );
+        assert_eq!(app.mode, Mode::Record, "{kind:?} closed the record view");
+    }
+}
+
+#[test]
+fn the_wheel_moves_the_rows_and_the_shift_key_moves_the_columns() {
+    use ratatui::crossterm::event::{KeyModifiers, MouseEventKind};
+    let p = write_sample("mouse-wheel-grid", SAMPLE, "csv");
+    let (mut app, mut term) = open(&p);
+    settle(&mut app, &mut term);
+    let none = KeyModifiers::NONE;
+
+    assert!(wheel(&mut app, MouseEventKind::ScrollDown, none, 20, 4));
+    assert_eq!(app.cursor_row, 3, "the wheel moves three rows");
+    assert!(wheel(&mut app, MouseEventKind::ScrollUp, none, 20, 4));
+    assert_eq!(app.cursor_row, 0);
+
+    // The shift key with the wheel moves to the side, and the row stays.
+    assert!(wheel(
+        &mut app,
+        MouseEventKind::ScrollDown,
+        KeyModifiers::SHIFT,
+        20,
+        4
+    ));
+    assert_eq!(app.cursor_col, 2, "the wheel with Shift moves two columns");
+    assert_eq!(app.cursor_row, 0, "the wheel with Shift moved a row too");
+    // A wheel that turns to the side does the same, with no modifier.
+    assert!(wheel(&mut app, MouseEventKind::ScrollLeft, none, 20, 4));
+    assert_eq!(app.cursor_col, 0);
+}
+
+#[test]
+fn the_wheel_moves_the_selection_of_an_overlay() {
+    use ratatui::crossterm::event::{KeyModifiers, MouseEventKind};
+    let p = write_sample("mouse-wheel-overlay", &wide_sample(), "csv");
+    let (mut app, mut term) = open(&p);
+    settle(&mut app, &mut term);
+    app.run(Cmd::Record);
+    settle(&mut app, &mut term);
+    assert_eq!(app.record_sel, 0);
+    let none = KeyModifiers::NONE;
+
+    let area = overlay_box(&app);
+    let (x, y) = (area.x + 3, area.y + 2);
+    assert!(wheel(&mut app, MouseEventKind::ScrollDown, none, x, y));
+    assert_eq!(app.record_sel, 3, "the wheel moved another number of lines");
+    assert!(wheel(&mut app, MouseEventKind::ScrollUp, none, x, y));
+    assert_eq!(app.record_sel, 0);
+}
+
+#[test]
+fn the_wheel_never_writes_in_a_box_that_takes_text() {
+    use ratatui::crossterm::event::{KeyCode, KeyModifiers, MouseEventKind};
+    // An arrow key inside a box that takes text belongs to the text: it walks
+    // the history of the box and puts an older line in it. A turn of the wheel
+    // must never do that.
+    let p = write_sample("mouse-wheel-text", &wide_sample(), "csv");
+    let (mut app, mut term) = open(&p);
+    settle(&mut app, &mut term);
+    let none = KeyModifiers::NONE;
+    // Put one line in the history that each prompt of the program shares.
+    app.input.set("amount > 100");
+    app.input.remember();
+
+    // The find box of the record view. The list of the fields is still on the
+    // screen under it, so the wheel moves that list and leaves the text.
+    app.run(Cmd::Record);
+    settle(&mut app, &mut term);
+    press_char(&mut app, '/');
+    type_text(&mut app, "col_1");
+    settle(&mut app, &mut term);
+    assert!(app.record_finding);
+    assert!(app.record_lines().len() > 4, "too few fields for the test");
+
+    assert!(wheel(&mut app, MouseEventKind::ScrollDown, none, 20, 8));
+    assert_eq!(app.record_sel, 3, "the wheel did not move the list");
+    assert!(wheel(&mut app, MouseEventKind::ScrollUp, none, 20, 8));
+    assert_eq!(app.record_sel, 0);
+    assert_eq!(app.record_find, "col_1", "the wheel wrote in the find box");
+    assert!(app.record_finding, "the wheel left the find box");
+    press(&mut app, KeyCode::Esc);
+    press(&mut app, KeyCode::Esc);
+    assert_eq!(app.mode, Mode::Normal);
+
+    // The value of a setting. The selection must stay where it is: Enter
+    // writes the text into the setting under the selection.
+    app.run(Cmd::Settings);
+    settle(&mut app, &mut term);
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Enter);
+    assert!(app.settings_editing);
+    let sel = app.settings_sel;
+    app.input.set("7");
+    for kind in [MouseEventKind::ScrollUp, MouseEventKind::ScrollDown] {
+        assert!(
+            !wheel(&mut app, kind, none, 20, 8),
+            "the wheel acted while a value was being typed"
+        );
+        assert_eq!(app.settings_sel, sel, "the wheel went to another setting");
+        assert_eq!(app.input.text(), "7", "the wheel wrote in the value");
+    }
+    press(&mut app, KeyCode::Esc);
+    press(&mut app, KeyCode::Esc);
+    assert_eq!(app.mode, Mode::Normal);
+
+    // The value step of the filter builder holds a prompt and no list, so the
+    // wheel has nothing to move.
+    app.run(Cmd::FilterBuild);
+    settle(&mut app, &mut term);
+    assert_eq!(app.build, Build::Column, "the builder opened at another step");
+    press(&mut app, KeyCode::Enter); // take the column
+    press(&mut app, KeyCode::Enter); // take the operator
+    assert_eq!(app.build, Build::Value);
+    app.input.set("v42");
+    for kind in [MouseEventKind::ScrollUp, MouseEventKind::ScrollDown] {
+        assert!(
+            !wheel(&mut app, kind, none, 20, 8),
+            "the wheel acted in a step that takes text"
+        );
+        assert_eq!(app.build, Build::Value, "the wheel left the step");
+        assert_eq!(app.input.text(), "v42", "the wheel wrote in the box");
+    }
+}
+
+#[test]
+fn a_double_click_in_a_long_list_keeps_the_line_of_the_first_press() {
+    // A list keeps the selected line near the middle, so a new selection moves
+    // the window. The frame between the two presses of a double click then
+    // puts another line under the pointer, and the second press must still act
+    // on the line that the first press chose.
+    let p = write_sample("mouse-double-scroll", SAMPLE, "csv");
+    let (mut app, mut term) = open(&p);
+    settle(&mut app, &mut term);
+    app.run(Cmd::ThemePicker);
+    frame(&mut app, &mut term);
+
+    let hit = app.overlay.as_ref().expect("no box for the theme picker");
+    assert!(
+        hit.lines.len() < app.themes.len(),
+        "the list holds each theme, so it never moves"
+    );
+    // The last line of the window is the furthest from the middle.
+    let (y, at) = *hit.lines.last().expect("the picker drew no line");
+    let want = app.themes[at].name.clone();
+    let area = overlay_box(&app);
+
+    assert!(click(&mut app, area.x + 3, y));
+    assert_eq!(app.theme_sel, at);
+    frame(&mut app, &mut term);
+    assert_ne!(
+        app.overlay.as_ref().unwrap().line_at(y),
+        Some(at),
+        "the list stayed still, so this test proves nothing"
+    );
+
+    assert!(click(&mut app, area.x + 3, y));
+    assert_eq!(app.mode, Mode::Normal, "the double click kept no theme");
+    assert_eq!(
+        app.themes[app.theme_idx].name, want,
+        "the double click kept the theme that the list moved under the pointer"
+    );
+}
+
+#[test]
+fn a_click_under_the_last_row_of_the_file_moves_nothing() {
+    // The grid keeps the rows under the last one empty. There is no cell
+    // there, so a click must change nothing: without this, a click on the
+    // empty part of the screen would send the cursor to the last row.
+    let p = write_sample("mouse-past-end", SAMPLE, "csv");
+    let (mut app, mut term) = open(&p);
+    settle(&mut app, &mut term);
+    assert_eq!(app.cursor_row, 0);
+
+    let y = row_of(&term, "erin") + 1;
+    assert!(
+        app.hit.row_at(y).is_some(),
+        "the row under the last one is outside the grid"
+    );
+    let (_, x, _) = app.hit.cols[1];
+    assert!(!click(&mut app, x, y), "the click acted under the last row");
+    assert_eq!(app.cursor_row, 0, "the click went to the last row");
+    assert_eq!(app.cursor_col, 0, "the click moved to another column");
+
+    // A second press at the same place must not open the record view either.
+    assert!(!click(&mut app, x, y));
+    assert_eq!(app.mode, Mode::Normal);
+}
+
+#[test]
+fn the_mouse_does_not_stop_the_program_on_a_small_terminal() {
+    let p = write_sample("mouse-small", SAMPLE, "csv");
+    let (mut app, _) = open(&p);
+    for (w, h) in [(10u16, 4u16), (20, 6), (40, 10)] {
+        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+        settle(&mut app, &mut term);
+        for cmd in [
+            Cmd::Record,
+            Cmd::Help,
+            Cmd::Palette,
+            Cmd::Settings,
+            Cmd::ThemePicker,
+            Cmd::FilterBuild,
+        ] {
+            app.run(cmd);
+            settle(&mut app, &mut term);
+            for x in [0, w / 2, w - 1] {
+                for y in [0, h / 2, h - 1] {
+                    click(&mut app, x, y);
+                    settle(&mut app, &mut term);
+                }
+            }
+            app.mode = Mode::Normal;
+            app.settings_editing = false;
+        }
+    }
 }

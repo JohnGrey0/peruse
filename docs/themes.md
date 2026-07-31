@@ -3,7 +3,7 @@
 A theme is a complete set of colors for the screen. The themes are in the crate
 `peruse-core`, and not in the terminal front-end. Each color is a group of
 three numbers for red, green and blue, and no type comes from a terminal
-library. An author writes a theme in a short form with 15 colors, and Peruse
+library. An author writes a theme in a short form with 13 colors, and Peruse
 calculates the 32 roles of the user interface from that form. A new theme
 therefore needs about fifteen lines. The code is in
 `crates/peruse-core/src/theme.rs`.
@@ -68,22 +68,68 @@ Four roles need a calculation:
 | `nested` | `magenta` mixed with 40 % of `blue` | A nested value needs its own color. |
 | `match_fg` | A dark text on a bright `yellow`, or a light text on a dark `yellow` | The text of a match must always be readable. |
 
-A test checks the last rule. The difference of the brightness between
-`match_bg` and `match_fg` must be more than 80 in each built-in theme.
+## The rules for a built-in theme
+
+Tests in `theme.rs` check each built-in theme:
+
+- The difference of the brightness between `match_bg` and `match_fg` is more
+  than 80.
+- The difference between `fg` and `bg` is more than 100. The smallest value in
+  the list is 125, from `solarized-dark`.
+- The difference between `fg` and `bg_alt` is more than 100. The header of the
+  grid, the title bar and the status line put `fg` on `bg_alt`. The smallest
+  value in the list is 115, from `solarized-dark`.
+- The difference between `dim` and `bg` is more than 60. This value is smaller
+  than the value for `fg`, because a dim text must look weak. The smallest
+  value in the list is 70, from `tokyo-night`.
+- A dark theme has a background that is darker than its text. A light theme has
+  a background that is brighter than its text. This test finds a `dark` flag
+  with the wrong value.
+- Six themes or more are light.
+- No two themes have the same name, and each name uses lower case letters,
+  digits and hyphens only. The option `--theme catppuccin-mocha` therefore
+  works.
+- The function `builtin` finds each theme in the list, in any case of the
+  letters.
+
+The Zenburn palette is not in the list. Its gray for a comment, `#656555`, on
+its background, `#3f3f3f`, gives a difference of 36 only, and the dim text is
+therefore difficult to read.
 
 ## The built-in themes
 
-Peruse holds nine themes:
+Peruse holds 25 themes. Nine of them are light, because a user of a light
+terminal also needs a choice.
 
-- `peruse-dark` (the default theme)
-- `peruse-light`
-- `nord`
-- `dracula`
-- `gruvbox-dark`
-- `solarized-dark`
-- `solarized-light`
-- `high-contrast`
-- `mono`
+| Group | Dark | Light |
+|---|---|---|
+| Peruse | `peruse-dark` (the default theme) | `peruse-light` |
+| A dark form only | `nord`, `dracula`, `monokai`, `kanagawa` | - |
+| Gruvbox | `gruvbox-dark` | `gruvbox-light` |
+| Solarized | `solarized-dark` | `solarized-light` |
+| Catppuccin | `catppuccin-mocha`, `catppuccin-frappe` | `catppuccin-latte` |
+| Tokyo Night | `tokyo-night` | `tokyo-night-day` |
+| One, from the Atom text editor | `one-dark` | `one-light` |
+| Everforest | `everforest-dark` | `everforest-light` |
+| Rose Pine | `rose-pine` | `rose-pine-dawn` |
+| GitHub | `github-dark` | `github-light` |
+| A special need | `high-contrast`, `mono` | - |
+
+The list in the code keeps this order, and the key `t` therefore moves through
+the groups in this order. The first theme must stay `peruse-dark`, because it is
+the default theme.
+
+The colors of a group come from the palette of that project. Five groups need a
+decision, because a palette does not always give one color for each role:
+
+- Monokai: the palette of the editor has no cyan. The yellow and the cyan
+  therefore come from the Monokai palette for a terminal.
+- Rose Pine: the palette gives six accent colors, but a theme needs seven. The
+  color foam therefore does the work of the blue and of the cyan.
+- Kanagawa: the red is peachRed, because the color samuraiRed is too dark on
+  the background.
+- Gruvbox and Everforest: each palette gives three levels of background, and
+  Peruse uses the medium level.
 
 The function `builtin_names` gives the names. The function `builtin` finds one
 theme by its name, and it ignores the case of the letters.

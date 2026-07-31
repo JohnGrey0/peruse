@@ -57,7 +57,7 @@ JSON has one rule, the database writes it, and a library reads it. The
 statement is in `View::row_json_sql`:
 
 ```sql
-SELECT CAST(to_json({'id': id, 'actor': actor, …}) AS VARCHAR)
+SELECT CAST(to_json({'id': "id", 'actor': "actor", …}) AS VARCHAR)
 FROM (SELECT * FROM src AS q WHERE … ORDER BY …) AS t
 LIMIT 1 OFFSET 12480
 ```
@@ -76,9 +76,11 @@ The statement reads one row. For a Parquet file that is immediate. For a CSV
 file or a JSON file with no index, DuckDB reads the file again for each row,
 because a file of text has no structure that lets the reader go to a row.
 
-Peruse indexes a file of text below 256 MB when it opens the file, so the usual
-case is fast. For a larger file, the footer shows the note, and the key `I`
-builds the index. See [engine.md](engine.md).
+Peruse indexes a file of text below 64 MB, and with 256 columns or fewer, when it
+opens the file, so the usual case is fast. Above either limit, the footer shows
+the note, and the key `I` builds the index. A table of a database needs no index.
+See
+[engine.md](engine.md).
 
 ## The rule about a field with no value
 

@@ -20,16 +20,51 @@ layer 2 keeps the promise for the text of the user.
 
 ## Layer 1: the structure of the connection
 
-Three facts stop a write, and none of them needs a check of the text:
+Four facts stop a write, and none of them needs a check of the text:
 
 - The database is always in memory. The engine calls
   `Connection::open_in_memory`, so the catalog holds no file on the disk.
-- The engine reaches the files of the user only through `read_parquet` and
-  `read_csv`. These two table functions can read, but they cannot write.
-- DuckDB never opens the files of the user for write access.
+- The engine reaches a data file of the user only through `read_parquet`,
+  `read_csv`, `read_json` and `read_json_auto`. These table functions can read,
+  but they cannot write.
+- DuckDB never opens a data file of the user for write access.
+- The engine never installs an extension and never loads one. The settings
+  `autoinstall_known_extensions` and `autoload_known_extensions` are both
+  `false`, so the engine cannot reach the network either. The test
+  `the_engine_does_not_download_an_extension` proves it.
 
 The view `src` is a view in memory. A `CREATE OR REPLACE VIEW` statement and
-the CSV index therefore write to memory only.
+the index of a file of text therefore write to memory only.
+
+### The scratch directory
+
+One write to the disk does happen. A query can need more memory than its limit,
+and a sort or a join over a file that is larger than the memory is the usual
+reason. DuckDB then spills the rows to the disk. The function `configure` in
+`engine.rs` gives it a directory of its own for that work: it sets
+`temp_directory` to `peruse` inside the temporary directory of the system. The
+setting keeps the pages away from the directory that the user works in.
+
+The spill is not a hole in the promise. DuckDB writes its own pages there,
+under names that it chooses, and it deletes them when the query ends. It never
+writes to a data file of the user, and it never writes to a database file.
+
+### A database file
+
+A DuckDB database file is the one source that DuckDB itself opens. The engine
+attaches it with the flag `READ_ONLY`:
+
+```sql
+ATTACH 'C:/data/shop.duckdb' AS "__peruse_db" (READ_ONLY);
+```
+
+The promise is stronger there than for a data file. The storage engine of DuckDB
+refuses each write to that file, so the promise does not rest on the words of a
+statement at all. The test `the_read_only_flag_stops_a_write_to_the_database`
+writes through the connection, past layer 2, and the database refuses it.
+
+Layer 2 still refuses a typed `ATTACH`, so a user cannot attach a second
+database and write to that one.
 
 ## Layer 2: the words of the statement
 
@@ -72,7 +107,7 @@ A statement must start with one of these words:
 
 The statement must hold none of these words, at any position:
 
-`INSERT`, `UPDATE`, `DELETE`, `DROP`, `CREATE`, `ALTER`, `REPLACE`,
+`INSERT`, `INTO`, `UPDATE`, `DELETE`, `DROP`, `CREATE`, `ALTER`, `REPLACE`,
 `TRUNCATE`, `ATTACH`, `DETACH`, `COPY`, `EXPORT`, `IMPORT`, `INSTALL`, `LOAD`,
 `VACUUM`, `CHECKPOINT`, `CALL`, `SET`, `RESET`, `PRAGMA`, `BEGIN`, `COMMIT`,
 `ROLLBACK`, `TRANSACTION`, `PREPARE`, `EXECUTE`, `DEALLOCATE`, `GRANT`,
@@ -108,6 +143,7 @@ Peruse rejects these statements:
 
 ```sql
 DROP TABLE src
+SELECT * INTO other FROM src
 INSERT INTO src VALUES (1)
 UPDATE src SET a = 1
 DELETE FROM src
@@ -194,7 +230,12 @@ The guard runs at four points:
 2. In `main.rs`, on the option `--filter`, before Peruse opens the file.
 3. In `app.rs`, after each key in the prompt. The user therefore sees an error
    before the user presses Enter.
-4. In `worker.rs`, on each request `SetView` with a statement from the user.
+4. In `worker.rs`, on each request `SetView`. The worker checks the statement
+   with `ensure_read_only` and the filter with `ensure_safe_predicate`. A view
+   holds text of the user in these two places, and each place gets the check
+   that fits it.
 
-The check in the worker is the last check. It makes sure that no statement
-reaches the engine without a check, whatever the caller does.
+The check in the worker is the last check. It makes sure that no text of the
+user reaches the engine without a check, whatever the caller does. The test
+`a_filter_that_writes_never_reaches_the_engine` sends a filter that writes
+directly to the worker, past the front end, and the worker refuses it.
