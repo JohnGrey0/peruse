@@ -35,7 +35,18 @@ jobs:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             archive: tar.gz
-          - os: macos-13
+          # The program for an Intel Mac is built on a Mac with Apple silicon,
+          # with the target given to cargo. GitHub retired the label `macos-13`,
+          # which was the Intel machine, and a job that asks for a label that
+          # GitHub no longer serves waits in the queue for ever. The release of
+          # v0.2.0 waited two hours in that state: the three other platforms
+          # finished, and the job that makes the release waits for all four, so
+          # no release appeared.
+          #
+          # A Mac with Apple silicon builds for Intel with no extra tool. The
+          # compiler of Apple takes `-arch x86_64`, and the crate `cc`, which
+          # compiles DuckDB, passes it from the target of cargo.
+          - os: macos-latest
             target: x86_64-apple-darwin
             archive: tar.gz
           - os: macos-latest
