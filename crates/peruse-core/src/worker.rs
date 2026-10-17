@@ -14,8 +14,8 @@
 use anyhow::Result;
 use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
 use duckdb::InterruptHandle;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -150,6 +150,27 @@ impl Request {
             Request::Shutdown => 10,
         }
     }
+
+    /// Gives the names of the parts of the screen that wait for the answer.
+    /// A request that a cancel does not stop gives no name.
+    ///
+    /// Each name is the context of an error that a stopped request gives. A
+    /// new view waits for its rows and for its count. The metadata and a
+    /// change of the settings are short work, and the user did not ask to
+    /// lose them, so a cancel lets them run.
+    fn cancel_contexts(&self) -> &'static [&'static str] {
+        match self {
+            Request::SetView { .. } => &["rows", "count"],
+            Request::Page { .. } => &["rows"],
+            Request::Stats { .. } => &["column stats"],
+            Request::Band { .. } => &["column band"],
+            Request::Cell { .. } => &["cell"],
+            Request::RowJson { .. } => &["record"],
+            Request::Search { .. } => &["search"],
+            Request::Index { .. } => &["indexing"],
+            Request::Meta { .. } | Request::Configure { .. } | Request::Shutdown => &[],
+        }
+    }
 }
 
 /// An answer from the worker thread. Each answer carries the epoch of its
@@ -194,6 +215,36 @@ pub enum Response {
 /// system stops the thread with the process.
 const SHUTDOWN_WAIT: Duration = Duration::from_secs(2);
 
+/// The longest time that a cancel sends its interrupt again.
+///
+/// A statement that DuckDB cannot interrupt keeps the batch alive. The cancel
+/// then stops after this time, and the user can press Esc again.
+const CANCEL_WAIT: Duration = Duration::from_secs(10);
+
+/// What a cancel and the engine thread share.
+///
+/// DuckDB forgets an interrupt at the start of each statement. One interrupt
+/// therefore stops nothing when it arrives between two statements, and it
+/// stops one request only when the batch holds more. A cancel therefore
+/// counts itself here, and the engine thread does not start a request of a
+/// batch that began before the cancel.
+#[derive(Default)]
+struct Cancel {
+    /// The number of cancels so far.
+    asked: AtomicU64,
+    /// The value of `asked` at the start of the batch that runs now, and
+    /// `None` while the engine thread waits. A cancel sends its interrupt
+    /// with this lock held, so an interrupt can never reach a later batch.
+    batch: Mutex<Option<u64>>,
+}
+
+impl Cancel {
+    fn batch(&self) -> std::sync::MutexGuard<'_, Option<u64>> {
+        // A panic with the lock held leaves a value that is still correct.
+        self.batch.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
 /// What the caller learns when the file opens, before Peruse draws a frame.
 #[derive(Clone, Debug)]
 pub struct Opened {
@@ -216,6 +267,7 @@ pub struct Worker {
     /// `true` after the caller drops the worker. The engine thread then does
     /// no more requests.
     stop: Arc<AtomicBool>,
+    cancel: Arc<Cancel>,
     handle: Option<thread::JoinHandle<()>>,
 }
 
@@ -234,6 +286,8 @@ impl Worker {
         let input = input.to_string();
         let stop = Arc::new(AtomicBool::new(false));
         let stop_flag = Arc::clone(&stop);
+        let cancel = Arc::new(Cancel::default());
+        let cancel_flag = Arc::clone(&cancel);
         let handle = thread::Builder::new()
             .name("peruse-engine".into())
             .spawn(move || {
@@ -256,7 +310,7 @@ impl Worker {
                 if ready_tx.send(Ok((opened, engine.interrupt_handle()))).is_err() {
                     return;
                 }
-                run(&mut engine, &req_rx, &resp_tx, &stop_flag);
+                run(&mut engine, &req_rx, &resp_tx, &stop_flag, &cancel_flag);
             })?;
 
         let (opened, interrupt) = ready_rx.recv()??;
@@ -266,6 +320,7 @@ impl Worker {
                 rx: resp_rx,
                 interrupt,
                 stop,
+                cancel,
                 handle: Some(handle),
             },
             opened,
@@ -284,12 +339,34 @@ impl Worker {
         &self.rx
     }
 
-    /// Stops the query that runs now.
+    /// Stops the work that runs now: the statement that runs, the other
+    /// statements of its request, and each request behind it in the batch.
     ///
-    /// The request that stops gives an error, and the user interface shows a
-    /// message about the cancellation.
+    /// Each request that stops gives an error, and the user interface shows a
+    /// message about the cancellation. A request that the caller sends after
+    /// the cancel runs as usual.
+    ///
+    /// The function does not wait. A short thread sends the interrupt again
+    /// until the batch ends, because DuckDB forgets an interrupt at the start
+    /// of each statement.
     pub fn cancel(&self) {
-        self.interrupt.interrupt();
+        let target = self.cancel.asked.fetch_add(1, Ordering::SeqCst) + 1;
+        let cancel = Arc::clone(&self.cancel);
+        let interrupt = Arc::clone(&self.interrupt);
+        let _ = thread::Builder::new().name("peruse-cancel".into()).spawn(move || {
+            let deadline = Instant::now() + CANCEL_WAIT;
+            while Instant::now() < deadline {
+                {
+                    let batch = cancel.batch();
+                    match *batch {
+                        Some(start) if start < target => interrupt.interrupt(),
+                        // The batch ended, or it started after the cancel.
+                        _ => return,
+                    }
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+        });
     }
 }
 
@@ -345,7 +422,13 @@ fn coalesce(mut batch: Vec<Request>) -> Vec<Request> {
 }
 
 /// The main loop of the worker thread.
-fn run(engine: &mut Engine, rx: &Receiver<Request>, tx: &Sender<Response>, stop: &AtomicBool) {
+fn run(
+    engine: &mut Engine,
+    rx: &Receiver<Request>,
+    tx: &Sender<Response>,
+    stop: &AtomicBool,
+    cancel: &Cancel,
+) {
     loop {
         // Wait for the first request, then take each request behind it. A key
         // that the user holds down therefore does not build a long queue.
@@ -362,11 +445,33 @@ fn run(engine: &mut Engine, rx: &Receiver<Request>, tx: &Sender<Response>, stop:
         if tx.send(Response::Busy(true)).is_err() {
             return;
         }
+        let start = {
+            let mut b = cancel.batch();
+            let start = cancel.asked.load(Ordering::SeqCst);
+            *b = Some(start);
+            start
+        };
         for req in batch {
-            if stop.load(Ordering::SeqCst) || handle(engine, req, tx).is_err() {
+            if stop.load(Ordering::SeqCst) {
+                return;
+            }
+            // The user cancelled this batch. Each request that reads the data
+            // gives an error, so the part of the screen that waits for it does
+            // not wait for ever.
+            let contexts = req.cancel_contexts();
+            if cancel.asked.load(Ordering::SeqCst) != start && !contexts.is_empty() {
+                for context in contexts {
+                    if fail(tx, req.epoch(), context, "cancelled").is_err() {
+                        return;
+                    }
+                }
+                continue;
+            }
+            if handle(engine, req, tx).is_err() {
                 return;
             }
         }
+        *cancel.batch() = None;
         if tx.send(Response::Busy(false)).is_err() {
             return;
         }
@@ -679,6 +784,74 @@ mod tests {
             done_rx.recv_timeout(std::time::Duration::from_secs(8)).is_ok(),
             "the end of the worker waited for the slow requests"
         );
+    }
+
+    #[test]
+    fn one_cancel_stops_each_slow_request_of_the_batch() {
+        // The user opens a panel on a large file, and the worker gets a batch
+        // of slow requests. Before this test, Esc sent one interrupt. It
+        // stopped the statement that ran, and each request behind it then ran
+        // to the end, so the user had to press Esc once for each request. An
+        // interrupt between two statements of one request stopped nothing.
+        let dir = std::env::temp_dir().join("peruse-worker-cancel");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.csv");
+        std::fs::write(&path, "id\n1\n").unwrap();
+        let opts = OpenOptions { threads: Some(2), ..OpenOptions::default() };
+        let worker = Worker::spawn(path.to_str().unwrap(), opts).unwrap().0;
+
+        let slow = View {
+            base: Base::Sql(
+                "SELECT count(*) AS n FROM range(4000000000) t(i) WHERE hash(i) % 7 = 3".into(),
+            ),
+            ..View::default()
+        };
+        let n = Column::new("n", "BIGINT", false);
+        worker.send(Request::SetView { epoch: 1, view: slow.clone(), limit: 50 });
+        worker.send(Request::Stats { epoch: 1, view: slow.clone(), column: n.clone(), top_k: 0 });
+        worker.send(Request::Band { epoch: 1, view: slow.clone(), columns: vec![n], values: true });
+        let wait = std::time::Duration::from_secs(30);
+        loop {
+            match worker.responses().recv_timeout(wait) {
+                Ok(Response::Busy(true)) => break,
+                Ok(_) => {}
+                Err(e) => panic!("the worker did not start: {e}"),
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(300));
+
+        worker.cancel();
+        let t0 = std::time::Instant::now();
+        let mut stopped = Vec::new();
+        loop {
+            match worker.responses().recv_timeout(std::time::Duration::from_secs(8)) {
+                Ok(Response::Busy(false)) => break,
+                Ok(Response::Error { context, .. }) => stopped.push(context),
+                Ok(_) => {}
+                Err(_) => panic!("one cancel did not stop the batch; stopped so far: {stopped:?}"),
+            }
+        }
+        assert!(t0.elapsed() < std::time::Duration::from_secs(5), "{:?}", t0.elapsed());
+        assert!(stopped.iter().any(|c| c == "column stats"), "{stopped:?}");
+        assert!(stopped.iter().any(|c| c == "column band"), "{stopped:?}");
+
+        // A request after the cancel runs as usual.
+        let quick = View { base: Base::Sql("SELECT 42 AS n".into()), ..View::default() };
+        worker.send(Request::SetView { epoch: 2, view: quick, limit: 50 });
+        loop {
+            match worker.responses().recv_timeout(wait) {
+                Ok(Response::Count { epoch: 2, total }) => {
+                    assert_eq!(total, 1);
+                    break;
+                }
+                Ok(Response::Error { context, message, .. }) => {
+                    panic!("a request after the cancel failed: {context}: {message}")
+                }
+                Ok(_) => {}
+                Err(e) => panic!("no count after the cancel: {e}"),
+            }
+        }
     }
 
     #[test]

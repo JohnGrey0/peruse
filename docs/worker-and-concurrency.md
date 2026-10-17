@@ -145,6 +145,22 @@ command `Cancel`, and that command calls `Worker::cancel` when the worker is
 busy. The request that stops gives an error, and the user interface shows a
 message about the cancellation.
 
+One interrupt is not sufficient. DuckDB forgets an interrupt at the start of
+each statement, so an interrupt between two statements of one request stops
+nothing. One interrupt also stops one statement only, and the batch can hold
+more requests behind it, each one a full scan. The cancel therefore does two
+things:
+
+- It adds one to a counter. The thread keeps the value of the counter at the
+  start of each batch, and it does not start a request of a batch that began
+  before the cancel. Each such request gives the error `cancelled`, so the
+  part of the screen that waits for it does not wait for ever. The metadata
+  and a change of the settings are short, and they still run.
+- A short thread sends the interrupt again every 5 milliseconds until the
+  batch ends, for 10 seconds at the most. It holds the lock of the batch while
+  it sends, so an interrupt never reaches a request that the user sent after
+  the cancel.
+
 The search also uses this rule. The first search request examines 250,000 rows
 at the most, and each request after it examines two times the rows of the one
 before, up to 4 million. The worker therefore answers quickly at the start, and
