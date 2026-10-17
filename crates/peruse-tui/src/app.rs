@@ -1854,6 +1854,14 @@ impl App {
             // The code above handles these two, before the test of the epoch.
             Response::Indexed { .. } | Response::Meta { .. } => {}
             Response::Error { context, message, .. } => {
+                // A view that failed before its first page gives the grid
+                // nothing to draw, and the grid would show a screen of points
+                // under the bad filter until the user found the key `u`. That
+                // view is a typing mistake more often than not, so the view
+                // before it comes back, and the message stays. The prompt
+                // keeps the bad text in its history for a correction.
+                let failed_view = matches!(context.as_str(), "query" | "filter" | "schema" | "rows")
+                    && self.page.ncols == 0;
                 // A request that failed must not leave its part of the screen
                 // waiting for ever. Each of these two parts asks one time and
                 // then waits for the answer, so a failure has to say that no
@@ -1882,8 +1890,33 @@ impl App {
                     _ => {}
                 }
                 self.report_error(&context, &message);
+                if failed_view
+                    && self.go_back_after_failure()
+                    && let Some(s) = self.status.as_mut()
+                {
+                    s.text.push_str(" — the view before it is back");
+                }
             }
         }
+        true
+    }
+
+    /// Puts back the view from the time before a view that failed, and gives
+    /// `true` when there was one.
+    ///
+    /// The view that failed does not go into the history. It gave no rows, so
+    /// the key `u` must not go back to it.
+    fn go_back_after_failure(&mut self) -> bool {
+        let Some(step) = self.history.pop() else {
+            return false;
+        };
+        self.view = step.view;
+        self.fset = step.fset;
+        self.restoring = true;
+        self.reload(true);
+        self.restoring = false;
+        // `reload` put the view that failed into the history. Remove it.
+        self.history.pop();
         true
     }
 
@@ -3114,7 +3147,9 @@ impl App {
 
     /// Gives the text in the cell under the cursor, from the current page.
     fn current_cell_text(&self) -> Option<String> {
-        let r = self.cursor_row.checked_sub(self.page.offset)? as usize;
+        // A row outside the page is no cell. An empty view has no row at all,
+        // and `y` there copied the word NULL.
+        let r = self.page_row()?;
         Some(self.page.cell(r, self.cursor_col).unwrap_or("NULL").to_string())
     }
 
@@ -4496,6 +4531,11 @@ impl App {
             }
             Cmd::Record => self.open_record(),
             Cmd::InspectCell => {
+                // An empty view has no cell to show.
+                if self.is_empty() {
+                    self.error("no rows here");
+                    return;
+                }
                 let Some(col) = self.schema.columns.get(self.cursor_col) else {
                     return;
                 };

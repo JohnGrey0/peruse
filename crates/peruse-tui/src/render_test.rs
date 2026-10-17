@@ -3390,3 +3390,52 @@ fn esc_stops_a_search_between_two_parts() {
     });
     assert_eq!(app.cursor_row, 0, "a search that Esc stopped moved the cursor");
 }
+
+#[test]
+fn a_filter_that_fails_gives_back_the_rows_of_the_view_before_it() {
+    use ratatui::crossterm::event::KeyCode;
+    let p = write_sample("bad-filter-back", SAMPLE, "csv");
+    let (mut app, mut term) = open(&p);
+    settle(&mut app, &mut term);
+    app.run(Cmd::SortCycle);
+    settle(&mut app, &mut term);
+
+    // The prompt checks the safety of the text, and only DuckDB knows the
+    // columns, so this filter fails in the engine.
+    press_char(&mut app, 'E');
+    type_text(&mut app, "no_such_column > 1");
+    press(&mut app, KeyCode::Enter);
+    settle(&mut app, &mut term);
+    let s = screen(&term);
+    assert!(s.contains("alice") && s.contains("dave"), "the grid lost its rows\n{s}");
+    assert!(s.contains("no_such_column"), "the message is gone\n{s}");
+    assert!(s.contains("5 × 4"), "{s}");
+    assert_eq!(app.view.filter, None);
+    assert_eq!(app.view.sort.len(), 1, "the sort of the view before was lost");
+
+    // The key u goes back past the view that failed, to the view before the
+    // sort.
+    press_char(&mut app, 'u');
+    assert!(app.view.sort.is_empty());
+
+    // The text is in the history of the prompt, for a correction.
+    press_char(&mut app, 'E');
+    press(&mut app, KeyCode::Up);
+    assert_eq!(app.input.text(), "no_such_column > 1");
+}
+
+#[test]
+fn an_empty_view_has_no_cell_to_copy_or_to_show() {
+    let p = write_sample("empty-cell", SAMPLE, "csv");
+    let (mut app, mut term) = open(&p);
+    settle(&mut app, &mut term);
+    app.view.filter = Some("id > 100".into());
+    app.run_startup_view();
+    settle(&mut app, &mut term);
+    assert!(app.is_empty());
+    app.run(Cmd::CopyCell);
+    let msg = app.status.as_ref().map(|s| s.text.clone()).unwrap_or_default();
+    assert!(!msg.contains("copied"), "y copied a cell of an empty view: {msg}");
+    app.run(Cmd::InspectCell);
+    assert_eq!(app.mode, Mode::Normal, "Enter opened a cell of an empty view");
+}
