@@ -3029,3 +3029,55 @@ fn a_local_copy_says_so_in_the_title_and_names_the_source_in_the_panel() {
     drop(app);
     drop(copy);
 }
+
+#[test]
+fn the_local_copies_clear_at_the_second_request_only() {
+    use peruse_core::cache::{plan, usage, Plan, Policy, Settings};
+    let src = write_sample("clear-copies", SAMPLE, "csv");
+    let cache = src.parent().unwrap().join("cache");
+    let _ = std::fs::remove_dir_all(&cache);
+    let (mut app, _term) = open(&src);
+
+    // With no copy, the command says so, and it asks nothing.
+    app.clear_copies_in(&cache);
+    let text = app.status.as_ref().map(|s| s.text.clone()).unwrap_or_default();
+    assert!(text.contains("no local copies"), "{text}");
+    assert!(app.clear_asked.is_none());
+
+    let settings = Settings {
+        policy: Policy::Always,
+        min_bytes: 0,
+        max_bytes: 1 << 30,
+        dir: Some(cache.clone()),
+    };
+    let probe = peruse_core::remote::System;
+    let Plan::Copy(job) = plan(src.to_str().unwrap(), &settings, &probe) else {
+        panic!("the policy always makes a copy");
+    };
+    let cancel = std::sync::atomic::AtomicBool::new(false);
+    drop(job.run(&mut |_| {}, &cancel, &probe).unwrap());
+    assert_eq!(usage(&cache).0, 1);
+
+    // The first request says what goes, and removes nothing.
+    app.clear_copies_in(&cache);
+    let text = app.status.as_ref().map(|s| s.text.clone()).unwrap_or_default();
+    assert!(text.contains("1 local copy") && text.contains("again"), "{text}");
+    assert_eq!(usage(&cache).0, 1, "one request removes nothing");
+
+    // The second request removes the copy.
+    app.clear_copies_in(&cache);
+    let text = app.status.as_ref().map(|s| s.text.clone()).unwrap_or_default();
+    assert!(text.starts_with("removed 1 local copy"), "{text}");
+    assert_eq!(usage(&cache), (0, 0));
+    assert_eq!(app.copies_usage, Some((0, 0)), "the settings page sees the change");
+
+    // A second request after the time for it starts again from the question.
+    let Plan::Copy(job) = plan(src.to_str().unwrap(), &settings, &probe) else {
+        panic!("the copy went, so a new copy is due");
+    };
+    drop(job.run(&mut |_| {}, &cancel, &probe).unwrap());
+    app.clear_asked = Some(std::time::Instant::now() - std::time::Duration::from_secs(60));
+    app.clear_copies_in(&cache);
+    assert_eq!(usage(&cache).0, 1, "a late second request asks again");
+    let _ = std::fs::remove_dir_all(&cache);
+}

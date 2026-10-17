@@ -312,7 +312,14 @@ fn main() -> Result<()> {
     // A database holds many tables, and the grid shows one of them. The user
     // chooses it here, in front of the grid, in the same way as the chooser
     // chooses a file.
-    match pick_table(read, cli.query.is_some(), &opts, &theme)? {
+    // The picker reads the tables of the copy. A message about it names the
+    // source, as each other message does.
+    let picked = pick_table(read, cli.query.is_some(), &opts, &theme)
+        .map_err(|e| match &local {
+            Some(c) => c.rewrite().apply_error(&e),
+            None => e,
+        });
+    match picked? {
         Picked::Table(name) => opts.table = Some(name),
         Picked::NoChoice => {}
         // The user left the picker without a table.

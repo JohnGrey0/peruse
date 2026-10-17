@@ -79,12 +79,18 @@ pub struct Config {
     /// The value `auto` copies a file from a network drive when it is at
     /// least [`Config::local_copy_min_mb`] large. The value `always` copies
     /// each file, also from a local disk. Refer to [`crate::cache`].
+    ///
+    /// The file also accepts the name `remote_cache`, and the same for the
+    /// two limits below. Peruse writes the names `local_copy`.
+    #[serde(alias = "remote_cache")]
     pub local_copy: Option<String>,
     /// The size in whole megabytes below which `auto` reads a file from a
     /// network drive in place.
+    #[serde(alias = "remote_cache_min_mb")]
     pub local_copy_min_mb: Option<u64>,
     /// The space in whole gigabytes that the local copies can take together.
     /// The copies that were used the least recently go first.
+    #[serde(alias = "remote_cache_max_gb")]
     pub local_copy_max_gb: Option<u64>,
     /// The files that the user opened, the newest first.
     ///
@@ -656,6 +662,15 @@ mod tests {
         let c: Config = toml::from_str("local_copy = \"sometimes\"").unwrap();
         assert_eq!(c.local_copy_policy(), Policy::Auto);
         assert_eq!(Config::default().local_copy_policy(), Policy::Auto);
+        // The second name of each setting reads the same.
+        let c: Config = toml::from_str(
+            "remote_cache = \"always\"
+remote_cache_min_mb = 8
+remote_cache_max_gb = 2",
+        )
+        .unwrap();
+        assert_eq!(c.local_copy_policy(), Policy::Always);
+        assert_eq!((c.local_copy_min_mb, c.local_copy_max_gb), (Some(8), Some(2)));
     }
 
     #[test]

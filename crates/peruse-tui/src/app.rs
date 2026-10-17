@@ -77,6 +77,9 @@ const AUTO_INDEX_BYTES: u64 = 64 * 1024 * 1024;
 /// so the number of columns needs its own limit.
 const AUTO_INDEX_COLUMNS: usize = 256;
 
+/// The time in which a second request to clear the local copies clears them.
+const CLEAR_CONFIRM: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// The number of rows or columns that one step moves, when the settings file
 /// names no other number.
 ///
@@ -970,6 +973,13 @@ pub struct App {
     pub settings_sel: usize,
     /// `true` while the user types the value of a setting.
     pub settings_editing: bool,
+    /// The number of local copies and the bytes that they take, for the
+    /// settings page. The page reads the directory one time when it opens,
+    /// and not at each frame.
+    pub copies_usage: Option<(usize, u64)>,
+    /// The time of the first request to clear the local copies. A second
+    /// request soon after it clears them.
+    pub clear_asked: Option<std::time::Instant>,
     /// The values that DuckDB uses now, for the settings page.
     pub duck_threads: Option<String>,
     /// The memory limit that DuckDB uses now.
@@ -1103,6 +1113,8 @@ impl App {
             resources: Resources::read(),
             settings_sel: 0,
             settings_editing: false,
+            copies_usage: None,
+            clear_asked: None,
             duck_threads: None,
             duck_memory: None,
 
@@ -3338,6 +3350,11 @@ impl App {
 
     /// Removes the local copies of files from network drives.
     ///
+    /// The first request says what the command removes, and a second request
+    /// within some seconds removes it. A copy of a large file took a long
+    /// time over the network, and one key that the user pressed by mistake
+    /// must not throw it away.
+    ///
     /// A copy that a Peruse reads now stays, and that includes the copy of
     /// this session. The next open of a file from a network drive copies it
     /// again.
@@ -3346,17 +3363,44 @@ impl App {
             self.info("this system gives no directory for local copies");
             return;
         };
-        let c = peruse_core::cache::clear(&dir);
+        self.clear_copies_in(&dir);
+    }
+
+    /// Does the work of [`App::clear_copies`] on one directory.
+    pub(crate) fn clear_copies_in(&mut self, dir: &std::path::Path) {
+        use peruse_core::source::human_bytes;
+        let now = std::time::Instant::now();
+        let confirmed = self
+            .clear_asked
+            .take()
+            .is_some_and(|t| now.duration_since(t) <= CLEAR_CONFIRM);
+        if !confirmed {
+            let (n, bytes) = peruse_core::cache::usage(dir);
+            if n == 0 {
+                self.info("there are no local copies to clear");
+                return;
+            }
+            self.clear_asked = Some(now);
+            let key = commands::binding(Cmd::ClearCopies).map_or("C", |b| b.label);
+            self.info(format!(
+                "{n} local {}, {}. Press {key} again to clear them",
+                if n == 1 { "copy" } else { "copies" },
+                human_bytes(bytes)
+            ));
+            return;
+        }
+        let c = peruse_core::cache::clear(dir);
         let mut msg = format!(
             "removed {} local {}, {}",
             c.removed,
             if c.removed == 1 { "copy" } else { "copies" },
-            peruse_core::source::human_bytes(c.bytes)
+            human_bytes(c.bytes)
         );
         if c.kept > 0 {
             let verb = if c.kept == 1 { "stays" } else { "stay" };
             msg.push_str(&format!(". {} in use now {verb}", c.kept));
         }
+        self.copies_usage = Some(peruse_core::cache::usage(dir));
         self.ok(msg);
     }
 
@@ -3365,6 +3409,7 @@ impl App {
         self.settings_sel = 0;
         self.settings_editing = false;
         self.mode = Mode::Settings;
+        self.copies_usage = peruse_core::cache::copies_dir().map(|d| peruse_core::cache::usage(&d));
         // Ask DuckDB what it uses now. The page then shows the truth, and
         // not the wish of the user.
         self.worker.send(Request::Configure {

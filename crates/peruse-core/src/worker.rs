@@ -371,7 +371,7 @@ fn name_source(rw: &crate::cache::Rewrite, r: Response) -> Response {
         }
         Response::Error { epoch, context, message } => Response::Error {
             epoch,
-            context,
+            context: rw.apply(&context),
             message: rw.apply(&message),
         },
         other => other,

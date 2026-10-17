@@ -844,6 +844,9 @@ struct EntryInfo {
     key: String,
     bytes: u64,
     last_used: u64,
+    /// `true` when the entry holds a complete copy. A copy that the user
+    /// stopped leaves an entry with no manifest and no bytes.
+    complete: bool,
 }
 
 fn entries(root: &Path) -> Vec<EntryInfo> {
@@ -854,12 +857,14 @@ fn entries(root: &Path) -> Vec<EntryInfo> {
         .filter(|e| e.path().is_dir())
         .map(|e| {
             let dir = e.path();
+            let manifest = read_manifest(&dir);
             EntryInfo {
                 key: e.file_name().to_string_lossy().into_owned(),
                 // The copies take the space. A manifest and a lease take some
                 // bytes, and the limit is not about them.
                 bytes: dir_bytes(&dir.join(DATA)) + dir_bytes(&dir.join(TMP)),
-                last_used: read_manifest(&dir).map(|m| m.last_used).unwrap_or(0),
+                last_used: manifest.as_ref().map(|m| m.last_used).unwrap_or(0),
+                complete: manifest.is_some(),
                 dir,
             }
         })
@@ -932,7 +937,8 @@ fn in_use(dir: &Path) -> bool {
 /// What [`clear`] did.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Cleared {
-    /// The entries that it removed.
+    /// The copies that it removed. An empty entry that a stopped copy left
+    /// goes too, but it does not count.
     pub removed: usize,
     /// The bytes that it gave back to the disk.
     pub bytes: u64,
@@ -944,20 +950,28 @@ pub struct Cleared {
 pub fn clear(root: &Path) -> Cleared {
     let mut out = Cleared::default();
     for e in entries(root) {
+        let counts = e.complete || e.bytes > 0;
         if remove_entry(&e.dir) {
-            out.removed += 1;
+            out.removed += usize::from(counts);
             out.bytes += e.bytes;
-        } else {
+        } else if counts {
             out.kept += 1;
         }
     }
     out
 }
 
-/// Gives the number of entries and the bytes that the local copies take.
+/// Gives the number of complete copies and the bytes that the local copies
+/// take.
+///
+/// The function reads the directory of each entry, so a caller that draws
+/// frames calls it one time and keeps the answer.
 pub fn usage(root: &Path) -> (usize, u64) {
     let list = entries(root);
-    (list.len(), list.iter().map(|e| e.bytes).sum())
+    (
+        list.iter().filter(|e| e.complete).count(),
+        list.iter().map(|e| e.bytes).sum(),
+    )
 }
 
 /// A mark that a Peruse reads an entry now.
@@ -1257,11 +1271,16 @@ mod tests {
             .unwrap()
             .path();
         assert_eq!(dir_bytes(&entry), 0, "no part of the copy stays");
+        assert_eq!(usage(&cache), (0, 0), "an empty entry is not a copy");
         // The next session copies again, from the start.
         assert!(matches!(
             plan(f.to_str().unwrap(), &settings(&cache), &probe),
             Plan::Copy(_)
         ));
+        // The command that clears the copies removes the empty entry, and it
+        // does not count it as a copy.
+        assert_eq!(clear(&cache), Cleared::default());
+        assert_eq!(fs::read_dir(&cache).unwrap().count(), 0);
         let _ = fs::remove_dir_all(&base);
     }
 
