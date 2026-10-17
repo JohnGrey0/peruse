@@ -210,12 +210,21 @@ impl Browser {
             if name.starts_with('.') {
                 continue;
             }
-            self.entries.push(entry_of(&path, false));
+            // The entry of the directory holds the facts of the file already
+            // on Windows, so `DirEntry::metadata` costs no call to the system
+            // there. A call for each path costs one round trip for each file
+            // on a network share, and a directory can hold thousands of
+            // files. A link needs the facts of the file that it points to, so
+            // a link takes the slow way, which follows it.
+            let meta = match e.file_type() {
+                Ok(kind) if !kind.is_symlink() => e.metadata().ok(),
+                _ => std::fs::metadata(&path).ok(),
+            };
+            let mut entry = entry_with(&path, meta, false);
             // Keep the name that the directory gave. A path with characters
             // that are not valid gives a different name from `file_name`.
-            if let Some(last) = self.entries.last_mut() {
-                last.name = name;
-            }
+            entry.name = name;
+            self.entries.push(entry);
         }
         // The directories come first, and each group follows the alphabet.
         // A user looks for a directory by its name, and for a file by its
@@ -512,7 +521,11 @@ impl Browser {
 
 /// Reads what the screen shows about one path.
 fn entry_of(path: &Path, is_recent: bool) -> Entry {
-    let meta = std::fs::metadata(path).ok();
+    entry_with(path, std::fs::metadata(path).ok(), is_recent)
+}
+
+/// Makes the entry of one path from the facts that the caller read.
+fn entry_with(path: &Path, meta: Option<std::fs::Metadata>, is_recent: bool) -> Entry {
     Entry {
         name: path
             .file_name()
@@ -1239,6 +1252,39 @@ mod tests {
         assert_eq!(ago(now - std::time::Duration::from_secs(172800)), "2d ago");
         // A time in the future is not a fault that stops the program.
         assert_eq!(ago(now + std::time::Duration::from_secs(60)), "");
+    }
+
+    /// A tool for the developer. It prints the time that the two ways to read
+    /// the facts of each file need, in a directory of 5000 files.
+    ///
+    ///     cargo test -p peruse-tui time_to_read -- --ignored --nocapture
+    #[test]
+    #[ignore = "prints a time instead of asserting"]
+    fn time_to_read_a_directory_of_many_files() {
+        let d = std::env::temp_dir().join("peruse-browser-many");
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        for n in 0..5000 {
+            std::fs::write(d.join(format!("f{n:04}.csv")), b"a\n").unwrap();
+        }
+        let t = std::time::Instant::now();
+        for e in std::fs::read_dir(&d).unwrap().flatten() {
+            let _ = std::fs::metadata(e.path());
+        }
+        let by_path = t.elapsed();
+        let t = std::time::Instant::now();
+        for e in std::fs::read_dir(&d).unwrap().flatten() {
+            let _ = e.metadata();
+        }
+        let by_entry = t.elapsed();
+        let t = std::time::Instant::now();
+        let b = Browser::new(d, &Config::default());
+        let whole = t.elapsed();
+        println!(
+            "5000 files: metadata(path) {by_path:?}, DirEntry::metadata {by_entry:?}, \
+             Browser::new {whole:?} for {} entries",
+            b.items().len()
+        );
     }
 }
 
