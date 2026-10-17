@@ -82,8 +82,8 @@ The function `scrub` replaces these parts:
 
 | Part | Form | Replacement |
 |---|---|---|
-| A line comment | `-- …` to the end of the line | Nothing |
-| A block comment | `/* … */` | One space |
+| A line comment | `-- …` to a line feed or a carriage return | Nothing |
+| A block comment | `/* … */`, which can nest | One space |
 | A value | `'…'`, with `''` for one quotation mark | `''` |
 | An identifier | `"…"`, with `""` for one quotation mark | `id` |
 | A value with dollar signs | `$$ … $$` | `''` |
@@ -107,7 +107,7 @@ A statement must start with one of these words:
 
 The statement must hold none of these words, at any position:
 
-`INSERT`, `INTO`, `UPDATE`, `DELETE`, `DROP`, `CREATE`, `ALTER`, `REPLACE`,
+`INSERT`, `INTO`, `UPDATE`, `DELETE`, `DROP`, `CREATE`, `ALTER`,
 `TRUNCATE`, `ATTACH`, `DETACH`, `COPY`, `EXPORT`, `IMPORT`, `INSTALL`, `LOAD`,
 `VACUUM`, `CHECKPOINT`, `CALL`, `SET`, `RESET`, `PRAGMA`, `BEGIN`, `COMMIT`,
 `ROLLBACK`, `TRANSACTION`, `PREPARE`, `EXECUTE`, `DEALLOCATE`, `GRANT`,

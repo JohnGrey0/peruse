@@ -94,7 +94,6 @@ const FORBIDDEN_ANYWHERE: &[&str] = &[
     "DROP",
     "CREATE",
     "ALTER",
-    "REPLACE",
     "TRUNCATE",
     "ATTACH",
     "DETACH",
@@ -139,23 +138,38 @@ fn scrub(sql: &str) -> Result<(String, bool), GuardError> {
     while i < b.len() {
         let c = b[i];
         // A comment that starts with -- and ends at the end of the line.
+        // DuckDB ends the comment at a carriage return as well as at a line
+        // feed, so the guard must end it at both. A guard that ended it at the
+        // line feed alone would read `-- x\r; DROP TABLE t` as one comment,
+        // but DuckDB would read a second statement after the carriage return.
         if c == '-' && i + 1 < b.len() && b[i + 1] == '-' {
-            while i < b.len() && b[i] != '\n' {
+            while i < b.len() && b[i] != '\n' && b[i] != '\r' {
                 i += 1;
             }
             continue;
         }
-        // A comment between /* and */. DuckDB does not put one of these
-        // comments inside another one.
+        // A comment between /* and */. DuckDB nests these comments, so the
+        // guard counts the depth. A guard that stopped at the first */ would
+        // read `/* /* */ ... */` as a comment and then the text, but DuckDB
+        // reads the whole span as one comment, and a keyword inside it would
+        // then be hidden from one of the two and not the other.
         if c == '/' && i + 1 < b.len() && b[i + 1] == '*' {
             i += 2;
-            while i + 1 < b.len() && !(b[i] == '*' && b[i + 1] == '/') {
-                i += 1;
+            let mut depth = 1;
+            while i + 1 < b.len() && depth > 0 {
+                if b[i] == '/' && b[i + 1] == '*' {
+                    depth += 1;
+                    i += 2;
+                } else if b[i] == '*' && b[i + 1] == '/' {
+                    depth -= 1;
+                    i += 2;
+                } else {
+                    i += 1;
+                }
             }
-            if i + 1 >= b.len() {
+            if depth > 0 {
                 return Err(GuardError::UnterminatedLiteral);
             }
-            i += 2;
             out.push(' ');
             continue;
         }
@@ -387,6 +401,62 @@ mod tests {
     #[test]
     fn comments_cannot_hide_a_statement_break() {
         assert!(ensure_read_only("SELECT 1 -- ; DROP TABLE src").is_ok());
+    }
+
+    #[test]
+    fn a_carriage_return_ends_a_line_comment() {
+        // DuckDB ends a line comment at a carriage return as well as at a line
+        // feed. A guard that ended it at the line feed alone would read the
+        // part after `\r` as a comment, but DuckDB reads a second statement
+        // there. An end-to-end test of this hole wrote a file with COPY.
+        assert_eq!(
+            ensure_read_only("SELECT 1 -- x\r; DROP TABLE t"),
+            Err(GuardError::MultipleStatements)
+        );
+        assert_eq!(
+            ensure_read_only("SELECT 1 -- x\r\n; COPY src TO 'out.csv'"),
+            Err(GuardError::MultipleStatements)
+        );
+        // A line comment with no break after the carriage return is still one
+        // query. The carriage return only ends the comment.
+        assert!(ensure_read_only("SELECT 1 -- note\r").is_ok());
+    }
+
+    #[test]
+    fn a_nested_block_comment_hides_nothing() {
+        // DuckDB nests block comments, so `/* /* */ ... */` is one comment.
+        // A guard that stopped at the first `*/` would read the keyword after
+        // it as code for itself but not for DuckDB, or the other way round.
+        assert!(ensure_read_only("SELECT 1 /* a /* b */ c */ FROM src").is_ok());
+        assert_eq!(
+            ensure_read_only("SELECT 1 /* /* */ ' */ ; DROP TABLE t --'"),
+            Err(GuardError::MultipleStatements)
+        );
+        // A nested comment that never closes is refused, not read as code.
+        assert_eq!(
+            ensure_read_only("SELECT 1 /* /* */ FROM src"),
+            Err(GuardError::UnterminatedLiteral)
+        );
+    }
+
+    #[test]
+    fn the_replace_function_is_not_a_write() {
+        // `replace()` is a common text function, and `SELECT * REPLACE (...)`
+        // is a DuckDB projection. Neither writes. DuckDB has no bare REPLACE
+        // statement (REPLACE INTO is MySQL only), and a write through REPLACE
+        // always carries CREATE or INSERT, which the guard still refuses.
+        assert!(ensure_read_only("SELECT replace(name, 'a', 'b') FROM src").is_ok());
+        assert!(ensure_read_only("SELECT * REPLACE (lower(name) AS name) FROM src").is_ok());
+        // A write that uses REPLACE always starts with CREATE or INSERT, and
+        // the guard still refuses each of those as the first word.
+        assert_eq!(
+            ensure_read_only("CREATE OR REPLACE TABLE t AS SELECT 1"),
+            Err(GuardError::NotAQuery("CREATE".into()))
+        );
+        assert_eq!(
+            ensure_read_only("INSERT OR REPLACE INTO t VALUES (1)"),
+            Err(GuardError::NotAQuery("INSERT".into()))
+        );
     }
 
     #[test]
