@@ -19,7 +19,7 @@ file on the disk. The function `configure` then sends these settings:
 | `threads` | The option `--threads`, or one thread for each core | It controls the parallel work. |
 | `enable_progress_bar` | `false` | A progress bar would write to the terminal and break the frame. |
 | `preserve_insertion_order` | `true` | The rows must always come back in the order of the file. |
-| `temp_directory` | The temporary directory of the system, plus `peruse`, plus a name for each engine | DuckDB writes here when the data does not fit in memory. Two engines must never share it, because DuckDB gives the same names to the files of each engine. |
+| `temp_directory` | The temporary directory of the system, plus `peruse`, plus a name for each engine | DuckDB writes here when the data does not fit in memory. Two engines must never share it, because DuckDB gives the same names to the files of each engine. A process that stops before the engine closes leaves its directory, so the first engine of each process removes the directory of each process that is not alive. |
 | `memory_limit` | The option `--memory-limit`, or the setting `memory_limit`, or one half of the memory of the machine, and three tenths of a machine of 8 GB or less | It limits the memory before DuckDB writes to the disk. |
 | `parquet_metadata_cache` | `true` | DuckDB then reads the footer of a Parquet file one time and keeps the result. |
 

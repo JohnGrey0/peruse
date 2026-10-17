@@ -1759,15 +1759,60 @@ fn configure(conn: &Connection, opts: &OpenOptions) -> Result<()> {
 /// `peruse` in the temporary directory of the system. DuckDB makes that
 /// directory only when a query writes to the disk, and it deletes it when the
 /// engine closes. Peruse makes the parent, because DuckDB makes one level only.
+///
+/// A process that stops before the engine closes leaves its directory, with
+/// each block in it. A kill during a large sort can leave some gigabytes. The
+/// first engine of each process therefore removes each directory of a process
+/// that is not alive. Refer to [`remove_dirs_of_ended_engines`].
 fn temp_dir_for_engine() -> PathBuf {
     use std::sync::atomic::{AtomicU64, Ordering};
     static NEXT: AtomicU64 = AtomicU64::new(0);
+    static CLEAN: std::sync::Once = std::sync::Once::new();
     let parent = std::env::temp_dir().join("peruse");
     // A parent that Peruse cannot make is not a reason to stop. DuckDB then
     // gives its own message when a query needs the disk.
     let _ = std::fs::create_dir_all(&parent);
+    CLEAN.call_once(|| remove_dirs_of_ended_engines(&parent, std::process::id(), process_alive));
     let n = NEXT.fetch_add(1, Ordering::Relaxed);
     parent.join(format!("{}-{n}", std::process::id()))
+}
+
+/// Removes each directory `<pid>-<n>` below `parent` that no live engine uses.
+///
+/// The function runs before the first engine of this process gets its
+/// directory, so a directory with the number `me` is from an earlier process
+/// that had the same number. A directory of a live process stays: its engine
+/// can need each block in it. A name of another form is not a directory of
+/// Peruse, and it stays.
+fn remove_dirs_of_ended_engines(parent: &Path, me: u32, alive: impl Fn(u32) -> bool) {
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some((pid, n)) = name.to_str().and_then(|s| s.split_once('-')) else {
+            continue;
+        };
+        let (Ok(pid), Ok(_)) = (pid.parse::<u32>(), n.parse::<u64>()) else {
+            continue;
+        };
+        if (pid == me || !alive(pid)) && entry.path().is_dir() {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
+/// Gives `true` when a process with the number `pid` runs now.
+fn process_alive(pid: u32) -> bool {
+    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
+    let pid = Pid::from_u32(pid);
+    let mut sys = System::new();
+    sys.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&[pid]),
+        true,
+        ProcessRefreshKind::nothing(),
+    );
+    sys.process(pid).is_some()
 }
 
 /// Expands a glob pattern, or accepts a path to one file.
@@ -3276,6 +3321,28 @@ mod tests {
         let glob = format!("{}/*.ndjson.gz", db_path(&d));
         let err = Engine::open(&glob, &OpenOptions::default()).err().expect("the deep set opened");
         assert!(err.to_string().contains("deep.ndjson.gz"), "{err}");
+    }
+
+    #[test]
+    fn the_blocks_of_a_process_that_stopped_are_removed() {
+        // A kill during a large sort left 1.5 GB below the temporary
+        // directory, and nothing removed it.
+        let d = tmpdir("temp-left");
+        for name in ["100-0", "100-1", "200-0", "300-2", "notes", "7-x"] {
+            std::fs::create_dir_all(d.join(name)).unwrap();
+            std::fs::write(d.join(name).join("duckdb_temp_storage_S256K-0.tmp"), "b").unwrap();
+        }
+        std::fs::write(d.join("400-0"), "a file and not a directory").unwrap();
+        // The process 200 is alive. This process is 300.
+        remove_dirs_of_ended_engines(&d, 300, |pid| pid == 200);
+        let mut left: Vec<String> = std::fs::read_dir(&d)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(left, ["200-0", "400-0", "7-x", "notes"]);
+
+        assert!(process_alive(std::process::id()), "this process is alive");
     }
 
     #[test]
