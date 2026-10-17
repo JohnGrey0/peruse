@@ -2978,6 +2978,15 @@ fn the_mouse_does_not_stop_the_program_on_a_small_terminal() {
 
 // ------------------------------------------------ the state of the grid
 
+/// A file of one column of numbers, with `n` rows.
+fn numbers(n: usize) -> String {
+    let mut s = String::from("id\n");
+    for i in 1..=n {
+        s.push_str(&format!("{i}\n"));
+    }
+    s
+}
+
 #[test]
 fn shift_tab_moves_the_cursor_to_the_previous_column() {
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -3044,4 +3053,61 @@ fn a_pasted_statement_stays_in_the_prompt_and_never_reaches_the_grid() {
     app.run(Cmd::Filter);
     app.on_paste("1; DROP TABLE x");
     assert!(app.prompt_error.is_some(), "a pasted text was not checked");
+}
+
+#[test]
+fn hiding_a_column_moves_the_cursor_to_the_column_that_takes_its_place() {
+    let p = write_sample("hide-next", &wide_sample(), "csv");
+    let (mut app, mut term) = open(&p);
+    settle(&mut app, &mut term);
+    app.run(Cmd::ColRight);
+    app.run(Cmd::ColRight);
+    // Three presses hide three columns that are side by side.
+    for _ in 0..3 {
+        app.run(Cmd::HideColumn);
+    }
+    assert_eq!(app.cursor_col, 5, "the cursor left the place of the hidden columns");
+    assert_eq!(
+        (0..60).filter(|i| app.hidden[*i]).collect::<Vec<_>>(),
+        vec![2, 3, 4]
+    );
+    // The last column has no column to its right, so the cursor goes left.
+    app.run(Cmd::ColLast);
+    app.run(Cmd::HideColumn);
+    assert_eq!(app.cursor_col, 58);
+}
+
+#[test]
+fn the_cursor_stays_on_the_screen_when_the_grid_loses_rows() {
+    let p = write_sample("follow-shrink", &numbers(200), "csv");
+    let (mut app, mut term) = open(&p);
+    settle(&mut app, &mut term);
+    // Move the cursor to the last row on the screen.
+    let rows = app.viewport_rows as i64;
+    for _ in 0..rows - 1 {
+        app.run(Cmd::RowDown);
+    }
+    assert_eq!(app.top_row, 0);
+    // The detailed band takes four rows of the grid.
+    app.run(Cmd::CycleBand);
+    app.run(Cmd::CycleBand);
+    settle(&mut app, &mut term);
+    assert!(
+        app.cursor_row < app.top_row + app.viewport_rows as u64,
+        "the cursor is on row {} and the screen shows {}..{}",
+        app.cursor_row,
+        app.top_row,
+        app.top_row + app.viewport_rows as u64
+    );
+    let at = (app.cursor_row + 1).to_string();
+    assert!(
+        lines(&term).iter().any(|l| l.trim_start().starts_with(&at)),
+        "the row of the cursor is not on the screen\n{}",
+        screen(&term)
+    );
+
+    // A terminal that gets smaller does the same.
+    let mut small = Terminal::new(TestBackend::new(110, 12)).unwrap();
+    settle(&mut app, &mut small);
+    assert!(app.cursor_row < app.top_row + app.viewport_rows as u64);
 }

@@ -158,6 +158,11 @@ pub fn draw(buf: &mut Buffer, area: Rect, app: &mut App, p: &Paint) {
         height: area.height - 1 - band,
     };
     app.viewport_rows = body.height as usize;
+    // The grid can lose rows with no movement of the cursor: the terminal
+    // gets smaller, the band or the prompt takes rows, or a panel opens under
+    // the grid. A cursor in the lost rows would then be off the screen until
+    // the next key that moves it.
+    app.follow_cursor();
     // Keep where the grid is on the screen. A click of the mouse arrives as a
     // row and a column of the terminal, and only the code that draws the grid
     // knows which cell is at that position.

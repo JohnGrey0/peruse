@@ -1275,7 +1275,7 @@ impl App {
     }
 
     /// Moves the viewport, if necessary, to keep the cursor on the screen.
-    fn follow_cursor(&mut self) {
+    pub(crate) fn follow_cursor(&mut self) {
         let vis = self.viewport_rows.max(1) as u64;
         if self.cursor_row < self.top_row {
             self.top_row = self.cursor_row;
@@ -4317,11 +4317,19 @@ impl App {
                     self.error("cannot hide the last visible column");
                     return;
                 }
-                self.hidden[self.cursor_col] = true;
+                let hid = self.cursor_col;
+                self.hidden[hid] = true;
+                // The cursor goes to the column that takes the place of the
+                // hidden one, as in a spreadsheet. A user who presses `x` three
+                // times then hides three columns that are side by side. Only
+                // the last column moves the cursor to the left.
                 let vis = self.visible_columns();
-                if !vis.contains(&self.cursor_col) {
-                    self.cursor_col = *vis.last().unwrap();
-                }
+                self.cursor_col = vis
+                    .iter()
+                    .copied()
+                    .find(|c| *c > hid)
+                    .or_else(|| vis.last().copied())
+                    .unwrap_or(0);
                 let name = self.schema.columns[self.cursor_col].name.clone();
                 self.ok(format!("hidden — X shows all again ({name} selected)"));
             }
