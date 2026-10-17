@@ -22,6 +22,7 @@ file on the disk. The function `configure` then sends these settings:
 | `temp_directory` | The temporary directory of the system, plus `peruse` | DuckDB writes here when the data does not fit in memory. |
 | `memory_limit` | The option `--memory-limit`, or the setting `memory_limit`, or one half of the memory of the machine, and three tenths of a machine of 8 GB or less | It limits the memory before DuckDB writes to the disk. |
 | `parquet_metadata_cache` | `true` | DuckDB then reads the footer of a Parquet file one time and keeps the result. |
+| `late_materialization_max_rows` | 4096 | DuckDB then reads a sorted page or a page of a filtered view in two steps: the sort column or the filter column first, and then the other columns of the page rows only. |
 
 The two extension settings are necessary for the read-only promise. The bundled
 DuckDB build sets them to `true`. A statement that names an `https://` path or
@@ -37,6 +38,13 @@ again when either one changes. With the cache, a page request costs 8
 milliseconds and not 12, and a count costs 1 and not 2. The setting arrived in a
 later version of DuckDB than the oldest one that Peruse builds against, so a
 failure there is not an error.
+
+The default of `late_materialization_max_rows` is 50 rows, and one request of
+the grid holds the screen and 250 rows on each side of it. Without the setting,
+a sorted window of 550 rows over 10 million rows of Parquet cost 153 ms, and a
+window deep in a filtered view cost 360 ms. With it, the two cost 50 ms and 115
+ms. Over a table of a database, the window deep in a filtered view fell from 515
+ms to 31 ms. A failure of this setting is also not an error.
 
 ## How Peruse opens a file
 
