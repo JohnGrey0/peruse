@@ -377,7 +377,14 @@ impl CopyJob {
         // A file that the source no longer holds must not stay. A glob over
         // the copies would find it.
         let keep: Vec<&str> = self.members.iter().map(|m| m.rec.rel.as_str()).collect();
-        remove_others(&data, &data, &keep);
+        if !remove_others(&data, &data, &keep) {
+            // Another Peruse holds the old file open. The entry gets no
+            // manifest, so no session reads it as a correct copy.
+            return Err(CopyError::Failed(format!(
+                "another Peruse reads an older copy of {} now. Peruse reads it in place.",
+                self.copy.origin
+            )));
+        }
         let _ = fs::remove_dir(&tmp);
 
         let manifest = Manifest {
@@ -458,6 +465,11 @@ fn copy_one(
         state.done += n as u64;
         progress(state);
     }
+    // The copy gets the time of the source. A copy that another Peruse
+    // holds open then shows which version of the source it is. See below.
+    if let Some(t) = system_time(m.rec.mtime_ns) {
+        let _ = dst.set_modified(t);
+    }
     drop(dst);
     drop(src);
 
@@ -475,15 +487,28 @@ fn copy_one(
     }
     if let Err(e) = fs::rename(part, dest) {
         let _ = fs::remove_file(part);
-        // A second Peruse that copied the same file at the same time can hold
-        // its copy open, and Windows then refuses the new name. Its copy is
-        // as good as this one when the size agrees.
-        let same = fs::metadata(dest).map(|d| d.len()).ok() == Some(m.rec.size);
-        if !same {
-            return Err(local_error(dest, e));
+        // Another Peruse can hold the old copy open, and Windows then refuses
+        // the new name. That copy is as good as this one only when it has the
+        // size and the time of this version of the source. A size alone is
+        // not enough: a source that changed can keep its size.
+        if stat(dest) != Some((m.rec.size, m.rec.mtime_ns)) {
+            return Err(CopyError::Failed(format!(
+                "another Peruse reads an older copy of {} now ({e}). Peruse reads it in place.",
+                remote.display()
+            )));
         }
     }
     Ok(())
+}
+
+/// Gives the time of a number of nanoseconds after 1970.
+fn system_time(ns: i64) -> Option<SystemTime> {
+    let d = Duration::from_nanos(ns.unsigned_abs());
+    if ns >= 0 {
+        UNIX_EPOCH.checked_add(d)
+    } else {
+        UNIX_EPOCH.checked_sub(d)
+    }
 }
 
 /// The age after which a part of a copy belongs to a Peruse that stopped.
@@ -513,25 +538,30 @@ fn remove_old_parts(tmp: &Path) {
 
 /// Removes each file below `dir` that is not in `keep`, and each directory
 /// that is then empty.
-fn remove_others(base: &Path, dir: &Path, keep: &[&str]) {
+///
+/// The function gives `false` when a file that must go stays, because a
+/// process holds it open.
+fn remove_others(base: &Path, dir: &Path, keep: &[&str]) -> bool {
     let Ok(list) = fs::read_dir(dir) else {
-        return;
+        return true;
     };
+    let mut all = true;
     for e in list.flatten() {
         let p = e.path();
         if p.is_dir() {
-            remove_others(base, &p, keep);
+            all &= remove_others(base, &p, keep);
             let _ = fs::remove_dir(&p);
         } else {
             let rel = p
                 .strip_prefix(base)
                 .map(|r| r.to_string_lossy().replace('\\', "/"))
                 .unwrap_or_default();
-            if !keep.contains(&rel.as_str()) {
-                let _ = fs::remove_file(&p);
+            if !keep.contains(&rel.as_str()) && fs::remove_file(&p).is_err() && p.exists() {
+                all = false;
             }
         }
     }
+    all
 }
 
 /// Gives the size and the time of the last change of a file.
@@ -1212,6 +1242,98 @@ mod tests {
             plan(input, &settings(&cache), &probe),
             Plan::Copy(_)
         ));
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// Another Peruse holds the old copy open, as DuckDB does, and Windows
+    /// refuses to put the new copy in its place. The source changed and kept
+    /// its size. The old copy must not pass for the new one.
+    #[cfg(windows)]
+    #[test]
+    fn an_old_copy_that_another_peruse_holds_never_passes_for_the_new_source() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let (base, share, cache) = setup("held");
+        let f = share.join("data.csv");
+        fs::write(&f, "id\n1\n").unwrap();
+        let probe = Fake::new(&share);
+        let input = f.to_str().unwrap();
+        let old = run(expect_copy(plan(input, &settings(&cache), &probe)), &probe);
+        let copy_path = PathBuf::from(&old.input);
+        drop(old);
+        // FILE_SHARE_READ and FILE_SHARE_WRITE, and no FILE_SHARE_DELETE.
+        let held = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(3)
+            .open(&copy_path)
+            .unwrap();
+
+        fs::write(&f, "id\n2\n").unwrap();
+        let t = SystemTime::now() + Duration::from_secs(5);
+        File::options()
+            .write(true)
+            .open(&f)
+            .unwrap()
+            .set_modified(t)
+            .unwrap();
+        let job = expect_copy(plan(input, &settings(&cache), &probe));
+        let cancel = AtomicBool::new(false);
+        match job.run(&mut |_| {}, &cancel, &probe) {
+            Err(CopyError::Failed(m)) => assert!(m.contains("older copy"), "{m}"),
+            other => panic!("the old copy passed for the new source: {other:?}"),
+        }
+        drop(held);
+        // With the old copy closed, the next session copies the new source.
+        let new = run(expect_copy(plan(input, &settings(&cache), &probe)), &probe);
+        assert_eq!(fs::read_to_string(&new.input).unwrap(), "id\n2\n");
+        drop(new);
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// A file left the source of a glob, and another Peruse holds its old
+    /// copy open. A glob over the copies would find that file, so the entry
+    /// must not get a manifest.
+    #[cfg(windows)]
+    #[test]
+    fn a_glob_whose_old_file_stays_open_is_read_in_place() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let (base, share, cache) = setup("glob-held");
+        let probe = Fake::new(&share);
+        fs::write(share.join("a.csv"), "id\n1\n").unwrap();
+        fs::write(share.join("b.csv"), "id\n2\n").unwrap();
+        let pattern = format!("{}/*.csv", share.to_string_lossy().replace('\\', "/"));
+        let local = run(expect_copy(plan(&pattern, &settings(&cache), &probe)), &probe);
+        let held = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(3)
+            .open(local.dir.join("a.csv"))
+            .unwrap();
+        drop(local);
+
+        fs::remove_file(share.join("a.csv")).unwrap();
+        let job = expect_copy(plan(&pattern, &settings(&cache), &probe));
+        let cancel = AtomicBool::new(false);
+        match job.run(&mut |_| {}, &cancel, &probe) {
+            Err(CopyError::Failed(m)) => assert!(m.contains("older copy"), "{m}"),
+            other => panic!("a stale file stayed in the copy: {other:?}"),
+        }
+        drop(held);
+        let local = run(expect_copy(plan(&pattern, &settings(&cache), &probe)), &probe);
+        assert!(!local.dir.join("a.csv").exists());
+        drop(local);
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_copy_has_the_time_of_its_source() {
+        let (base, share, cache) = setup("mtime");
+        let f = share.join("data.csv");
+        fs::write(&f, "id\n1\n").unwrap();
+        let probe = Fake::new(&share);
+        let local = run(
+            expect_copy(plan(f.to_str().unwrap(), &settings(&cache), &probe)),
+            &probe,
+        );
+        assert_eq!(stat(Path::new(&local.input)), stat(&f));
         let _ = fs::remove_dir_all(&base);
     }
 
