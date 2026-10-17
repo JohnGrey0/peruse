@@ -23,7 +23,7 @@ use duckdb::{Connection, InterruptHandle};
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::ddl::{ColumnProfile, TableProfile};
 use crate::meta::{ColumnFooterStats, CsvMeta, FileEntry, FileMeta, ParquetMeta};
@@ -35,6 +35,21 @@ use crate::stats::{CellKindWrapper, ColumnStats, Histogram};
 /// The name of the table in memory that holds an indexed CSV file. The
 /// function [`Engine::materialize`] makes this table.
 const MAT_TABLE: &str = "__peruse_indexed";
+
+/// The name of the table in memory that holds the position of each row of one
+/// sorted view, in the order of the view. Refer to [`Engine::sorted_window`].
+const SORT_TABLE: &str = "__peruse_sorted";
+
+/// A sorted request that ends after this row reads the view through
+/// [`SORT_TABLE`].
+///
+/// A sorted window deep in the view costs a sort of each column of each row:
+/// 550 rows at row 5,000,000 of 10 million rows of Parquet cost 1.2 s, and
+/// each later window costs the same. The table sorts the sort columns and the
+/// position only, one time, in 0.2 s, and each window from it costs 20 ms.
+/// Near the start of the view the sort keeps the first rows only, and it costs
+/// less than the table: 59 ms at row 10,000 and 119 ms at row 50,000.
+const SORT_TABLE_ROWS: u64 = 100_000;
 
 /// The name that Peruse gives to an attached database.
 ///
@@ -320,6 +335,9 @@ pub struct Engine {
     /// file. The engine makes that view at the first sorted request. Refer to
     /// [`Engine::ordered`].
     ordered: OnceLock<bool>,
+    /// The statement that filled [`SORT_TABLE`], or `None` when that table
+    /// holds no rows of the source now. Refer to [`Engine::sorted_window`].
+    sort_table: Mutex<Option<String>>,
 }
 
 /// What the DuckDB CSV sniffer found about a file.
@@ -583,6 +601,7 @@ impl Engine {
             table: None,
             order_view: None,
             ordered: OnceLock::new(),
+            sort_table: Mutex::new(None),
         };
 
         // A file of text and a file of JSON hold no schema. DuckDB therefore
@@ -663,6 +682,7 @@ impl Engine {
             table: Some(table),
             order_view: None,
             ordered: OnceLock::new(),
+            sort_table: Mutex::new(None),
         };
         // Read the schema now, in the same way as for a file. A name that the
         // database does not hold therefore gives an error here.
@@ -743,6 +763,13 @@ impl Engine {
             .filter(|p| !taken(p))
             .map(|p| format!("SELECT *, {p} AS {} FROM {from}", quote_ident(ORDER_COLUMN)));
         self.ordered = OnceLock::new();
+        // The positions of a sorted view belong to the old rows.
+        let held = self.sort_table.get_mut().unwrap_or_else(|e| e.into_inner());
+        if held.take().is_some() {
+            let _ = self
+                .conn
+                .execute_batch(&format!("DROP TABLE IF EXISTS {SORT_TABLE}"));
+        }
     }
 
     /// Gives `true` when the view [`ORDER_VIEW`] gives the position of each
@@ -758,6 +785,46 @@ impl Engine {
                     .is_ok()
             })
         })
+    }
+
+    /// Gives a statement that holds the rows `offset` to `offset + limit` of
+    /// a sorted view over the file, in the order of the view, when those rows
+    /// come from [`SORT_TABLE`]. Refer to [`SORT_TABLE_ROWS`].
+    ///
+    /// The table holds the position of each row of the view, in the order of
+    /// the view, so the row id of a position is the number of its row in the
+    /// view. The engine fills it at the first request past
+    /// [`SORT_TABLE_ROWS`], and each later request of the same view uses it.
+    /// The table holds one view at a time.
+    ///
+    /// The result is a view of the statement, with no filter and no sort. Its
+    /// rows start at its row 0. `None` tells the caller to use `view` itself.
+    fn sorted_window(&self, view: &View, limit: u64, offset: u64) -> Result<Option<View>> {
+        if !view.is_source() || view.sort.is_empty() || !self.ordered() {
+            return Ok(None);
+        }
+        let ord = quote_ident(ORDER_COLUMN);
+        let key = view.select(&ord);
+        let mut held = self.sort_table.lock().unwrap_or_else(|e| e.into_inner());
+        if held.as_deref() != Some(key.as_str()) {
+            if offset.saturating_add(limit) <= SORT_TABLE_ROWS {
+                return Ok(None);
+            }
+            *held = None;
+            self.conn
+                .execute_batch(&format!("CREATE OR REPLACE TEMP TABLE {SORT_TABLE} AS {key}"))?;
+            *held = Some(key);
+        }
+        // The page keeps the order of the row ids, from the `ORDER BY` part.
+        let rows = format!(
+            "SELECT q.* FROM (SELECT rowid AS __peruse_rank, {ord} FROM {SORT_TABLE} \
+             LIMIT {limit} OFFSET {offset}) AS p JOIN {ORDER_VIEW} AS q USING ({ord}) \
+             ORDER BY p.__peruse_rank"
+        );
+        Ok(Some(View {
+            base: Base::Sql(rows),
+            ..Default::default()
+        }))
     }
 
     /// Gives the view that a statement over the rows of `view` must use.
@@ -1016,7 +1083,10 @@ impl Engine {
             return Ok(RowPage::new(offset, 0, Vec::new()));
         }
         let ncols = schema.len();
-        let sql = self.sorted_view(view).page_sql(schema, limit, offset);
+        let sql = match self.sorted_window(view, u64::from(limit), offset)? {
+            Some(window) => window.page_sql(schema, limit, 0),
+            None => self.sorted_view(view).page_sql(schema, limit, offset),
+        };
         let mut stmt = self.conn.prepare(&sql)?;
         let mut rows = stmt.query([])?;
         let mut cells: Vec<Option<String>> = Vec::with_capacity(limit as usize * ncols);
@@ -1084,7 +1154,10 @@ impl Engine {
     /// A page holds a short form of a long value. This function gives the
     /// complete value.
     pub fn cell(&self, view: &View, column: &str, row: u64) -> Result<Option<String>> {
-        let sql = self.sorted_view(view).cell_sql(column, row);
+        let sql = match self.sorted_window(view, 1, row)? {
+            Some(window) => window.cell_sql(column, 0),
+            None => self.sorted_view(view).cell_sql(column, row),
+        };
         let mut stmt = self.conn.prepare(&sql)?;
         let mut rows = stmt.query([])?;
         match rows.next()? {
@@ -1137,7 +1210,10 @@ impl Engine {
     ///
     /// The function gives `None` when the view holds no row at that offset.
     pub fn row_json(&self, view: &View, schema: &Schema, row: u64) -> Result<Option<String>> {
-        let sql = self.sorted_view(view).row_json_sql(schema, row);
+        let sql = match self.sorted_window(view, 1, row)? {
+            Some(window) => window.row_json_sql(schema, 0),
+            None => self.sorted_view(view).row_json_sql(schema, row),
+        };
         let mut stmt = self.conn.prepare(&sql)?;
         let mut rows = stmt.query([])?;
         match rows.next()? {
@@ -4361,6 +4437,94 @@ mod tests {
         e.materialize().unwrap();
         assert!(e.ordered());
         assert_eq!(sorted_ids(&e, 2), vec![2, 1]);
+    }
+
+    #[test]
+    fn a_deep_sorted_window_reads_the_same_rows_through_the_table_of_positions() {
+        // Past `SORT_TABLE_ROWS`, a sorted window reads the positions of the
+        // rows from a table in the order of the view. Each window must hold
+        // the rows that the sort itself gives, in the same order: here the
+        // order of `k`, then of `j` where a second key applies, then of the
+        // file.
+        let rows: i64 = 150_000;
+        let d = tmpdir("sort-table");
+        let p = d.join("t.parquet");
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(&format!(
+            "COPY (SELECT i AS id, CASE WHEN i % 11 = 0 THEN NULL ELSE i % 7 END AS k, i % 5 AS j \
+             FROM range({rows}) t(i)) TO '{}' (FORMAT parquet, ROW_GROUP_SIZE 10000);",
+            db_path(&p)
+        ))
+        .unwrap();
+        let opts = OpenOptions {
+            threads: Some(4),
+            ..Default::default()
+        };
+        let e = Engine::open(p.to_str().unwrap(), &opts).unwrap();
+        let key = |column: &str, dir| crate::query::SortKey {
+            column: column.into(),
+            dir,
+        };
+        use crate::query::SortDir::{Asc, Desc};
+        // The value of `k` for a sort: DuckDB puts NULL last in each direction.
+        let k = |i: i64| if i % 11 == 0 { None } else { Some(i % 7) };
+        let cases: Vec<(View, Vec<i64>)> = vec![
+            (
+                View {
+                    sort: vec![key("k", Asc)],
+                    ..Default::default()
+                },
+                {
+                    let mut ids: Vec<i64> = (0..rows).collect();
+                    ids.sort_by_key(|&i| (k(i).is_none(), k(i), i));
+                    ids
+                },
+            ),
+            (
+                View {
+                    sort: vec![key("k", Desc), key("j", Asc)],
+                    filter: Some("id % 3 <> 0".into()),
+                    ..Default::default()
+                },
+                {
+                    let mut ids: Vec<i64> = (0..rows).filter(|i| i % 3 != 0).collect();
+                    ids.sort_by_key(|&i| (k(i).is_none(), std::cmp::Reverse(k(i)), i % 5, i));
+                    ids
+                },
+            ),
+        ];
+        for (view, want) in &cases {
+            let schema = e.describe(view).unwrap();
+            let n = want.len() as u64;
+            let held = || {
+                let key = view.select(&quote_ident(ORDER_COLUMN));
+                e.sort_table.lock().unwrap().as_deref() == Some(key.as_str())
+            };
+            // A shallow window of a new view does not fill the table.
+            let _ = e.page(view, &schema, 50, 0).unwrap();
+            assert!(!held(), "{view:?}");
+            for offset in [n - 40, 0, 99_990, SORT_TABLE_ROWS - 3, 5, n / 2, n - 1] {
+                let page = e.page(view, &schema, 700, offset).unwrap();
+                let got: Vec<i64> = (0..page.nrows)
+                    .map(|r| page.cell(r, 0).unwrap().parse().unwrap())
+                    .collect();
+                let end = (offset as usize + 700).min(want.len());
+                assert_eq!(got, want[offset as usize..end], "{view:?} at {offset}");
+                // The first window is deep, so each window reads the table.
+                assert!(held(), "{view:?} at {offset}");
+            }
+            // The cell inspector and the record view read the same rows.
+            let deep = n - 7;
+            let id = want[deep as usize];
+            assert_eq!(e.cell(view, "id", deep).unwrap(), Some(id.to_string()));
+            let json = e.row_json(view, &schema, deep).unwrap().unwrap();
+            assert!(json.contains(&format!("\"id\":{id},")), "{json}");
+        }
+        // The last view filled the table, and the first view fills it again.
+        let (view, want) = &cases[0];
+        let schema = e.describe(view).unwrap();
+        let page = e.page(view, &schema, 3, 140_000).unwrap();
+        assert_eq!(text_at(&page, 0, 0), Some(want[140_000].to_string()));
     }
 
     #[test]

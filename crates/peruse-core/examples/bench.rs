@@ -114,6 +114,13 @@ fn main() -> Result<()> {
     time("sorted window at middle", || {
         engine.page(&sorted, &schema, WINDOW, total / 2)
     })?;
+    // The user scrolls on, and the grid asks for the next window.
+    time("sorted, next window at middle", || {
+        engine.page(&sorted, &schema, WINDOW, total / 2 + u64::from(WINDOW))
+    })?;
+    time("sorted, jump to last screen", || {
+        engine.page(&sorted, &schema, 50, deep)
+    })?;
     // A column of text holds repeated values, and the end of the sort puts the
     // rows of one value in order. Refer to `View::order_by`.
     if let Some(col) = schema.columns.iter().find(|c| c.kind == CellKind::Text) {
@@ -129,6 +136,9 @@ fn main() -> Result<()> {
         })?;
         time("sorted on text, window at middle", || {
             engine.page(&ties, &schema, WINDOW, total / 2)
+        })?;
+        time("sorted on text, next window", || {
+            engine.page(&ties, &schema, WINDOW, total / 2 + u64::from(WINDOW))
         })?;
     }
 
