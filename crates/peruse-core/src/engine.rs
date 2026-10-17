@@ -447,6 +447,7 @@ impl Engine {
             // `Engine::open_database` names the table as soon as it chooses
             // one. A file holds one table, and it keeps this value empty.
             table: None,
+            local_copy: None,
         };
 
         // A SQLite file is a database, and the reader for it is an extension
@@ -1741,6 +1742,7 @@ pub fn database_tables(path: &Path, opts: &OpenOptions) -> Result<Vec<DbTable>> 
         delimiter: None,
         compressed: false,
         table: None,
+        local_copy: None,
     };
     attach_database(&conn, &src)?;
     read_tables(&conn).with_context(|| format!("reading the tables of {}", src.label))
