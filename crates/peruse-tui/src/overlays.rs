@@ -696,7 +696,17 @@ pub fn draw_cell(buf: &mut Buffer, area: Rect, app: &App, p: &Paint) -> OverlayH
     let t = &app.theme;
 
     let value = app.cell_value.as_deref().unwrap_or("…");
-    let lines = text::wrap(value, inner.width as usize);
+    // The grid writes a control character as a visible mark, and the
+    // inspector must say the same. The terminal library drops such a
+    // character, so `a<tab>b` read as `ab` here, and an escape sequence lost
+    // its first character and read as a plain `[31m`. A line end keeps its
+    // work: it starts a new line.
+    let shown: String = value
+        .split('\n')
+        .map(|line| text::sanitize(line.trim_end_matches('\r')))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let lines = text::wrap(&shown, inner.width as usize);
     let max_scroll = lines.len().saturating_sub(inner.height as usize) as u16;
     let scroll = app.cell_scroll.min(max_scroll);
 

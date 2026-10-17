@@ -45,10 +45,13 @@ fn kv(buf: &mut Buffer, area: Rect, y: u16, label: &str, value: &str, p: &Paint,
         p.on(t.dim, t.bg),
     );
     let vw = (area.width as usize).saturating_sub(lw + 1);
+    // The smallest value and the largest value of a column come from the
+    // data, and a value can hold a line end or a tab. The grid writes such a
+    // character as a visible mark, and the panel must say the same.
     buf.set_stringn(
         area.x + lw as u16 + 1,
         y,
-        text::truncate(value, vw),
+        text::truncate(&text::sanitize(value), vw),
         vw,
         p.on(t.fg, t.bg),
     );

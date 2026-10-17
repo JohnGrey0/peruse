@@ -2976,6 +2976,288 @@ fn the_mouse_does_not_stop_the_program_on_a_small_terminal() {
     }
 }
 
+// ------------------------------------------------ the sizes of the terminal
+
+/// A file whose text is awkward for a screen: characters of two screen
+/// columns, characters of no width, characters that join, control characters,
+/// an escape sequence and a line end inside a value, and a long value.
+fn awkward_sample() -> String {
+    let long = "x".repeat(500);
+    let mut s = String::new();
+    s.push_str("id,日本語の列,emoji🎉,\"tab\tname\",ctrl,long\n");
+    s.push_str(&format!(
+        "1,こんにちは世界,👨‍👩‍👧 family,\"a\tb\",\"esc\x1b[31mred\",{long}\n"
+    ));
+    s.push_str(
+        "2,e\u{301}\u{301}\u{301},🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉,\"line1\nline2\",\
+         \u{202E}reversed,\u{200B}\u{200B}zero\n",
+    );
+    s.push_str("3,,,,,\n");
+    s.push_str("4,مرحبا بالعالم,🇯🇵🇫🇷,\"\r\n\",\x07bell,a\n");
+    s
+}
+
+/// The sizes of the terminal that the sweep draws at: no cell at all, one
+/// cell, one row, a few rows, the usual sizes, and a very wide one.
+const SIZES: &[(u16, u16)] = &[
+    (0, 0),
+    (1, 1),
+    (0, 24),
+    (80, 0),
+    (80, 1),
+    (80, 2),
+    (3, 3),
+    (10, 3),
+    (20, 5),
+    (5, 10),
+    (40, 8),
+    (60, 12),
+    (110, 24),
+    (300, 100),
+    (1000, 40),
+    (65535, 3),
+];
+
+/// Tests that no cell of the screen holds a control character.
+///
+/// A control character in a cell goes to the terminal as it is. An escape
+/// sequence inside a value could then change the colors of the terminal, move
+/// its cursor, or write its title.
+fn screen_is_sane(term: &Terminal<TestBackend>, what: &str) {
+    let buf = term.backend().buffer();
+    for (i, cell) in buf.content.iter().enumerate() {
+        let s = cell.symbol();
+        assert!(
+            !s.chars().any(char::is_control),
+            "{what}: the cell {i} holds a control character {s:?}"
+        );
+    }
+}
+
+#[test]
+fn every_mode_draws_at_every_size_over_awkward_text() {
+    use ratatui::crossterm::event::KeyCode;
+    let p = write_sample("sizes", &awkward_sample(), "csv");
+    let (worker, opened) = Worker::spawn(p.to_str().unwrap(), OpenOptions::default()).unwrap();
+    let mut app = App::new(
+        worker,
+        opened,
+        peruse_core::theme::builtin("peruse-dark").unwrap(),
+        false,
+    );
+    app.config_path = p.parent().map(|d| d.join("config.toml"));
+
+    // The usual size first, to prove that the file read as intended. A file
+    // that the sniffer read as one column would make the sweep prove nothing.
+    let mut term = Terminal::new(TestBackend::new(110, 24)).unwrap();
+    settle(&mut app, &mut term);
+    assert_eq!(app.schema.len(), 6, "the file did not read as six columns");
+    assert!(screen(&term).contains("family"), "{}", screen(&term));
+    assert!(screen(&term).contains("4 × 6"), "{}", screen(&term));
+    let long_line = "amount > 100 AND name LIKE '%zebra%' AND ".repeat(4);
+
+    for &(w, h) in SIZES {
+        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+        let at = |what: &str| format!("{w}x{h} {what}");
+        app.needle = "family".into();
+        settle(&mut app, &mut term);
+        screen_is_sane(&term, &at("grid"));
+
+        for band in ["compact", "detailed"] {
+            app.config.band = Some(band.into());
+            settle(&mut app, &mut term);
+            screen_is_sane(&term, &at(band));
+        }
+        app.config.band = None;
+
+        for panel in [Panel::Meta, Panel::Stats, Panel::Both] {
+            app.panel = panel;
+            settle(&mut app, &mut term);
+            screen_is_sane(&term, &at("panel"));
+        }
+        app.panel = Panel::None;
+
+        // The cursor at each end of the grid.
+        for cmd in [Cmd::ColLast, Cmd::Bottom, Cmd::ColRight, Cmd::Origin] {
+            app.run(cmd);
+            frame(&mut app, &mut term);
+            screen_is_sane(&term, &at("move"));
+        }
+
+        // Each prompt, with a line that is longer than the screen.
+        for cmd in [Cmd::Filter, Cmd::Sql, Cmd::Search, Cmd::GotoRow] {
+            app.run(cmd);
+            type_text(&mut app, &long_line);
+            frame(&mut app, &mut term);
+            screen_is_sane(&term, &at("prompt"));
+            press(&mut app, KeyCode::Home);
+            frame(&mut app, &mut term);
+            press(&mut app, KeyCode::Esc);
+        }
+        assert_eq!(app.mode, Mode::Normal);
+
+        app.run(Cmd::Help);
+        app.help_scroll = 5;
+        frame(&mut app, &mut term);
+        screen_is_sane(&term, &at("help"));
+        press(&mut app, KeyCode::Esc);
+
+        app.run(Cmd::Palette);
+        type_text(&mut app, "the");
+        frame(&mut app, &mut term);
+        screen_is_sane(&term, &at("palette"));
+        press(&mut app, KeyCode::Esc);
+
+        app.run(Cmd::ThemePicker);
+        frame(&mut app, &mut term);
+        screen_is_sane(&term, &at("themes"));
+        press(&mut app, KeyCode::Esc);
+
+        // The inspector on the long value, and on the value with the escape
+        // sequence.
+        app.run(Cmd::ColLast);
+        app.run(Cmd::InspectCell);
+        settle(&mut app, &mut term);
+        app.cell_scroll = 3;
+        frame(&mut app, &mut term);
+        screen_is_sane(&term, &at("inspector"));
+        press(&mut app, KeyCode::Esc);
+        app.run(Cmd::ColLeft);
+        app.run(Cmd::InspectCell);
+        settle(&mut app, &mut term);
+        screen_is_sane(&term, &at("inspector of an escape sequence"));
+        press(&mut app, KeyCode::Esc);
+        app.run(Cmd::Origin);
+
+        app.run(Cmd::Record);
+        settle(&mut app, &mut term);
+        screen_is_sane(&term, &at("record"));
+        press_char(&mut app, '/');
+        type_text(&mut app, "本");
+        frame(&mut app, &mut term);
+        screen_is_sane(&term, &at("record find"));
+        press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.mode, Mode::Normal, "{}", at("the record view stayed open"));
+
+        app.run(Cmd::FilterBuild);
+        for step in [Build::List, Build::Column, Build::Op, Build::Value, Build::Value2, Build::Raw] {
+            app.build = step;
+            frame(&mut app, &mut term);
+            screen_is_sane(&term, &at("filter builder"));
+        }
+        app.run(Cmd::Cancel);
+        app.mode = Mode::Normal;
+
+        app.run(Cmd::Settings);
+        frame(&mut app, &mut term);
+        press(&mut app, KeyCode::Enter);
+        type_text(&mut app, "abc");
+        frame(&mut app, &mut term);
+        screen_is_sane(&term, &at("settings"));
+        press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Esc);
+        app.mode = Mode::Normal;
+        app.settings_editing = false;
+    }
+}
+
+#[test]
+fn the_scroll_bar_never_covers_the_last_character_of_a_column() {
+    // Six columns of six screen columns each, after a gutter of four, end
+    // exactly at the right edge of a terminal of 45 columns. The scroll bar
+    // sits on that edge, so it covered the last digit of each number in the
+    // last column.
+    let mut body = String::from("a,b,c,d,e,f\n");
+    for i in 0..100 {
+        body.push_str(&format!("{i},{i},{i},{i},{i},{}\n", 900 + i));
+    }
+    let p = write_sample("scrollbar", &body, "csv");
+    let (mut app, _) = open(&p);
+    let mut term = Terminal::new(TestBackend::new(45, 24)).unwrap();
+    settle(&mut app, &mut term);
+    let s = screen(&term);
+    assert!(s.contains('│') && s.contains('█'), "no scroll bar\n{s}");
+
+    let (ci, x, w) = *app.hit.cols.last().expect("no column on the screen");
+    assert!(x + w < 45, "the last column reaches under the scroll bar\n{s}");
+    // The first row of data holds the whole value of the last column.
+    let row = &lines(&term)[2];
+    let shown: String = row.chars().skip(x as usize).take(w as usize).collect();
+    let want = app.page.cell(0, ci).expect("the first row did not arrive").to_string();
+    assert_eq!(shown.trim(), want, "the value is cut\n{s}");
+}
+
+#[test]
+fn the_prompt_scrolls_so_that_the_cursor_and_the_text_before_it_stay_on_the_screen() {
+    use ratatui::crossterm::event::KeyCode;
+    let p = write_sample("prompt-scroll", SAMPLE, "csv");
+    let (mut app, _) = open(&p);
+    let mut term = Terminal::new(TestBackend::new(60, 10)).unwrap();
+    settle(&mut app, &mut term);
+
+    app.run(Cmd::Sql);
+    type_text(&mut app, "region = 'EU' AND amount > 100 AND name LIKE '%zebra%'");
+    assert!(
+        app.input.cursor_col() + 6 > 60,
+        "the line fits on the screen, so the test proves nothing"
+    );
+    frame(&mut app, &mut term);
+    // The status line is the row above the footer.
+    let row = lines(&term)[8].clone();
+    assert!(
+        row.contains("'%zebra%'"),
+        "the end of the line, where the user types, is not on the screen: {row:?}"
+    );
+    let cursor = term.get_cursor_position().unwrap();
+    assert!(cursor.x < 60, "the cursor is outside the screen: {cursor:?}");
+    assert_eq!(cursor.y, 8);
+
+    // The key Home moves the cursor to the start, and the start comes back.
+    press(&mut app, KeyCode::Home);
+    frame(&mut app, &mut term);
+    let row = lines(&term)[8].clone();
+    assert!(row.contains("SELECT * FROM src"), "the start is not on the screen: {row:?}");
+}
+
+#[test]
+fn the_statistics_panel_shows_a_line_end_inside_a_value_as_a_mark() {
+    // The smallest value of a column of text can hold a line end. The panel
+    // wrote it as it was, the terminal library dropped it, and the two lines
+    // then read as one text.
+    let p = write_sample("stats-ctrl", "a,b\n1,\"x\ny\"\n2,zzz\n", "csv");
+    let (mut app, mut term) = open(&p);
+    settle(&mut app, &mut term);
+    app.run(Cmd::ColRight);
+    app.run(Cmd::ToggleStats);
+    settle(&mut app, &mut term);
+    let s = screen(&term);
+    assert!(s.contains("min"), "no smallest value\n{s}");
+    assert!(s.contains("x␊y"), "the panel lost the mark\n{s}");
+}
+
+#[test]
+fn the_inspector_shows_a_tab_and_an_escape_as_the_grid_does() {
+    // The grid writes a control character as a visible mark. The inspector
+    // dropped it, so `a<tab>b` read as `ab`, and an escape sequence lost its
+    // first character and read as a plain `[31m`.
+    let p = write_sample("inspect-ctrl", "a,b\n1,\"x\ty\x1b[31mz\"\n", "csv");
+    let (mut app, mut term) = open(&p);
+    settle(&mut app, &mut term);
+    // The column is narrow, so the grid cuts the value after the marks.
+    assert!(screen(&term).contains("x␉y·["), "the grid lost the marks\n{}", screen(&term));
+
+    app.run(Cmd::ColRight);
+    app.run(Cmd::InspectCell);
+    settle(&mut app, &mut term);
+    assert_eq!(app.mode, Mode::Cell);
+    assert!(
+        screen(&term).contains("x␉y·[31mz"),
+        "the inspector lost the marks\n{}",
+        screen(&term)
+    );
+}
+
 /// Writes a file of 40 columns: even columns hold numbers, odd columns text.
 ///
 /// A column of numbers gets a chart and more rows of statistics than a column
