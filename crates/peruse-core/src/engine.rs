@@ -21,6 +21,7 @@ use anyhow::{bail, Context, Result};
 use duckdb::types::Value;
 use duckdb::{Connection, InterruptHandle};
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
@@ -94,6 +95,16 @@ const LATE_MATERIALIZATION_ROWS: u64 = 4096;
 /// of that time is not work of the processor. A set of 500 files therefore
 /// costs four seconds on one thread. Refer to [`Engine::pin_csv`].
 const SNIFF_THREADS: usize = 8;
+
+/// The smallest set of Parquet files that the engine reads without
+/// `union_by_name`. Refer to [`Engine::pin_parquet_set`].
+///
+/// The comparison of the schemas costs some milliseconds and more for each
+/// file, and `union_by_name` costs less than one millisecond for each file in
+/// each statement. At 100 files of 2000 rows, the open operation costs the same
+/// with the comparison and without it, and each later statement costs about 20
+/// percent less. A smaller set would wait longer for its first screen.
+const PIN_PARQUET_FILES: usize = 100;
 
 /// The options that control how the engine opens a file.
 #[derive(Clone, Debug, Default)]
@@ -588,10 +599,10 @@ impl Engine {
         // A set of files needs `union_by_name`, and two files of one set can
         // hold different columns. One column list cannot serve them all, so a
         // set keeps the call that finds the columns for each file.
-        let pinned = if engine.source.format == Format::Csv {
-            engine.pin_csv(opts)
-        } else {
-            None
+        let pinned = match engine.source.format {
+            Format::Csv => engine.pin_csv(opts),
+            Format::Parquet => engine.pin_parquet_set(),
+            _ => None,
         };
 
         // Read the schema now, and keep it. An error message here is more
@@ -808,6 +819,73 @@ impl Engine {
         }
         self.csv_dialect = Some(sniff.meta);
         Some(schema)
+    }
+
+    /// Reads a set of Parquet files without `union_by_name`, when each file
+    /// holds the same columns in the same order with the same types.
+    ///
+    /// With `union_by_name`, DuckDB reads the footer of each file of the set
+    /// again for every statement, to find the columns of the set. Over 500
+    /// small files that cost about 20 ms for each statement. The plain call
+    /// reads the columns of the first file, and each other file when it reads
+    /// its rows. The plain call is correct only for files that agree, so the
+    /// engine compares the schema of each file one time here, in one
+    /// statement. A set whose files differ keeps `union_by_name`.
+    ///
+    /// The function gives `None` for a set of fewer than
+    /// [`PIN_PARQUET_FILES`] files, and for a set that keeps the call with
+    /// `union_by_name`.
+    fn pin_parquet_set(&mut self) -> Option<Schema> {
+        if self.source.files.len() < PIN_PARQUET_FILES || !self.parquet_set_agrees() {
+            return None;
+        }
+        let list = file_list(&self.source.files);
+        self.use_scan_expr(format!("read_parquet({list})")).ok()
+    }
+
+    /// Gives `true` when each Parquet file of the set holds the same columns,
+    /// in the same order, with the same types.
+    fn parquet_set_agrees(&self) -> bool {
+        self.parquet_schemas().is_some_and(|mut schemas| {
+            let first = schemas.pop();
+            schemas.iter().all(|s| Some(s) == first.as_ref())
+        })
+    }
+
+    /// Reads the elements of the schema of each Parquet file of the set.
+    ///
+    /// Each list holds the position, the name, the type, and the count of the
+    /// elements inside a nested one, in the order of the positions.
+    fn parquet_schemas(&self) -> Option<Vec<Vec<(i64, String)>>> {
+        let list = file_list(&self.source.files);
+        // Each element of the schema of a file, with its position: the name,
+        // the type, and the count of the elements inside a nested one. The
+        // comparison is in Rust, because an aggregate in DuckDB costs some
+        // milliseconds more, also on a set of two files.
+        let sql = format!(
+            "SELECT file_name, column_id, name || chr(31) || coalesce(duckdb_type, '') || chr(31) \
+               || coalesce(repetition_type, '') || chr(31) || coalesce(num_children::VARCHAR, '') \
+             FROM parquet_schema({list})"
+        );
+        let mut files: HashMap<String, Vec<(i64, String)>> = HashMap::new();
+        let mut stmt = self.conn.prepare(&sql).ok()?;
+        let mut rows = stmt.query([]).ok()?;
+        while let Some(r) = rows.next().ok()? {
+            let element = (r.get(1).ok()?, r.get(2).ok()?);
+            files.entry(r.get(0).ok()?).or_default().push(element);
+        }
+        if files.len() != self.source.files.len() {
+            return None;
+        }
+        Some(
+            files
+                .into_values()
+                .map(|mut s| {
+                    s.sort_unstable();
+                    s
+                })
+                .collect(),
+        )
     }
 
     /// Asks the DuckDB sniffer for the dialect and the columns of a CSV file.
@@ -2812,6 +2890,70 @@ mod tests {
             let pattern = format!("{}/*.csv", d.to_string_lossy());
             let e = Engine::open(&pattern, &OpenOptions::default()).unwrap();
             assert!(!e.scan_expr.contains("auto_detect = false"), "{tag}: {}", e.scan_expr);
+            assert!(e.scan_expr.contains("union_by_name"), "{tag}: {}", e.scan_expr);
+            assert_eq!(e.count(&View::default()).unwrap(), 3, "{tag}");
+        }
+    }
+
+    #[test]
+    fn a_set_of_parquet_files_with_the_same_columns_gets_a_read_call_with_no_union() {
+        let d = tmpdir("pq-set-same");
+        let conn = Connection::open_in_memory().unwrap();
+        let files = PIN_PARQUET_FILES as u64;
+        let copies: String = (0..files)
+            .map(|i| {
+                format!(
+                    "COPY (SELECT {i} * 10 + n AS id, {{'a': n, 'b': 'x'}} AS s FROM range(10) t(n)) \
+                     TO '{}/p{i:03}.parquet' (FORMAT parquet);\n",
+                    db_path(&d)
+                )
+            })
+            .collect();
+        conn.execute_batch(&copies).unwrap();
+        let pattern = format!("{}/*.parquet", d.to_string_lossy());
+        let e = Engine::open(&pattern, &OpenOptions::default()).unwrap();
+        assert!(!e.scan_expr.contains("union_by_name"), "{}", e.scan_expr);
+        let view = View::default();
+        assert_eq!(e.count(&view).unwrap(), files * 10);
+        let schema = e.describe(&view).unwrap();
+        assert_eq!(schema.len(), 2);
+        let page = e.page(&view, &schema, 3, 19).unwrap();
+        assert_eq!(text_at(&page, 0, 0).as_deref(), Some("19"));
+        assert_eq!(text_at(&page, 1, 0).as_deref(), Some("20"));
+        assert_eq!(text_at(&page, 2, 1).as_deref(), Some("{'a': 1, 'b': x}"));
+
+        // A small set keeps the call with `union_by_name`. The comparison
+        // would cost more than it saves.
+        let small = format!("{}/p00*.parquet", d.to_string_lossy());
+        let e = Engine::open(&small, &OpenOptions::default()).unwrap();
+        assert!(e.scan_expr.contains("union_by_name"), "{}", e.scan_expr);
+        assert!(e.parquet_set_agrees());
+    }
+
+    #[test]
+    fn a_set_of_parquet_files_that_differ_keeps_the_read_call_with_the_union() {
+        // Each second file differs from the first file in one way. The plain
+        // call would read the columns of the first file only.
+        for (tag, second) in [
+            ("order", "SELECT 'y' AS name, 3 AS id"),
+            ("type", "SELECT 3.5 AS id, 'y' AS name"),
+            ("missing", "SELECT 3 AS id"),
+            ("more", "SELECT 3 AS id, 'y' AS name, true AS flag"),
+            ("nested", "SELECT 3 AS id, {'a': 1} AS name"),
+            ("name", "SELECT 3 AS ID, 'y' AS label"),
+        ] {
+            let d = tmpdir(&format!("pq-set-differ-{tag}"));
+            let conn = Connection::open_in_memory().unwrap();
+            conn.execute_batch(&format!(
+                "COPY (SELECT 1 AS id, 'x' AS name UNION ALL SELECT 2, 'z') \
+                 TO '{0}/a.parquet' (FORMAT parquet);
+                 COPY ({second}) TO '{0}/b.parquet' (FORMAT parquet);",
+                db_path(&d)
+            ))
+            .unwrap();
+            let pattern = format!("{}/*.parquet", d.to_string_lossy());
+            let e = Engine::open(&pattern, &OpenOptions::default()).unwrap();
+            assert!(!e.parquet_set_agrees(), "{tag}");
             assert!(e.scan_expr.contains("union_by_name"), "{tag}: {}", e.scan_expr);
             assert_eq!(e.count(&View::default()).unwrap(), 3, "{tag}");
         }
