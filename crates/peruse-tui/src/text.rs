@@ -40,14 +40,17 @@ pub fn sanitize(s: &str) -> String {
 /// Makes a text safe to write to the terminal outside the frame, as a message
 /// on the standard error.
 ///
-/// The function keeps a line end and a tab, because a message uses them. It
-/// writes each other control character as an escape, such as `\u{1b}`. The
-/// terminal then shows the character, and it does not obey it.
+/// The function keeps a line end and a tab, because a message uses them. A
+/// message of Windows ends its lines with `\r\n`, and that pair becomes one
+/// line end. The function writes each other control character as an escape,
+/// such as `\u{1b}`. The terminal then shows the character, and it does not
+/// obey it.
 pub fn for_terminal(s: &str) -> String {
     let unsafe_char = |c: char| c.is_control() && c != '\n' && c != '\t';
     if !s.chars().any(unsafe_char) {
         return s.to_string();
     }
+    let s = s.replace("\r\n", "\n");
     let mut out = String::with_capacity(s.len() + 16);
     for c in s.chars() {
         if unsafe_char(c) {
@@ -225,7 +228,7 @@ mod tests {
     #[test]
     fn a_message_for_the_terminal_shows_an_escape_and_does_not_send_it() {
         // A CSV file can put these into an error message of DuckDB.
-        let msg = "Original Line: 2,\x1b[2J\x1b]0;PWNED\x07\u{9b}31m\r\nnext\tline";
+        let msg = "Original Line: 2,\x1b[2J\x1b]0;PWNED\x07\u{9b}31m\r\rnext\tline";
         let safe = for_terminal(msg);
         assert!(
             !safe.chars().any(|c| c.is_control() && c != '\n' && c != '\t'),
@@ -233,9 +236,12 @@ mod tests {
         );
         assert_eq!(
             safe,
-            "Original Line: 2,\\u{1b}[2J\\u{1b}]0;PWNED\\u{7}\\u{9b}31m\\u{d}\nnext\tline"
+            "Original Line: 2,\\u{1b}[2J\\u{1b}]0;PWNED\\u{7}\\u{9b}31m\\u{d}\\u{d}next\tline"
         );
         assert_eq!(for_terminal("plain\ntext"), "plain\ntext");
+        // A message of Windows ends its lines with a carriage return and a
+        // line feed. That pair is a line end, and not a character to show.
+        assert_eq!(for_terminal("in use.\r\nnext \x1b"), "in use.\nnext \\u{1b}");
     }
 
     #[test]
