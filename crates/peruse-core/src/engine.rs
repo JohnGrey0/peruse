@@ -1656,7 +1656,7 @@ fn configure(conn: &Connection, opts: &OpenOptions) -> Result<()> {
             .map(|n| n.get())
             .unwrap_or(4)
     });
-    let tmp = std::env::temp_dir().join("peruse");
+    let tmp = temp_dir_for_engine();
     // The two extension options are necessary for the read-only promise.
     //
     // The bundled DuckDB build sets `autoinstall` and `autoload` to true. A
@@ -1695,6 +1695,31 @@ fn configure(conn: &Connection, opts: &OpenOptions) -> Result<()> {
     // failure here is not an error.
     let _ = conn.execute_batch("SET parquet_metadata_cache = true;");
     Ok(())
+}
+
+/// Gives a temporary directory that belongs to one engine only.
+///
+/// DuckDB names its temporary files with a counter that starts at zero in each
+/// database, such as `duckdb_temp_storage_S256K-0.tmp`. Two engines that share
+/// one directory therefore write their blocks into the same files, and each one
+/// reads the data of the other: the result is wrong rows, or a crash. When an
+/// engine closes, DuckDB also deletes each `duckdb_temp_` file in the
+/// directory, and the files of the other engine go with them. Two Peruse
+/// windows on two large files are enough to cause this.
+///
+/// Each engine therefore gets a directory of its own below the directory
+/// `peruse` in the temporary directory of the system. DuckDB makes that
+/// directory only when a query writes to the disk, and it deletes it when the
+/// engine closes. Peruse makes the parent, because DuckDB makes one level only.
+fn temp_dir_for_engine() -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let parent = std::env::temp_dir().join("peruse");
+    // A parent that Peruse cannot make is not a reason to stop. DuckDB then
+    // gives its own message when a query needs the disk.
+    let _ = std::fs::create_dir_all(&parent);
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    parent.join(format!("{}-{n}", std::process::id()))
 }
 
 /// Expands a glob pattern, or accepts a path to one file.
@@ -3172,6 +3197,61 @@ mod tests {
         let err = Engine::open(&glob, &OpenOptions::default()).err().expect("the deep set opened");
         let msg = err.to_string();
         assert!(msg.contains("b.json") && msg.contains("nests deeper"), "{msg}");
+    }
+
+    #[test]
+    fn two_engines_do_not_share_a_temporary_directory() {
+        // Each DuckDB names its temporary files with a counter that starts at
+        // zero, such as `duckdb_temp_storage_S256K-0.tmp`. Two engines that
+        // share one directory therefore write into the same file, and each one
+        // reads the blocks of the other. When one of them closes, it also
+        // deletes each `duckdb_temp_` file in the directory, and the other
+        // engine loses its data.
+        //
+        // The test makes both engines write to the disk, and then checks that
+        // each one reads back its own rows.
+        let d = tmpdir("temp-share");
+        let p = write_csv(&d, "s.csv", SAMPLE);
+        let opts = OpenOptions {
+            memory_limit: Some("64MB".into()),
+            threads: Some(2),
+            ..Default::default()
+        };
+        let a = Engine::open(p.to_str().unwrap(), &opts).unwrap();
+        let b = Engine::open(p.to_str().unwrap(), &opts).unwrap();
+        let dir = |e: &Engine| e.current_setting("temp_directory").unwrap();
+
+        // About 250 MB for each engine, with a limit of 64 MB: most of each
+        // table goes to the disk.
+        let fill = |e: &Engine, add: i64| {
+            e.conn
+                .execute_batch(&format!(
+                    "CREATE TABLE big AS SELECT range + {add} AS i, \
+                     repeat(md5((range + {add})::VARCHAR), 4) AS h FROM range(1500000)"
+                ))
+                .unwrap();
+        };
+        fill(&a, 0);
+        fill(&b, 10_000_000);
+        let sums = |e: &Engine| -> (i64, i64) {
+            e.conn
+                .query_row(
+                    "SELECT sum(i)::BIGINT, \
+                     count(*) FILTER (WHERE h <> repeat(md5(i::VARCHAR), 4))::BIGINT FROM big",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap()
+        };
+        let base: i64 = (0..1_500_000i64).sum();
+        assert_eq!(sums(&a), (base, 0), "the first engine read wrong rows");
+        assert_eq!(sums(&b), (base + 10_000_000 * 1_500_000, 0), "the second engine read wrong rows");
+
+        assert_ne!(dir(&a), dir(&b), "two engines share one temporary directory");
+
+        // The first engine closes. The second engine must keep its data.
+        drop(a);
+        assert_eq!(sums(&b), (base + 10_000_000 * 1_500_000, 0), "the close of one engine broke the other");
     }
 
     #[test]

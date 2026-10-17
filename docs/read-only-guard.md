@@ -42,8 +42,11 @@ One write to the disk does happen. A query can need more memory than its limit,
 and a sort or a join over a file that is larger than the memory is the usual
 reason. DuckDB then spills the rows to the disk. The function `configure` in
 `engine.rs` gives it a directory of its own for that work: it sets
-`temp_directory` to `peruse` inside the temporary directory of the system. The
-setting keeps the pages away from the directory that the user works in.
+`temp_directory` to a directory below `peruse` inside the temporary directory
+of the system, with a name for each engine. The setting keeps the pages away
+from the directory that the user works in. Each engine has its own directory,
+because DuckDB gives the same file names to each database: two windows of
+Peruse that shared one directory would read the pages of each other.
 
 The spill is not a hole in the promise. DuckDB writes its own pages there,
 under names that it chooses, and it deletes them when the query ends. It never
