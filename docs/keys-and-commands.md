@@ -309,6 +309,19 @@ each command in `FOOTER_HINTS` has a short form. Without a short form, the
 function `short_desc` gives the first word of the description, and that word is
 frequently the wrong one: `build a filter from menus` would give "build".
 
+## A paste
+
+Peruse asks the terminal to send a paste as one event, with the mode that the
+terminals call "bracketed paste". `App::on_paste` puts the text into the box
+that takes text now, and each line break and tab becomes one space, because a
+prompt holds one line. A paste over the grid, or over a list, does nothing.
+
+Without that mode, a paste arrives as keys. The line break of a statement in
+more than one line is then the key `Enter`: the prompt runs the first line
+alone, and each character after it reaches the grid as a command. The letter
+`R` resets the view, `t` changes the theme, and `q` stops the program. The
+console of Windows sends a paste as keys in all cases.
+
 ## The keys inside an overlay
 
 The record view, the filter builder, the settings page, the theme picker and

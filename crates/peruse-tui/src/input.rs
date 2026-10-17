@@ -136,6 +136,29 @@ impl LineInput {
         self.hist_pos = None;
     }
 
+    /// Puts a pasted text in the line at the cursor, and gives `Changed` when
+    /// the line changed.
+    ///
+    /// The line holds one line only. A statement that the user copies from an
+    /// editor holds line breaks and tabs, so each control character becomes
+    /// one space. A Windows line break is two characters, and it gives one
+    /// space.
+    pub fn insert_str(&mut self, text: &str) -> Action {
+        let clean = text.replace("\r\n", "\n");
+        let added: Vec<char> = clean
+            .chars()
+            .map(|c| if c.is_control() { ' ' } else { c })
+            .collect();
+        if added.is_empty() {
+            return Action::Ignored;
+        }
+        let n = added.len();
+        self.chars.splice(self.cursor..self.cursor, added);
+        self.cursor += n;
+        self.hist_pos = None;
+        Action::Changed
+    }
+
     /// Gives the position of the start of the name in front of the cursor.
     ///
     /// A full stop belongs to the name. A value inside a structure has a path
@@ -401,6 +424,18 @@ mod tests {
         // Ctrl alone and Alt alone still give the keys of the editor.
         i.handle(&ctrl('w'));
         assert_eq!(i.text(), "a ");
+    }
+
+    #[test]
+    fn a_pasted_text_goes_in_at_the_cursor_as_one_line() {
+        let mut i = typed("SELECT  FROM src");
+        for _ in 0..9 {
+            i.handle(&key(KeyCode::Left));
+        }
+        assert_eq!(i.insert_str("a,\r\n\tb"), Action::Changed);
+        assert_eq!(i.text(), "SELECT a,  b FROM src");
+        assert_eq!(i.cursor_col(), 12, "the cursor is after the pasted text");
+        assert_eq!(i.insert_str(""), Action::Ignored);
     }
 
     #[test]

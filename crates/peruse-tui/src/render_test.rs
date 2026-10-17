@@ -2990,3 +2990,58 @@ fn shift_tab_moves_the_cursor_to_the_previous_column() {
     app.on_key(&KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
     assert_eq!(app.cursor_col, 1, "Shift-Tab did not move to the left");
 }
+
+#[test]
+fn esc_keeps_the_line_of_a_prompt_in_its_history() {
+    use ratatui::crossterm::event::KeyCode;
+    let p = write_sample("esc-history", SAMPLE, "csv");
+    let (mut app, mut term) = open(&p);
+    settle(&mut app, &mut term);
+
+    press_char(&mut app, 'E');
+    type_text(&mut app, "region = 'EU' AND amount > 5");
+    press(&mut app, KeyCode::Esc);
+    assert_eq!(app.view.filter, None, "Esc must not apply the filter");
+
+    // The next prompt gives the line back with the arrow key.
+    press_char(&mut app, 'E');
+    assert_eq!(app.input.text(), "");
+    press(&mut app, KeyCode::Up);
+    assert_eq!(app.input.text(), "region = 'EU' AND amount > 5");
+    press(&mut app, KeyCode::Esc);
+
+    // The same for the search, and the two histories stay apart.
+    press_char(&mut app, '/');
+    type_text(&mut app, "carol");
+    press(&mut app, KeyCode::Esc);
+    press_char(&mut app, '/');
+    press(&mut app, KeyCode::Up);
+    assert_eq!(app.input.text(), "carol");
+}
+
+#[test]
+fn a_pasted_statement_stays_in_the_prompt_and_never_reaches_the_grid() {
+    let p = write_sample("paste", SAMPLE, "csv");
+    let (mut app, mut term) = open(&p);
+    settle(&mut app, &mut term);
+
+    // A paste in the grid is no command. The letter q would stop the program.
+    assert!(!app.on_paste("q"));
+    assert!(!app.quit);
+
+    app.run(Cmd::Sql);
+    app.input.set("");
+    assert!(app.on_paste("SELECT name\r\nFROM src\nWHERE region = 'EU'"));
+    assert_eq!(app.mode, Mode::Prompt(PromptKind::Sql));
+    assert_eq!(app.input.text(), "SELECT name FROM src WHERE region = 'EU'");
+    assert!(!app.quit);
+    press(&mut app, ratatui::crossterm::event::KeyCode::Enter);
+    settle(&mut app, &mut term);
+    let s = screen(&term);
+    assert!(s.contains("carol") && !s.contains("bob"), "the statement did not run\n{s}");
+
+    // The filter prompt checks a pasted text as it checks a typed one.
+    app.run(Cmd::Filter);
+    app.on_paste("1; DROP TABLE x");
+    assert!(app.prompt_error.is_some(), "a pasted text was not checked");
+}

@@ -27,7 +27,10 @@ use clap::{CommandFactory, Parser};
 use crossbeam_channel::{select, unbounded};
 use peruse_core::query::Base;
 use peruse_core::{sql_guard, OpenOptions, View, Worker};
-use ratatui::crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event};
+use ratatui::crossterm::event::{
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event,
+};
 use ratatui::crossterm::execute;
 
 use crate::app::App;
@@ -472,11 +475,33 @@ fn enable_mouse() -> bool {
     true
 }
 
+/// Asks the terminal to send a paste as one event, and makes sure that a panic
+/// turns that mode off again.
+///
+/// The hook of `ratatui::init` knows nothing about this mode. A shell after a
+/// panic would otherwise get marks around each paste, as text.
+fn enable_paste() -> bool {
+    if execute!(std::io::stdout(), EnableBracketedPaste).is_err() {
+        return false;
+    }
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = execute!(std::io::stdout(), DisableBracketedPaste);
+        previous(info);
+    }));
+    true
+}
+
 /// Draws the frames and reads the events until the user quits.
 fn run(application: &mut App, mouse: bool) -> Result<()> {
     let depth = Depth::detect();
     let mut terminal = ratatui::init();
     let mouse = mouse && enable_mouse();
+    // The terminal then sends a paste as one event. Without it, a statement in
+    // more than one line arrives as keys, and its first line break runs the
+    // prompt. Refer to `App::on_paste`. A terminal that does not know the
+    // request ignores it, and the paste then arrives as keys, as before.
+    let paste = enable_paste();
 
     // A read from the terminal blocks. The reads therefore run on their own
     // thread, and each event arrives as a message. The engine responses
@@ -535,6 +560,9 @@ fn run(application: &mut App, mouse: bool) -> Result<()> {
         }
     };
 
+    if paste {
+        let _ = execute!(std::io::stdout(), DisableBracketedPaste);
+    }
     if mouse {
         let _ = execute!(std::io::stdout(), DisableMouseCapture);
     }
@@ -555,6 +583,7 @@ fn handle_event(application: &mut App, ev: Event) -> bool {
             true
         }
         Event::Mouse(m) => application.on_mouse(&m),
+        Event::Paste(text) => application.on_paste(&text),
         Event::Resize(_, _) => true,
         _ => false,
     }

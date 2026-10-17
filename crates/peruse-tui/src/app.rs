@@ -2674,30 +2674,86 @@ impl App {
                 // word, arrives here as a cancel. Without this line, that jump
                 // deletes the work of the user.
                 self.input.remember();
+                // The prompt edits a copy of the history of its kind, and the
+                // next open starts from the kept copy again. The line must
+                // therefore go back into the kept copy, or the next open
+                // forgets it.
+                match kind {
+                    PromptKind::Filter => self.filter_input = self.input.clone(),
+                    PromptKind::Sql => self.sql_input = self.input.clone(),
+                    PromptKind::Search => self.search_input = self.input.clone(),
+                    PromptKind::Goto => {}
+                }
                 self.mode = Mode::Normal;
                 self.prompt_error = None;
             }
             Action::Submit => self.submit_prompt(kind),
-            Action::Changed => {
-                // Check the text while the user types it. A bad expression
-                // is then visible before the user presses Enter, and not
-                // after a request to the worker.
-                self.prompt_error = match kind {
-                    PromptKind::Filter if !self.input.is_empty() => {
-                        sql_guard::ensure_safe_predicate(&self.input.text())
-                            .err()
-                            .map(|e| e.to_string())
-                    }
-                    PromptKind::Sql if !self.input.is_empty() => {
-                        sql_guard::ensure_read_only(&self.input.text())
-                            .err()
-                            .map(|e| e.to_string())
-                    }
-                    _ => None,
-                };
-            }
+            Action::Changed => self.prompt_changed(kind),
             Action::Ignored => {}
         }
+    }
+
+    /// Checks the text of the prompt after a change.
+    fn prompt_changed(&mut self, kind: PromptKind) {
+        // Check the text while the user types it. A bad expression
+        // is then visible before the user presses Enter, and not
+        // after a request to the worker.
+        self.prompt_error = match kind {
+            PromptKind::Filter if !self.input.is_empty() => {
+                sql_guard::ensure_safe_predicate(&self.input.text())
+                    .err()
+                    .map(|e| e.to_string())
+            }
+            PromptKind::Sql if !self.input.is_empty() => {
+                sql_guard::ensure_read_only(&self.input.text())
+                    .err()
+                    .map(|e| e.to_string())
+            }
+            _ => None,
+        };
+    }
+
+    /// Gives a pasted text to the box that takes text now, and gives `true`
+    /// when the screen changed.
+    ///
+    /// The terminal sends a paste as one event, and not as keys. A paste that
+    /// arrives as keys has two faults. The line break of a statement in more
+    /// than one line is the key Enter, so the prompt runs the first line alone.
+    /// Each character after it then reaches the grid as a command: the letter
+    /// `R` resets the view, `t` changes the theme, and `q` stops the program.
+    ///
+    /// The grid takes no text, so a paste there does nothing.
+    pub fn on_paste(&mut self, text: &str) -> bool {
+        let takes_text = match self.mode {
+            Mode::Prompt(_) | Mode::Palette => true,
+            Mode::Record => self.record_finding,
+            Mode::Settings => self.settings_editing,
+            Mode::FilterBuild => matches!(
+                self.build,
+                Build::Column | Build::Value | Build::Value2 | Build::Raw
+            ),
+            _ => false,
+        };
+        if !takes_text || self.input.insert_str(text) != Action::Changed {
+            return false;
+        }
+        self.status = None;
+        match self.mode {
+            Mode::Prompt(kind) => self.prompt_changed(kind),
+            Mode::Palette => self.palette_sel = 0,
+            Mode::Record => {
+                self.record_find = self.input.text();
+                self.record_sel = 0;
+            }
+            Mode::FilterBuild if self.build == Build::Column => self.pick_sel = 0,
+            Mode::FilterBuild if self.build == Build::Raw => {
+                self.prompt_error = sql_guard::ensure_safe_predicate(&self.input.text())
+                    .err()
+                    .map(|e| e.to_string());
+            }
+            _ => {}
+        }
+        true
     }
 
     /// Applies the text of the prompt after the user presses Enter.
