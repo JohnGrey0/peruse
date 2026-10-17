@@ -2549,9 +2549,7 @@ mod tests {
     #[test]
     fn the_pinned_read_call_keeps_a_delimiter_that_the_sniffer_found() {
         // The extension `.dat` names no delimiter, so the sniffer finds the
-        // semicolon. The pinned call must carry what the sniffer found. A file
-        // with the extension `.csv` always uses a comma, and it would not test
-        // this path.
+        // semicolon. The pinned call must carry what the sniffer found.
         let d = tmpdir("pin-semicolon");
         let p = write_csv(&d, "s.dat", "a;b;c\n1;two;3.5\n4;five;6.5\n");
         let e = Engine::open(p.to_str().unwrap(), &OpenOptions::default()).unwrap();
@@ -3755,6 +3753,32 @@ mod tests {
     /// Gives the cell `(row, col)` of a page as an owned text.
     fn text_at(page: &RowPage, row: usize, col: usize) -> Option<String> {
         page.cell(row, col).map(str::to_string)
+    }
+
+    #[test]
+    fn a_csv_file_with_semicolons_gets_its_columns() {
+        // A spreadsheet program in a country that writes a decimal comma saves
+        // a `.csv` file with a semicolon between the values. The extension
+        // forced a comma, and each such file showed as one column.
+        let d = tmpdir("semicolon-csv");
+        let p = write_csv(&d, "export.csv", "id;name;amount\n1;alice;10,5\n2;bob;20,25\n");
+        let e = Engine::open(p.to_str().unwrap(), &OpenOptions::default()).unwrap();
+        let schema = e.describe(&View::default()).unwrap();
+        let names: Vec<&str> = schema.columns.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["id", "name", "amount"]);
+        assert_eq!(all_cells(&e)[1][1].as_deref(), Some("bob"));
+
+        // A plain file with commas still gets the comma.
+        let p = write_csv(&d, "plain.csv", SAMPLE);
+        let e = Engine::open(p.to_str().unwrap(), &OpenOptions::default()).unwrap();
+        assert_eq!(e.describe(&View::default()).unwrap().len(), 4);
+        // The option of the user still wins over the sniffer.
+        let opts = OpenOptions {
+            delimiter: Some(';'),
+            ..Default::default()
+        };
+        let e = Engine::open(p.to_str().unwrap(), &opts).unwrap();
+        assert_eq!(e.describe(&View::default()).unwrap().len(), 1);
     }
 
     #[test]

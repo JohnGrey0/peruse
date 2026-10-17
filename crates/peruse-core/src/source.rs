@@ -194,7 +194,11 @@ pub fn by_extension(path: &Path) -> Option<(Format, Option<char>)> {
     match ext.as_deref() {
         Some("parquet" | "parq" | "pq") => Some((Format::Parquet, None)),
         Some("tsv" | "tab") => Some((Format::Csv, Some('\t'))),
-        Some("csv") => Some((Format::Csv, Some(','))),
+        // The name `.csv` does not give the delimiter. A spreadsheet program
+        // in a country that writes a decimal comma saves a `.csv` file with a
+        // semicolon between the values, so the sniffer must decide. With a
+        // comma here, each such file showed as one column.
+        Some("csv") => Some((Format::Csv, None)),
         Some("psv") => Some((Format::Csv, Some('|'))),
         Some("json" | "ndjson" | "jsonl") => Some((Format::Json, None)),
         Some("arrow" | "ipc" | "feather" | "arrows") => Some((Format::Arrow, None)),
@@ -394,7 +398,10 @@ mod tests {
     fn extensions_map_to_formats() {
         assert_eq!(detect(Path::new("a.parquet")).0, Format::Parquet);
         assert_eq!(detect(Path::new("a.pq")).0, Format::Parquet);
-        assert_eq!(detect(Path::new("a.csv")).1, Some(','));
+        assert_eq!(detect(Path::new("a.csv")).0, Format::Csv);
+        // The sniffer finds the delimiter of a `.csv` file. Refer to
+        // `by_extension`.
+        assert_eq!(detect(Path::new("a.csv")).1, None);
         assert_eq!(detect(Path::new("a.tsv")).1, Some('\t'));
         assert_eq!(detect(Path::new("a.psv")).1, Some('|'));
         assert_eq!(detect(Path::new("a.json")).0, Format::Json);

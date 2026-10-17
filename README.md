@@ -990,7 +990,7 @@ a database and not a parse failure.
 | Format | Extensions | Notes |
 |---|---|---|
 | Parquet | `.parquet` `.parq` `.pq` | Full footer metadata. Jumps are instant. |
-| CSV and friends | `.csv` `.tsv` `.tab` `.psv` | The extension gives the delimiter. The sniffer finds the rest. |
+| CSV and friends | `.csv` `.tsv` `.tab` `.psv` | `.tsv`, `.tab` and `.psv` give the delimiter. The sniffer finds the rest, and the delimiter of a `.csv` file too. |
 | JSON | `.json` `.ndjson` `.jsonl` | One object for each row, one list of objects, or one object with a list inside it. The reader finds the form. |
 | DuckDB database | `.duckdb` `.ddb`, or any name | Opened read-only. Peruse shows one table of it. Jumps are instant. See [DuckDB databases](#duckdb-databases). |
 

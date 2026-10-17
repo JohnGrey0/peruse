@@ -105,7 +105,10 @@ to change the file to Parquet.
 
 For a CSV file, the expression takes more options:
 
-- `delim`, when the user or the file extension gives a delimiter
+- `delim`, when the user or the file extension gives a delimiter. The
+  extensions `.tsv` and `.tab` give a tab, and `.psv` gives `|`. The extension
+  `.csv` gives none: a spreadsheet program in a country that writes a decimal
+  comma saves a `.csv` file with a semicolon, so the sniffer decides.
 - `header`, when the user gives the option `--no-header`
 - `all_varchar`, `ignore_errors` and `sample_size`, from the options
 - `union_by_name`, when the source holds more than one file
