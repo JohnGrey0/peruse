@@ -509,13 +509,23 @@ impl Engine {
         // level, and a stack that is full is not a fault that Rust can
         // catch. Peruse therefore counts the levels with a loop of its own
         // before it gives the file to that reader.
+        //
+        // Each file of a set needs the test. The reader examines a part of each
+        // file of a set to find its columns, and one deep file of a glob
+        // stopped the program as surely as one deep file alone.
         if src.format == Format::Json
-            && source::json_depth_over(&src.files[0], MAX_JSON_DEPTH as usize)
+            && let Some(deep) = src
+                .files
+                .iter()
+                .find(|f| source::json_depth_over(f, MAX_JSON_DEPTH as usize))
         {
+            let name = deep
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| src.label.clone());
             bail!(
-                "{}: this file nests deeper than {MAX_JSON_DEPTH} levels.\n\
-                 A file that deep stops the reader of DuckDB, so Peruse does not open it.",
-                src.label
+                "{name}: this file nests deeper than {MAX_JSON_DEPTH} levels.\n\
+                 A file that deep stops the reader of DuckDB, so Peruse does not open it."
             );
         }
 
@@ -2060,11 +2070,26 @@ fn pinned_json_expr(src: &Source, schema: &Schema) -> Option<String> {
         .iter()
         .map(|c| format!("{}: {}", quote_str(&c.name), quote_str(&c.sql_type)))
         .collect();
+    let format = json_format_option(src)
+        .map(|f| format!(", {f}"))
+        .unwrap_or_default();
     Some(format!(
-        "read_json({}, maximum_depth = {MAX_JSON_DEPTH}, columns = {{{}}})",
+        "read_json({}, maximum_depth = {MAX_JSON_DEPTH}{format}, columns = {{{}}})",
         file_list(&src.files),
         cols.join(", ")
     ))
+}
+
+/// Gives the option `format = 'array'` when each file of a JSON source holds a
+/// list behind a byte order mark.
+///
+/// The JSON reader of DuckDB does not see the list behind the mark, and it
+/// reads the whole file as one row. Refer to [`source::json_list_behind_bom`].
+/// A file with no mark keeps the reader that finds the form of the file itself.
+fn json_format_option(src: &Source) -> Option<&'static str> {
+    let all = !src.files.is_empty()
+        && src.files.iter().all(|f| source::json_list_behind_bom(f));
+    all.then_some("format = 'array'")
 }
 
 /// Builds the `read_parquet` call or the `read_csv` call for this source.
@@ -2117,6 +2142,9 @@ fn build_read_expr(src: &Source, opts: &OpenOptions) -> String {
             // view of a strange file, and it is much better than a program
             // that goes away.
             let mut args = vec![list, format!("maximum_depth = {MAX_JSON_DEPTH}")];
+            if let Some(f) = json_format_option(src) {
+                args.push(f.to_string());
+            }
             if let Some(n) = opts.sample_size {
                 // The reader looks at this number of rows before it decides
                 // the types. The value -1 reads the whole file.
@@ -3945,5 +3973,49 @@ mod tests {
         let h = e.column_stats(&view, &schema.columns[1], 5).unwrap();
         assert_eq!(h.n_present, 3);
         assert!(h.avg.is_some());
+    }
+
+    #[test]
+    fn a_json_list_behind_a_byte_order_mark_gives_one_row_for_each_object() {
+        // PowerShell 5 writes a byte order mark in front of each UTF-8 file.
+        // The JSON reader of DuckDB then does not see the list, and it read the
+        // whole file as one row with one column `json`.
+        let d = tmpdir("json-bom");
+        let p = d.join("rows.json");
+        std::fs::write(
+            &p,
+            b"\xEF\xBB\xBF[\r\n {\"a\": 1, \"b\": \"x\"},\r\n {\"a\": 2, \"b\": \"y\"}\r\n]\r\n",
+        )
+        .unwrap();
+        let e = Engine::open(p.to_str().unwrap(), &OpenOptions::default()).unwrap();
+        let schema = e.describe(&View::default()).unwrap();
+        let names: Vec<&str> = schema.columns.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["a", "b"]);
+        assert_eq!(e.count(&View::default()).unwrap(), 2);
+        assert_eq!(all_cells(&e)[1][1].as_deref(), Some("y"));
+
+        // A file of one object on each line with the same mark keeps its form.
+        let p = d.join("rows.ndjson");
+        std::fs::write(&p, b"\xEF\xBB\xBF{\"a\": 1}\n{\"a\": 2}\n").unwrap();
+        let e = Engine::open(p.to_str().unwrap(), &OpenOptions::default()).unwrap();
+        assert_eq!(e.count(&View::default()).unwrap(), 2);
+    }
+
+    #[test]
+    fn a_deep_file_in_a_glob_is_refused_and_does_not_stop_the_program() {
+        // The test of the depth looked at the first file of a set only. The
+        // reader examines each file of a set, so a deep second file filled the
+        // stack and stopped the whole program.
+        let d = tmpdir("json-deep-glob");
+        write_csv(&d, "a.json", "[{\"a\": 1}]");
+        let deep = format!("[{}1{}]", "{\"a\":".repeat(3000), "}".repeat(3000));
+        write_csv(&d, "b.json", &deep);
+        let pattern = format!("{}/*.json", db_path(&d));
+        let err = Engine::open(&pattern, &OpenOptions::default())
+            .map(|_| ())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("b.json"), "the message names the deep file: {err}");
+        assert!(err.contains("nests deeper"), "{err}");
     }
 }

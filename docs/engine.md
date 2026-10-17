@@ -90,7 +90,8 @@ that holds a SQLite database therefore gets a message about SQLite, and not a
 parse failure from the CSV reader. The marks are `DUCK` after the eight bytes of
 the checksum for DuckDB, and `SQLite format 3` and one zero byte for SQLite.
 For the third test the marks are `PAR1` for Parquet, `ARROW1` for Arrow, and `{`
-or `[` for JSON, after any spaces.
+or `[` for JSON, after any spaces and after a byte order mark. The head for this
+test is 4096 bytes long, so a JSON file can start with some empty lines.
 
 The function reads the head of the file with a limit and `read_to_end`, and not
 with one call to `read`. One call can give fewer bytes than the caller asked
@@ -131,9 +132,19 @@ Two rules stop it:
   number, so it can never fill the stack itself. It stops at the first level
   above 128, so a file that is made to be deep costs almost nothing to refuse.
   It reads 8 MB of the file at the most: a file that nests too deep does so at
-  its start, because each level is one character.
+  its start, because each level is one character. It examines each file of a
+  glob, because the reader examines a part of each file of a set to find its
+  columns. One deep file of a set stopped the program before this rule.
 - The read call also holds `maximum_depth = 128`. The reader then stops at that
-  level and gives the value below it as text.
+  level and gives the value below it as text. This limit does not protect the
+  part of the reader that finds the columns, so the first rule is necessary.
+
+A JSON file that holds a list behind a byte order mark needs one more option.
+PowerShell 5 writes the mark in front of each file that it writes as UTF-8. The
+reader of DuckDB does not see the list behind the mark, and it reads the whole
+file as one row with one column `json`. The function
+`source::json_list_behind_bom` finds such a file, and the read call then holds
+`format = 'array'`.
 
 ## One examination of a file of text
 

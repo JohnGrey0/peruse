@@ -108,6 +108,36 @@ fn effective_extension(path: &Path) -> (Option<String>, bool) {
     (ext, compressed)
 }
 
+/// The number of bytes that [`sniff_magic`] reads from the start of a file.
+const MAGIC_HEAD_LEN: usize = 4096;
+
+/// The byte order mark of UTF-8.
+const UTF8_BOM: &[u8] = b"\xEF\xBB\xBF";
+
+/// Gives `true` when a JSON file starts with a byte order mark and then a list.
+///
+/// The JSON reader of DuckDB does not see the list behind such a mark. It reads
+/// the whole file as one row, with one column `json` that holds the list. The
+/// caller then tells the reader that the file holds a list. Refer to
+/// `build_read_expr` in [`crate::engine`].
+///
+/// A program on Windows writes such a file often: PowerShell 5 writes the mark
+/// for each file that it writes as UTF-8.
+pub fn json_list_behind_bom(path: &Path) -> bool {
+    use std::io::Read;
+    let Ok(f) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut head = Vec::with_capacity(MAGIC_HEAD_LEN);
+    if f.take(MAGIC_HEAD_LEN as u64).read_to_end(&mut head).is_err() {
+        return false;
+    }
+    let Some(text) = head.strip_prefix(UTF8_BOM) else {
+        return false;
+    };
+    text.iter().find(|b| !b.is_ascii_whitespace()) == Some(&b'[')
+}
+
 /// Reads the first bytes of the file and finds the format from them.
 ///
 /// A Parquet file starts with `PAR1`, and an Arrow IPC file starts with
@@ -115,19 +145,26 @@ fn effective_extension(path: &Path) -> (Option<String>, bool) {
 /// are sufficient to tell such a file from a text file with rows.
 fn sniff_magic(path: &Path) -> Option<Format> {
     use std::io::Read;
-    let mut f = std::fs::File::open(path).ok()?;
-    let mut buf = [0u8; 16];
-    // Read what the file holds. A file of eight bytes is short, but it is
-    // still a file, and `read_exact` would give an error for it.
-    let n = f.read(&mut buf).ok()?;
-    let head = &buf[..n];
+    let f = std::fs::File::open(path).ok()?;
+    // Read what the file holds, up to the limit. A file of eight bytes is
+    // short, but it is still a file, and `read_exact` would give an error for
+    // it. One call to `read` can give fewer bytes than the caller asked for,
+    // so `read_to_end` over a reader with a limit fills the head.
+    //
+    // The head is long enough for the spaces and the empty lines that can
+    // come before the first `{` of a JSON file.
+    let mut head = Vec::with_capacity(MAGIC_HEAD_LEN);
+    f.take(MAGIC_HEAD_LEN as u64).read_to_end(&mut head).ok()?;
     if head.starts_with(b"PAR1") {
         return Some(Format::Parquet);
     }
     if head.starts_with(b"ARROW1") {
         return Some(Format::Arrow);
     }
-    match head.iter().find(|b| !b.is_ascii_whitespace()) {
+    // A program on Windows often writes a byte order mark in front of UTF-8
+    // text. The mark is not a part of the data.
+    let text = head.strip_prefix(UTF8_BOM).unwrap_or(&head);
+    match text.iter().find(|b| !b.is_ascii_whitespace()) {
         Some(b'{') | Some(b'[') => Some(Format::Json),
         _ => None,
     }
@@ -478,6 +515,26 @@ mod tests {
             std::fs::write(&p, body).unwrap();
             assert_eq!(detect(&p).0, want, "file {name}");
         }
+        // A JSON file can start with many spaces or empty lines, or with the
+        // byte order mark that a program on Windows writes. The head of 16
+        // bytes saw neither, and such a file went to the CSV reader.
+        let cases: [(&str, &[u8]); 2] = [
+            ("f.txt", b"                              \r\n\r\n  [{\"a\": 1}]"),
+            ("g.txt", b"\xEF\xBB\xBF{\"a\": 1}\n"),
+        ];
+        for (name, body) in cases {
+            let p = dir.join(name);
+            std::fs::write(&p, body).unwrap();
+            assert_eq!(detect(&p).0, Format::Json, "file {name}");
+        }
+        let p = dir.join("h.json");
+        std::fs::write(&p, b"\xEF\xBB\xBF  [{\"a\": 1}]").unwrap();
+        assert!(json_list_behind_bom(&p));
+        std::fs::write(&p, b"[{\"a\": 1}]").unwrap();
+        assert!(!json_list_behind_bom(&p), "no mark, no change");
+        std::fs::write(&p, b"\xEF\xBB\xBF{\"a\": 1}").unwrap();
+        assert!(!json_list_behind_bom(&p), "an object is not a list");
+
         // A file that holds nothing is not a reason to stop the program.
         let empty = dir.join("empty.bin");
         std::fs::write(&empty, b"").unwrap();
