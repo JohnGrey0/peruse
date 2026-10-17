@@ -264,60 +264,28 @@ impl Worker {
     /// Refer to [`crate::cache`].
     pub fn spawn_local(copy: &crate::cache::LocalCopy, opts: OpenOptions) -> Result<(Worker, Opened)> {
         let rw = copy.rewrite();
-        let (req_tx, req_rx) = unbounded::<Request>();
-        let (resp_tx, resp_rx) = unbounded::<Response>();
-        let (ready_tx, ready_rx) = bounded::<Result<(Opened, Arc<InterruptHandle>)>>(1);
+        let (mut worker, mut opened) =
+            Worker::spawn(&copy.input, opts).map_err(|e| rw.apply_error(&e))?;
+        opened.source.input = rw.origin.clone();
+        opened.source.local_copy = Some(rw.local.clone());
+        opened.read_expr = rw.apply(&opened.read_expr);
 
         // The responses go through a second thread that changes each path of
-        // the copy back to the path of the source. The loop of the worker
-        // therefore stays the same for a copy and for a file in place.
-        let (inner_tx, inner_rx) = unbounded::<Response>();
-        let names = rw.clone();
+        // the copy back to the path of the source. The worker and its loop
+        // therefore stay the same for a copy and for a file in place. The
+        // thread stops when the worker thread stops and closes its channel.
+        let (tx, rx) = unbounded::<Response>();
+        let inner = std::mem::replace(&mut worker.rx, rx);
         thread::Builder::new()
             .name("peruse-names".into())
             .spawn(move || {
-                for r in inner_rx {
-                    if resp_tx.send(name_source(&names, r)).is_err() {
+                for r in inner {
+                    if tx.send(name_source(&rw, r)).is_err() {
                         return;
                     }
                 }
             })?;
-
-        let input = copy.input.clone();
-        let handle = thread::Builder::new()
-            .name("peruse-engine".into())
-            .spawn(move || {
-                let mut engine = match Engine::open(&input, &opts) {
-                    Ok(e) => e,
-                    Err(e) => {
-                        let _ = ready_tx.send(Err(rw.apply_error(&e)));
-                        return;
-                    }
-                };
-                engine.source.input = rw.origin.clone();
-                engine.source.local_copy = Some(rw.local.clone());
-                let opened = Opened {
-                    schema: engine.base_schema().clone(),
-                    source: engine.source.clone(),
-                    seekable: engine.is_seekable(),
-                    read_expr: rw.apply(engine.read_expr()),
-                };
-                if ready_tx.send(Ok((opened, engine.interrupt_handle()))).is_err() {
-                    return;
-                }
-                run(&mut engine, &req_rx, &inner_tx);
-            })?;
-
-        let (opened, interrupt) = ready_rx.recv()??;
-        Ok((
-            Worker {
-                tx: req_tx,
-                rx: resp_rx,
-                interrupt,
-                handle: Some(handle),
-            },
-            opened,
-        ))
+        Ok((worker, opened))
     }
 
     /// Sends one request to the worker thread.
