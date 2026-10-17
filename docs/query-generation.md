@@ -32,19 +32,36 @@ Three private functions build the parts that each statement needs:
 |---|---|---|
 | `relation()` | `src AS q` | `(<statement>) AS q` |
 | `where_clause()` | `` (empty) `` or ` WHERE (<filter>)` | The same |
-| `order_clause()` | `` (empty) `` or ` ORDER BY "a" ASC, "b" DESC, COLUMNS(*)` | The same |
+| `order_clause()` | `` (empty) `` or ` ORDER BY "a" ASC, "b" DESC, "__peruse_row_order"` | `` (empty) `` or ` ORDER BY "a" ASC, "b" DESC, COLUMNS(*)` |
 
 The function `relation()` removes a semicolon at the end of a statement from
-the user. Each statement uses the same name `q` for its one relation.
+the user. Each statement uses the same name `q` for its one relation. A sorted
+statement over the file reads the view `src_ord AS q` and not `src AS q`.
 
-The part `COLUMNS(*)` at the end of a sort is necessary. The sort of DuckDB is
-not stable, and it uses each thread, so two rows with the same sort value can
-come in a different order in each statement. Each page is one statement. Without
-the part, a sort on a column with repeated values showed some rows on two pages
-and other rows on none, and the same page changed when the user scrolled back to
-it. With the part, the database sorts such rows by each of their values, and two
-rows that it still cannot put in order look the same. On a Parquet file of 20
-million rows, the first sorted page costs about 200 milliseconds and not 80.
+The last part of a sort is necessary. The sort of DuckDB is not stable, and it
+uses each thread, so two rows with the same sort value can come in a different
+order in each statement. Each page is one statement. Without the part, a sort on
+a column with repeated values showed some rows on two pages and other rows on
+none, and the same page changed when the user scrolled back to it.
+
+* Over the file, the sort ends with the position of each row in the file. The
+  view `src_ord` holds `src` and that position in the column
+  `__peruse_row_order`. Each row has its own position, so rows with the same
+  sort value keep the order of the file. The position comes from the metadata:
+  `file_row_number` of a Parquet file (with `file_index` for a set of files),
+  and `rowid` of a table of a database or of the index of a file of text. On a
+  Parquet file of 10 million rows, the first sorted window of 550 rows costs 77
+  milliseconds with it, and 667 with `COLUMNS(*)`.
+* A statement of the user, and a file of text with no index, have no position.
+  The sort then ends with `COLUMNS(*)`, and the database sorts such rows by each
+  of their values. Two rows that it still cannot put in order look the same. The
+  engine gives such a file to the functions here as the statement
+  `SELECT * FROM src`. On a CSV file the scan costs the most, so the part costs
+  almost nothing there. A number from `row_number()` would also be a position,
+  but on a CSV file of 1.4 GB it made the first sorted window cost 3.6 s and not
+  0.5 s.
+* A file with a column of the name `__peruse_row_order`, or of the name that
+  gives the position, gets no `src_ord`, and its sort ends with `COLUMNS(*)`.
 
 Two public functions join those parts:
 

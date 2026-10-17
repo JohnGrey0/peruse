@@ -20,13 +20,14 @@
 use anyhow::{bail, Context, Result};
 use duckdb::types::Value;
 use duckdb::{Connection, InterruptHandle};
+use std::borrow::Cow;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use crate::ddl::{ColumnProfile, TableProfile};
 use crate::meta::{ColumnFooterStats, CsvMeta, FileEntry, FileMeta, ParquetMeta};
 use crate::model::{CellKind, Column, RowPage, Schema};
-use crate::query::{quote_ident, quote_str, View};
+use crate::query::{quote_ident, quote_str, Base, View, ORDER_COLUMN, ORDER_VIEW};
 use crate::source::{self, Format, Source};
 use crate::stats::{CellKindWrapper, ColumnStats, Histogram};
 
@@ -301,6 +302,13 @@ pub struct Engine {
     /// The value is `None` for a file. A file holds one table, and that table
     /// has no name of its own.
     table: Option<DbTable>,
+    /// The statement of the view [`ORDER_VIEW`], or `None` when the source
+    /// gives no position of a row. Refer to [`Engine::define_order_view`].
+    order_view: Option<String>,
+    /// True when the view [`ORDER_VIEW`] gives the position of each row in the
+    /// file. The engine makes that view at the first sorted request. Refer to
+    /// [`Engine::ordered`].
+    ordered: OnceLock<bool>,
 }
 
 /// What the DuckDB CSV sniffer found about a file.
@@ -562,6 +570,8 @@ impl Engine {
             base_schema: Schema::default(),
             csv_dialect: None,
             table: None,
+            order_view: None,
+            ordered: OnceLock::new(),
         };
 
         // A file of text and a file of JSON hold no schema. DuckDB therefore
@@ -640,6 +650,8 @@ impl Engine {
             base_schema: Schema::default(),
             csv_dialect: None,
             table: Some(table),
+            order_view: None,
+            ordered: OnceLock::new(),
         };
         // Read the schema now, in the same way as for a file. A name that the
         // database does not hold therefore gives an error here.
@@ -664,8 +676,94 @@ impl Engine {
         let schema = self
             .read_schema(&View::default())
             .map_err(|e| open_error(&input, &e.to_string()))?;
+        let position = if self.source.format == Format::Parquet {
+            // A set of files numbers the rows of each file from 0, so the
+            // position of a row also needs the position of its file.
+            Some(if self.source.is_multi() {
+                "(file_index::BIGINT << 40) + file_row_number"
+            } else {
+                "file_row_number"
+            })
+        } else if self.table.as_ref().is_some_and(|t| !t.is_view) {
+            Some("rowid")
+        } else {
+            None
+        };
+        self.define_order_view(&expr, position, &schema);
         self.scan_expr = expr;
         Ok(schema)
+    }
+
+    /// Prepares the view [`ORDER_VIEW`]: each column of `src`, and the
+    /// position of each row in the file. A sorted view over the file reads it,
+    /// and its sort ends with that position. Refer to [`View::order_by`].
+    ///
+    /// `position` is an expression over `from` that gives the position from
+    /// the metadata: the row number of a Parquet file, or the row id of a
+    /// table. It costs almost nothing, because DuckDB reads it only for the
+    /// rows that it sorts.
+    ///
+    /// A file of text has no such expression, and the engine then makes no
+    /// view. A sorted view over that file ends its sort with each of its
+    /// columns. A number from `row_number()` is also a position, but it costs
+    /// too much: on a CSV file of 1.4 GB, a sorted window of 550 rows costs 3.6
+    /// s with it, and 0.5 s with each column.
+    ///
+    /// The file can hold a column with the name of the position, or with the
+    /// name that the expression reads. Then that name does not give the
+    /// position, and the engine makes no view.
+    ///
+    /// The engine makes the view at the first sorted request, and not here.
+    /// The view reads the metadata of each file again, and on a set of 500
+    /// Parquet files that made the open operation 36 ms slower.
+    fn define_order_view(&mut self, from: &str, position: Option<&str>, schema: &Schema) {
+        // DuckDB compares names with no difference between upper case and
+        // lower case.
+        let taken = |p: &str| {
+            schema.columns.iter().any(|c| {
+                let name = c.name.to_ascii_lowercase();
+                name == ORDER_COLUMN
+                    || ["rowid", "file_row_number", "file_index"]
+                        .iter()
+                        .any(|n| name == *n && p.contains(n))
+            })
+        };
+        self.order_view = position
+            .filter(|p| !taken(p))
+            .map(|p| format!("SELECT *, {p} AS {} FROM {from}", quote_ident(ORDER_COLUMN)));
+        self.ordered = OnceLock::new();
+    }
+
+    /// Gives `true` when the view [`ORDER_VIEW`] gives the position of each
+    /// row in the file. The first call makes that view.
+    fn ordered(&self) -> bool {
+        *self.ordered.get_or_init(|| {
+            self.order_view.as_ref().is_some_and(|body| {
+                self.conn
+                    .execute_batch(&format!(
+                        "CREATE OR REPLACE VIEW {} AS {body}",
+                        quote_ident(ORDER_VIEW)
+                    ))
+                    .is_ok()
+            })
+        })
+    }
+
+    /// Gives the view that a statement over the rows of `view` must use.
+    ///
+    /// A sorted view over the file ends its sort with the position of each
+    /// row, from [`ORDER_VIEW`]. A source with no such view becomes the
+    /// statement `SELECT * FROM src`, whose sort ends with each of its columns.
+    /// The two give the same rows, so the user sees no difference.
+    fn sorted_view<'a>(&self, view: &'a View) -> Cow<'a, View> {
+        if view.is_source() && !view.sort.is_empty() && !self.ordered() {
+            Cow::Owned(View {
+                base: Base::Sql("SELECT * FROM src".into()),
+                ..view.clone()
+            })
+        } else {
+            Cow::Borrowed(view)
+        }
     }
 
     /// Asks the CSV sniffer one time, and writes the dialect and the columns
@@ -840,7 +938,7 @@ impl Engine {
             return Ok(RowPage::new(offset, 0, Vec::new()));
         }
         let ncols = schema.len();
-        let sql = view.page_sql(schema, limit, offset);
+        let sql = self.sorted_view(view).page_sql(schema, limit, offset);
         let mut stmt = self.conn.prepare(&sql)?;
         let mut rows = stmt.query([])?;
         let mut cells: Vec<Option<String>> = Vec::with_capacity(limit as usize * ncols);
@@ -908,7 +1006,7 @@ impl Engine {
     /// A page holds a short form of a long value. This function gives the
     /// complete value.
     pub fn cell(&self, view: &View, column: &str, row: u64) -> Result<Option<String>> {
-        let sql = view.cell_sql(column, row);
+        let sql = self.sorted_view(view).cell_sql(column, row);
         let mut stmt = self.conn.prepare(&sql)?;
         let mut rows = stmt.query([])?;
         match rows.next()? {
@@ -961,7 +1059,7 @@ impl Engine {
     ///
     /// The function gives `None` when the view holds no row at that offset.
     pub fn row_json(&self, view: &View, schema: &Schema, row: u64) -> Result<Option<String>> {
-        let sql = view.row_json_sql(schema, row);
+        let sql = self.sorted_view(view).row_json_sql(schema, row);
         let mut stmt = self.conn.prepare(&sql)?;
         let mut rows = stmt.query([])?;
         match rows.next()? {
@@ -1012,13 +1110,14 @@ impl Engine {
             scan_rows
         };
 
+        let sorted = self.sorted_view(view);
         let mut out: Vec<u64> = Vec::new();
         let mut done = 0u64;
         let mut window = first;
         while done < scan_rows && out.len() < limit as usize {
             let take = window.min(scan_rows - done);
             let need = limit - out.len() as u32;
-            let sql = view.search_sql(schema, needle, from_row + done, take, need);
+            let sql = sorted.search_sql(schema, needle, from_row + done, take, need);
             if sql.is_empty() {
                 // No column of the view holds text that a search can read.
                 return Ok(Vec::new());
@@ -1476,6 +1575,10 @@ impl Engine {
              CREATE OR REPLACE VIEW src AS SELECT * FROM {MAT_TABLE};",
             self.scan_expr
         ))?;
+        // The table keeps the order of the file, so the row id of a row is its
+        // position in the file.
+        let schema = self.base_schema.clone();
+        self.define_order_view(MAT_TABLE, Some("rowid"), &schema);
         self.indexed = true;
         Ok(())
     }
@@ -3990,6 +4093,132 @@ mod tests {
     /// Gives the cell `(row, col)` of a page as an owned text.
     fn text_at(page: &RowPage, row: usize, col: usize) -> Option<String> {
         page.cell(row, col).map(str::to_string)
+    }
+
+    /// Reads each page of a sorted view over the column `k`, and gives the
+    /// column `id` of each row in the order of the pages.
+    fn sorted_ids(e: &Engine, rows: u64) -> Vec<i64> {
+        let view = View {
+            sort: vec![crate::query::SortKey {
+                column: "k".into(),
+                dir: crate::query::SortDir::Asc,
+            }],
+            ..Default::default()
+        };
+        let schema = e.describe(&view).unwrap();
+        let mut out = Vec::new();
+        for n in 0..rows.div_ceil(700) {
+            let page = e.page(&view, &schema, 700, n * 700).unwrap();
+            for r in 0..page.nrows {
+                out.push(page.cell(r, 0).unwrap().parse().unwrap());
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn each_kind_of_source_sorts_its_ties_in_the_order_of_the_file() {
+        // The sort ends with the position of the row in the file, where the
+        // metadata gives it: the row number of a Parquet file and of a set of
+        // them, and the row id of a table and of the index of a file of text.
+        // A file of text with no index ends its sort with each column. Each of
+        // them must give each row on one page only, and here the rows of one
+        // value in the order of the file.
+        let rows = 20_000u64;
+        let want: Vec<i64> = (0..3)
+            .flat_map(|k| (0..rows as i64).filter(move |i| i % 3 == k))
+            .collect();
+        let d = tmpdir("sort-ties-each-source");
+        let conn = Connection::open_in_memory().unwrap();
+        let body = format!("SELECT i AS id, i % 3 AS k FROM range({rows}) t(i)");
+        let half = rows / 2;
+        conn.execute_batch(&format!(
+            "COPY ({body}) TO '{0}/t.parquet' (FORMAT parquet, ROW_GROUP_SIZE 1000);
+             COPY ({body} WHERE i < {half}) TO '{0}/set-0.parquet' (FORMAT parquet, ROW_GROUP_SIZE 1000);
+             COPY ({body} WHERE i >= {half}) TO '{0}/set-1.parquet' (FORMAT parquet, ROW_GROUP_SIZE 1000);
+             COPY ({body}) TO '{0}/t.csv' (FORMAT csv, HEADER);
+             ATTACH '{0}/t.duckdb' AS out;
+             CREATE TABLE out.t AS {body};
+             DETACH out;",
+            db_path(&d)
+        ))
+        .unwrap();
+        let opts = OpenOptions {
+            threads: Some(4),
+            ..Default::default()
+        };
+        for name in ["t.parquet", "set-*.parquet", "t.csv", "t.duckdb"] {
+            let path = format!("{}/{name}", db_path(&d));
+            let mut e = Engine::open(&path, &opts).unwrap();
+            // The open operation does not pay for the view. The first sort does.
+            let views = |e: &Engine| -> i64 {
+                e.conn
+                    .query_row(
+                        &format!(
+                            "SELECT count(*) FROM duckdb_views() WHERE view_name = '{ORDER_VIEW}'"
+                        ),
+                        [],
+                        |r| r.get(0),
+                    )
+                    .unwrap()
+            };
+            assert_eq!(views(&e), 0, "{name}");
+            assert_eq!(sorted_ids(&e, rows), want, "{name}");
+            assert_eq!(e.ordered(), name != "t.csv", "{name}");
+            assert_eq!(views(&e), i64::from(name != "t.csv"), "{name}");
+            if !e.is_seekable() {
+                e.materialize().unwrap();
+                assert!(e.ordered(), "{name} with its index");
+                assert_eq!(sorted_ids(&e, rows), want, "{name} with its index");
+            }
+        }
+    }
+
+    #[test]
+    fn a_column_with_the_name_of_the_position_does_not_give_the_position() {
+        // A column of the file with the name `file_row_number` or `rowid` hides
+        // the value of DuckDB with that name. Its values can repeat, so the
+        // sort must then end with each column.
+        let rows = 3_000u64;
+        let want: Vec<i64> = (0..3)
+            .flat_map(|k| (0..rows as i64).filter(move |i| i % 3 == k))
+            .collect();
+        let d = tmpdir("sort-position-name");
+        let conn = Connection::open_in_memory().unwrap();
+        let body = |extra: &str| {
+            format!("SELECT i AS id, i % 3 AS k, 0 AS {extra} FROM range({rows}) t(i)")
+        };
+        conn.execute_batch(&format!(
+            "COPY ({1}) TO '{0}/t.parquet' (FORMAT parquet, ROW_GROUP_SIZE 500);
+             COPY ({2}) TO '{0}/t.csv' (FORMAT csv, HEADER);
+             COPY ({3}) TO '{0}/u.csv' (FORMAT csv, HEADER);",
+            db_path(&d),
+            body("File_Row_Number"),
+            body("rowid"),
+            body("__peruse_row_order"),
+        ))
+        .unwrap();
+        for name in ["t.parquet", "t.csv", "u.csv"] {
+            let path = format!("{}/{name}", db_path(&d));
+            let mut e = Engine::open(&path, &OpenOptions::default()).unwrap();
+            e.materialize().unwrap();
+            assert!(!e.ordered(), "{name}");
+            assert_eq!(sorted_ids(&e, rows), want, "{name}");
+        }
+    }
+
+    #[test]
+    fn a_column_named_id_keeps_the_position_of_a_table() {
+        // The name `id` is a part of the name `rowid`, and that must not count.
+        let d = tmpdir("sort-position-id");
+        let p = write_csv(&d, "t.csv", "id,k
+1,2
+2,1
+");
+        let mut e = Engine::open(p.to_str().unwrap(), &OpenOptions::default()).unwrap();
+        e.materialize().unwrap();
+        assert!(e.ordered());
+        assert_eq!(sorted_ids(&e, 2), vec![2, 1]);
     }
 
     #[test]

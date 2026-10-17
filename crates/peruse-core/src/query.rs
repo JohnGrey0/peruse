@@ -163,6 +163,19 @@ pub struct View {
 /// The name that each generated statement gives to its one relation.
 const ALIAS: &str = "q";
 
+/// The view that a sorted statement over the file reads.
+///
+/// The view holds each column of `src` and one more, [`ORDER_COLUMN`]. The
+/// engine makes it. Refer to [`View::order_by`] for the reason.
+pub const ORDER_VIEW: &str = "src_ord";
+
+/// The column of [`ORDER_VIEW`] that gives the position of each row in the file.
+///
+/// The value is different for each row, so a sort that ends with it puts each
+/// row in one position. The page statement names each column that it shows, so
+/// the grid never shows this one.
+pub const ORDER_COLUMN: &str = "__peruse_row_order";
+
 impl View {
     /// Gives `true` when the view reads the file, and not a statement from the
     /// user.
@@ -183,6 +196,19 @@ impl View {
         match &self.base {
             Base::Source => format!("src AS {ALIAS}"),
             Base::Sql(sql) => format!("({}) AS {ALIAS}", sql.trim().trim_end_matches(';')),
+        }
+    }
+
+    /// Gives the relation of a statement that holds the `ORDER BY` part.
+    ///
+    /// A sorted view over the file reads [`ORDER_VIEW`], because its sort ends
+    /// with [`ORDER_COLUMN`]. Each other statement reads `src`, so a count or a
+    /// statistic does not pay for a column that it does not need.
+    fn sorted_relation(&self) -> String {
+        if self.is_source() && !self.sort.is_empty() {
+            format!("{ORDER_VIEW} AS {ALIAS}")
+        } else {
+            self.relation()
         }
     }
 
@@ -213,10 +239,21 @@ impl View {
     /// repeated values showed some rows on two pages and other rows on none,
     /// and the same page changed when the user scrolled back to it.
     ///
-    /// The part `COLUMNS(*)` at the end sorts such rows by each of their
-    /// values. Two rows that it cannot put in order hold the same values, so
-    /// the user cannot see which of the two comes first. The cost is about two
-    /// to three times the cost of the sort alone.
+    /// A view over the file therefore ends its sort with [`ORDER_COLUMN`], the
+    /// position of the row in the file. Each row has its own position, so each
+    /// row has one place in the sort, and rows with the same sort value keep the
+    /// order of the file. A Parquet file and a table give that position from
+    /// their metadata, so it costs almost nothing: a sorted window of 550 rows
+    /// over 10 million rows of Parquet costs 77 ms with it, and 667 ms with
+    /// `COLUMNS(*)`.
+    ///
+    /// A statement of the user has no position of a row. Its sort ends with
+    /// `COLUMNS(*)`, which sorts such rows by each of their values. Two rows
+    /// that it cannot put in order hold the same values, so the user cannot see
+    /// which of the two comes first. A file of text with no index has no
+    /// position either, and the engine gives it to this function as the
+    /// statement `SELECT * FROM src`. There the scan of the text costs the most,
+    /// and `COLUMNS(*)` adds almost nothing.
     fn order_by(&self) -> String {
         if self.sort.is_empty() {
             return String::new();
@@ -226,7 +263,11 @@ impl View {
             .iter()
             .map(|k| format!("{} {}", quote_ident(&k.column), k.dir.sql()))
             .collect();
-        format!("ORDER BY {}, COLUMNS(*)", keys.join(", "))
+        if self.is_source() {
+            format!("ORDER BY {}, {}", keys.join(", "), quote_ident(ORDER_COLUMN))
+        } else {
+            format!("ORDER BY {}, COLUMNS(*)", keys.join(", "))
+        }
     }
 
     /// Gives the same text as [`View::order_by`], with a space in front.
@@ -243,7 +284,7 @@ impl View {
     pub fn select(&self, projection: &str) -> String {
         format!(
             "SELECT {projection} FROM {}{}{}",
-            self.relation(),
+            self.sorted_relation(),
             self.where_clause(),
             self.order_clause()
         )
@@ -340,7 +381,7 @@ impl View {
         format!(
             "SELECT CAST({} AS VARCHAR) FROM {}{}{} LIMIT 1 OFFSET {offset}",
             quote_ident(column),
-            self.relation(),
+            self.sorted_relation(),
             self.where_clause(),
             self.order_clause()
         )
@@ -668,9 +709,26 @@ mod tests {
         };
         assert_eq!(
             v.select("*"),
-            "SELECT * FROM src AS q WHERE (amount > 100) ORDER BY \"amount\" DESC, \"id\" ASC, COLUMNS(*)"
+            "SELECT * FROM src_ord AS q WHERE (amount > 100) ORDER BY \"amount\" DESC, \"id\" ASC, \"__peruse_row_order\""
         );
         assert!(!v.is_unfiltered_source());
+        // A count and a statistic do not sort, so they read `src`.
+        assert_eq!(v.count_sql(), "SELECT count(*) FROM src AS q WHERE (amount > 100)");
+    }
+
+    #[test]
+    fn a_sorted_statement_of_the_user_sorts_its_ties_by_each_value() {
+        // A statement of the user has no position of a row, so the sort ends
+        // with each of its columns.
+        let v = View {
+            base: Base::Sql("SELECT 1 AS x".into()),
+            sort: vec![SortKey { column: "x".into(), dir: SortDir::Asc }],
+            ..Default::default()
+        };
+        assert_eq!(
+            v.select("*"),
+            "SELECT * FROM (SELECT 1 AS x) AS q ORDER BY \"x\" ASC, COLUMNS(*)"
+        );
     }
 
     #[test]
@@ -911,7 +969,7 @@ mod tests {
         };
         let sql = v.search_sql(&schema(), "x", 0, 100, 10);
         assert!(
-            sql.contains("ORDER BY \"id\" DESC, COLUMNS(*) LIMIT 100 OFFSET 0"),
+            sql.contains("ORDER BY \"id\" DESC, \"__peruse_row_order\" LIMIT 100 OFFSET 0"),
             "slice must be taken from the sorted view: {sql}"
         );
     }
