@@ -77,6 +77,33 @@ pub fn width_capped(s: &str, cap: usize) -> usize {
     used
 }
 
+/// Gives the first screen column of the line that a prompt shows.
+///
+/// A line that is longer than the prompt scrolls, so the cursor and the text
+/// in front of it stay on the screen. The cursor is then on the last column of
+/// the prompt at the most. Without this rule, the user types with no sight of
+/// the line as soon as it is longer than the screen.
+pub fn scroll_start(cursor_col: usize, width: usize) -> usize {
+    cursor_col.saturating_sub(width.saturating_sub(1))
+}
+
+/// Removes the first `n` screen columns of a text.
+///
+/// The function gives the rest of the text, and the number of blank screen
+/// columns that go in front of it. A character of two screen columns can sit
+/// across the cut. The function then removes that character, and gives one
+/// blank column for the half of it that was after the cut.
+pub fn drop_cols(s: &str, n: usize) -> (&str, usize) {
+    let mut used = 0usize;
+    for (i, c) in s.char_indices() {
+        if used >= n {
+            return (&s[i..], used - n);
+        }
+        used += c.width().unwrap_or(0);
+    }
+    ("", 0)
+}
+
 /// Cuts a text and then adds spaces, until the text has the width `w`.
 pub fn fit(s: &str, w: usize, align: Align) -> String {
     let t = truncate(s, w);
@@ -285,6 +312,32 @@ mod tests {
         let lines = wrap("the quick brown fox", 10);
         assert!(lines.iter().all(|l| width(l) <= 10), "{lines:?}");
         assert_eq!(wrap("a\n\nb", 10), vec!["a", "", "b"]);
+    }
+
+    #[test]
+    fn a_line_scrolls_so_that_the_cursor_is_on_the_screen() {
+        // A cursor inside the width needs no scroll.
+        assert_eq!(scroll_start(0, 10), 0);
+        assert_eq!(scroll_start(9, 10), 0);
+        // The cursor on the column after the last one moves the line by one.
+        assert_eq!(scroll_start(10, 10), 1);
+        assert_eq!(scroll_start(25, 10), 16);
+        // A prompt with no room puts the cursor on its first column.
+        assert_eq!(scroll_start(7, 0), 7);
+        assert_eq!(scroll_start(7, 1), 7);
+    }
+
+    #[test]
+    fn dropping_columns_keeps_the_rest_and_says_how_many_blanks_go_first() {
+        assert_eq!(drop_cols("hello", 0), ("hello", 0));
+        assert_eq!(drop_cols("hello", 2), ("llo", 0));
+        assert_eq!(drop_cols("hello", 5), ("", 0));
+        assert_eq!(drop_cols("hello", 9), ("", 0));
+        // A character of two columns across the cut goes away, and one blank
+        // column stands for its second half.
+        assert_eq!(drop_cols("日本語", 1), ("本語", 1));
+        assert_eq!(drop_cols("日本語", 2), ("本語", 0));
+        assert_eq!(drop_cols("a日b", 2), ("b", 1));
     }
 
     #[test]

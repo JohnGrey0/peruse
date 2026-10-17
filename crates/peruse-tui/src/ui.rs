@@ -330,10 +330,46 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App, p: &Paint) -> Option<Positi
         let vx = area.x + lw as u16;
         let avail = (area.width as usize).saturating_sub(lw);
 
+        // Report a bad expression while the user types it. The message goes
+        // at the right side, so it does not move the text of the user. Its
+        // width is known first, so the line can keep the cursor out from
+        // under it.
+        let err = app.prompt_error.as_ref().map(|err| format!(" ✕ {err}"));
+        let err_w = err
+            .as_ref()
+            .map(|msg| text::width(msg).min(area.width as usize / 2))
+            .filter(|mw| *mw > 4)
+            .unwrap_or(0);
+
+        // A line that is longer than the prompt scrolls, so the cursor and the
+        // text in front of it stay on the screen. The first `skip` screen
+        // columns of the line are then outside the screen, at the left.
+        let window = if err_w > 0 {
+            avail.saturating_sub(err_w + 1).max(1)
+        } else {
+            avail
+        };
+        let skip = text::scroll_start(app.input.cursor_col(), window);
+        let cursor_x = vx.saturating_add((app.input.cursor_col() - skip) as u16);
+
         match kind {
             PromptKind::Filter | PromptKind::Sql => {
                 let mut x = vx;
+                // The screen column of the segment inside the whole line.
+                let mut col = 0usize;
                 for (seg, tok) in sqlhl::tokens(&value) {
+                    let sw = text::width(&seg);
+                    if col + sw <= skip {
+                        col += sw;
+                        continue;
+                    }
+                    let (shown, blank) = if col < skip {
+                        text::drop_cols(&seg, skip - col)
+                    } else {
+                        (seg.as_str(), 0)
+                    };
+                    col += sw;
+                    x = x.saturating_add(blank as u16);
                     if x >= area.right() {
                         break;
                     }
@@ -346,46 +382,43 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App, p: &Paint) -> Option<Positi
                         Tok::Punct | Tok::Space => base,
                     };
                     let w = (area.right() - x) as usize;
-                    buf.set_stringn(x, area.y, &seg, w, style);
-                    x += text::width(&seg).min(w) as u16;
+                    buf.set_stringn(x, area.y, shown, w, style);
+                    x += text::width(shown).min(w) as u16;
                 }
             }
             _ => {
-                buf.set_stringn(vx, area.y, text::truncate(&value, avail), avail, base);
+                let (shown, blank) = text::drop_cols(&value, skip);
+                let bx = vx.saturating_add(blank as u16);
+                if bx < area.right() {
+                    let w = (area.right() - bx) as usize;
+                    buf.set_stringn(bx, area.y, text::truncate(shown, w), w, base);
+                }
             }
         }
 
         // The name of a column that the user did not type yet, in a dim
         // color, after the cursor. The key Tab and the key -> take it.
-        if let Some(rest) = app.ghost() {
-            let gx = vx + app.input.cursor_col() as u16;
-            if gx < area.right() {
-                let w = (area.right() - gx) as usize;
-                buf.set_stringn(
-                    gx,
-                    area.y,
-                    text::truncate(&rest, w),
-                    w,
-                    p.on(t.dim, t.bg),
-                );
-            }
+        if let Some(rest) = app.ghost()
+            && cursor_x < area.right()
+        {
+            let w = (area.right() - cursor_x) as usize;
+            buf.set_stringn(
+                cursor_x,
+                area.y,
+                text::truncate(&rest, w),
+                w,
+                p.on(t.dim, t.bg),
+            );
         }
 
-        // Report a bad expression while the user types it. The message
-        // goes at the right side, so it does not move the text of the user.
-        if let Some(err) = &app.prompt_error {
-            let msg = format!(" ✕ {err}");
-            let mw = text::width(&msg).min(area.width as usize / 2);
-            if mw > 4 {
-                let mx = area.right() - mw as u16;
-                buf.set_stringn(mx, area.y, text::truncate(&msg, mw), mw, p.on(t.error, t.bg));
-            }
+        if let Some(msg) = &err
+            && err_w > 0
+        {
+            let mx = area.right() - err_w as u16;
+            buf.set_stringn(mx, area.y, text::truncate(msg, err_w), err_w, p.on(t.error, t.bg));
         }
 
-        return Some(Position::new(
-            (vx + app.input.cursor_col() as u16).min(area.right() - 1),
-            area.y,
-        ));
+        return Some(Position::new(cursor_x.min(area.right() - 1), area.y));
     }
 
     if let Some(s) = &app.status {

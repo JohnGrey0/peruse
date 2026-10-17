@@ -3188,3 +3188,35 @@ fn the_scroll_bar_never_covers_the_last_character_of_a_column() {
     assert_eq!(shown.trim(), want, "the value is cut\n{s}");
 }
 
+#[test]
+fn the_prompt_scrolls_so_that_the_cursor_and_the_text_before_it_stay_on_the_screen() {
+    use ratatui::crossterm::event::KeyCode;
+    let p = write_sample("prompt-scroll", SAMPLE, "csv");
+    let (mut app, _) = open(&p);
+    let mut term = Terminal::new(TestBackend::new(60, 10)).unwrap();
+    settle(&mut app, &mut term);
+
+    app.run(Cmd::Sql);
+    type_text(&mut app, "region = 'EU' AND amount > 100 AND name LIKE '%zebra%'");
+    assert!(
+        app.input.cursor_col() + 6 > 60,
+        "the line fits on the screen, so the test proves nothing"
+    );
+    frame(&mut app, &mut term);
+    // The status line is the row above the footer.
+    let row = lines(&term)[8].clone();
+    assert!(
+        row.contains("'%zebra%'"),
+        "the end of the line, where the user types, is not on the screen: {row:?}"
+    );
+    let cursor = term.get_cursor_position().unwrap();
+    assert!(cursor.x < 60, "the cursor is outside the screen: {cursor:?}");
+    assert_eq!(cursor.y, 8);
+
+    // The key Home moves the cursor to the start, and the start comes back.
+    press(&mut app, KeyCode::Home);
+    frame(&mut app, &mut term);
+    let row = lines(&term)[8].clone();
+    assert!(row.contains("SELECT * FROM src"), "the start is not on the screen: {row:?}");
+}
+
