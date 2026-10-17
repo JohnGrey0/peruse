@@ -61,6 +61,11 @@ The function `Engine::open` does these steps:
     read call. See [One examination of a file of
     text](#one-examination-of-a-file-of-text).
 
+A large file on a network drive arrives here as the path of a local copy. The
+engine reads the copy, and it does not know that the copy is a copy. The worker
+writes the path of the source into the source and into each message. See
+[local-copies.md](local-copies.md).
+
 The engine changes each backslash in a path to a forward slash. DuckDB accepts
 a forward slash on each platform. In a glob pattern, DuckDB reads a backslash
 as an escape character.

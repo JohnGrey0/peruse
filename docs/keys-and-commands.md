@@ -134,6 +134,7 @@ moves the cursor, and the plain letter changes the band.
 | `t` | `ThemeNext` | next theme |
 | `T` | `ThemePicker` | choose a theme |
 | `,` | `Settings` | settings, and what this machine gives |
+| `C` | `ClearCopies` | clear the local copies of files from network drives. The first `C` asks, and a second `C` in 5 seconds clears |
 | `?`, `F1` | `Help` | this help |
 | `:`, `p` | `Palette` | run a command by name |
 | `Esc` | `Cancel` | cancel the running query |
