@@ -23,10 +23,10 @@ pub fn plain(key: &KeyEvent) -> bool {
 /// Gives `true` when a character key comes from the key `AltGr`.
 ///
 /// A European keyboard gives many characters with `AltGr`: `@`, `[`, `{`, `|`
-/// and `\` on a German keyboard, `#` on a French keyboard, and letters such
-/// as `ą` and `ł` on a Polish keyboard. Windows reports that key as Ctrl and
-/// Alt together. Such a key is a character to type, and not a chord: without
-/// this test, the prompt would refuse each of those characters.
+/// and `\` on a German keyboard, `#` on a French keyboard, and the letters
+/// with a tail or a stroke on a Polish keyboard. Windows reports that key as
+/// Ctrl and Alt together. Such a key is a character to type, and not a chord:
+/// without this test, the prompt would refuse each of those characters.
 pub fn is_altgr(key: &KeyEvent) -> bool {
     matches!(key.code, KeyCode::Char(_))
         && key
@@ -410,7 +410,8 @@ mod tests {
     #[test]
     fn a_character_from_the_altgr_key_goes_into_the_line() {
         // Windows reports AltGr as Ctrl and Alt together. A German keyboard
-        // gives `@`, `[` and `|` with it, and a Polish keyboard gives `ł`.
+        // gives `@`, `[` and `|` with it, and a Polish keyboard gives the
+        // letter l with a stroke.
         let altgr = KeyModifiers::CONTROL | KeyModifiers::ALT;
         let mut i = typed("a ");
         for c in ['|', '|', '[', '@', 'ł', '€'] {
