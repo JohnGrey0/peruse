@@ -305,6 +305,52 @@ fn db_path(p: &Path) -> String {
     p.to_string_lossy().replace('\\', "/")
 }
 
+/// Gives `true` when a compressed JSON file nests deeper than
+/// [`MAX_JSON_DEPTH`] in a record that the reader examines.
+///
+/// The test of [`source::json_depth_over`] reads the bytes of the file, and
+/// the bytes of a compressed file are not JSON. A file of 80 bytes can then
+/// hold 3000 levels, and it stops the program. Peruse holds no decompressor,
+/// but DuckDB does. The function `read_json_objects` gives each record as
+/// text, and it finds no columns, so it does not call itself for each level.
+/// Peruse then counts the levels of each text with a loop.
+///
+/// The function reads twice the records that the reader examines, as
+/// [`source::json_depth_over`] does. A record that DuckDB cannot read gives an
+/// error here. The reader then gives the same error, so the function gives
+/// `false` and lets the reader report it.
+fn compressed_json_too_deep(
+    conn: &Connection,
+    path: &Path,
+    records: Option<u64>,
+    ignore_errors: bool,
+) -> bool {
+    let mut sql = format!("SELECT json FROM read_json_objects({}", quote_str(&db_path(path)));
+    if ignore_errors {
+        // The reader then skips a bad record and examines the records after
+        // it. This read must examine the same records.
+        sql.push_str(", ignore_errors = true");
+    }
+    sql.push(')');
+    if let Some(n) = records {
+        sql.push_str(&format!(" LIMIT {}", n.saturating_mul(2).max(1)));
+    }
+    let Ok(mut stmt) = conn.prepare(&sql) else {
+        return false;
+    };
+    let Ok(mut rows) = stmt.query([]) else {
+        return false;
+    };
+    while let Ok(Some(row)) = rows.next() {
+        if let Ok(Some(text)) = row.get::<_, Option<String>>(0)
+            && source::json_text_depth_over(text.as_bytes(), MAX_JSON_DEPTH as usize)
+        {
+            return true;
+        }
+    }
+    false
+}
+
 /// Turns the message of a failed open into a message that names the options of
 /// Peruse.
 ///
@@ -512,11 +558,13 @@ impl Engine {
                 Some(n) if n < 0 => None,
                 Some(n) => Some(n as u64),
             };
-            if let Some(deep) = src
-                .files
-                .iter()
-                .find(|f| source::json_depth_over(f, MAX_JSON_DEPTH as usize, records))
-            {
+            if let Some(deep) = src.files.iter().find(|f| {
+                if source::is_compressed(f) {
+                    compressed_json_too_deep(&conn, f, records, opts.ignore_errors)
+                } else {
+                    source::json_depth_over(f, MAX_JSON_DEPTH as usize, records)
+                }
+            }) {
                 let name = deep
                     .file_name()
                     .map(|s| s.to_string_lossy().into_owned())
@@ -3197,6 +3245,37 @@ mod tests {
         let err = Engine::open(&glob, &OpenOptions::default()).err().expect("the deep set opened");
         let msg = err.to_string();
         assert!(msg.contains("b.json") && msg.contains("nests deeper"), "{msg}");
+    }
+
+    #[test]
+    fn a_deep_compressed_json_file_is_refused_and_does_not_crash() {
+        // The depth test read the bytes of the file, and the bytes of a
+        // compressed file are not JSON. Before this test, a file of 77 bytes
+        // with 3000 levels filled the stack and stopped the whole program.
+        let d = tmpdir("deep-gz");
+        let conn = Connection::open_in_memory().unwrap();
+        let write = |name: &str, levels: usize| {
+            let p = db_path(&d.join(name));
+            conn.execute_batch(&format!(
+                "COPY (SELECT (repeat('{{\"a\":', {levels}) || '1' || repeat('}}', {levels}))::JSON AS j \
+                 FROM range(3)) TO {} (FORMAT json, COMPRESSION gzip)",
+                quote_str(&p)
+            ))
+            .unwrap();
+            p
+        };
+        let deep = write("deep.ndjson.gz", 3000);
+        let err = Engine::open(&deep, &OpenOptions::default()).err().expect("the deep file opened");
+        assert!(err.to_string().contains("nests deeper"), "{err}");
+
+        // A compressed file of usual depth still opens, and a deep file in a
+        // set of them is still found.
+        let flat = write("flat.ndjson.gz", 20);
+        let e = Engine::open(&flat, &OpenOptions::default()).unwrap();
+        assert_eq!(e.count(&View::default()).unwrap(), 3);
+        let glob = format!("{}/*.ndjson.gz", db_path(&d));
+        let err = Engine::open(&glob, &OpenOptions::default()).err().expect("the deep set opened");
+        assert!(err.to_string().contains("deep.ndjson.gz"), "{err}");
     }
 
     #[test]

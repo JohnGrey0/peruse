@@ -330,6 +330,49 @@ pub fn json_depth_over(path: &Path, limit: usize, records: Option<u64>) -> bool 
     }
 }
 
+/// Gives `true` when the name of the file ends with `.gz`, `.zst` or `.bz2`.
+///
+/// DuckDB decompresses a file by its extension, and not by its first bytes. A
+/// file of compressed bytes with another name gives a parse failure there.
+pub fn is_compressed(path: &Path) -> bool {
+    effective_extension(path).1
+}
+
+/// Gives `true` when one JSON text nests deeper than `limit`.
+///
+/// This is the test of [`json_depth_over`] for a text in memory. A compressed
+/// file needs it: Peruse cannot decompress the file, so DuckDB reads its
+/// records as text, and this function counts the levels of each one.
+pub fn json_text_depth_over(text: &[u8], limit: usize) -> bool {
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    for &b in text {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match b {
+            b'"' => in_string = true,
+            b'{' | b'[' => {
+                depth += 1;
+                if depth > limit {
+                    return true;
+                }
+            }
+            b'}' | b']' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    false
+}
+
 /// Writes a path in a form that a settings file can hold, and that the system
 /// can open again.
 ///

@@ -131,6 +131,12 @@ Two rules stop it:
   `sample_size`, and 20480 when the user gives none. A limit in bytes is not
   safe: a deep record can come after some megabytes of shallow records. The
   check reads each file of a set, because the reader examines each of them.
+- The bytes of a compressed file (`.json.gz`, `.json.zst`) are not JSON, and a
+  file of 80 bytes can hold 3000 levels. Peruse holds no decompressor, but
+  DuckDB does. For such a file, `compressed_json_too_deep` reads the same
+  records with `read_json_objects`, which gives each record as text and finds
+  no columns. Then `source::json_text_depth_over` counts the levels of each
+  text with a loop.
 - The read call also holds `maximum_depth = 128`. The reader then stops at that
   level and gives the value below it as text.
 
