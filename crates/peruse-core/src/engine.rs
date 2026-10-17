@@ -3784,6 +3784,38 @@ mod tests {
     }
 
     #[test]
+    fn a_file_whose_name_holds_a_bracket_opens() {
+        // A bracket makes the name look like a glob, so the engine gives the
+        // name to the glob of DuckDB. That glob finds a file of the exact name
+        // too, and the open depends on it.
+        let d = tmpdir("bracket-name");
+        let p = write_csv(&d, "export[1].csv", "a\n1\n2\n");
+        let e = Engine::open(p.to_str().unwrap(), &OpenOptions::default()).unwrap();
+        assert_eq!(e.source.files.len(), 1);
+        assert_eq!(e.count(&View::default()).unwrap(), 2);
+    }
+
+    #[test]
+    fn a_verbatim_path_on_windows_opens() {
+        // The file chooser goes into a directory with `canonicalize`, and on
+        // Windows that gives a path that starts with `\\?\`. The `?` makes the
+        // path look like a glob, and the engine changes its separators. DuckDB
+        // still opens the file, and each file that the user chooses in a
+        // directory of the chooser depends on that.
+        if !cfg!(windows) {
+            return;
+        }
+        let d = tmpdir("verbatim");
+        let p = write_csv(&d, "t.csv", "a,b\n1,x\n");
+        let full = std::fs::canonicalize(&p).unwrap();
+        assert!(full.to_string_lossy().starts_with(r"\\?\"), "{full:?}");
+        let e = Engine::open(full.to_str().unwrap(), &OpenOptions::default()).unwrap();
+        assert_eq!(e.count(&View::default()).unwrap(), 1);
+        let rows = all_cells(&e);
+        assert_eq!(rows[0][1].as_deref(), Some("x"));
+    }
+
+    #[test]
     fn a_csv_file_with_semicolons_gets_its_columns() {
         // A spreadsheet program in a country that writes a decimal comma saves
         // a `.csv` file with a semicolon between the values. The extension
