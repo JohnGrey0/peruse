@@ -208,7 +208,7 @@ impl Clicks {
 /// the file would cost the user the rest of it.
 ///
 /// A file that is not there is not a fault, and Peruse writes a new one.
-fn write_blocked(path: &std::path::Path) -> Option<String> {
+pub(crate) fn write_blocked(path: &std::path::Path) -> Option<String> {
     Config::load_from(path)
         .1
         .map(|why| format!("the file has a fault, so nothing was written: {why}"))

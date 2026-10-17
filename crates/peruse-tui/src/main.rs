@@ -282,12 +282,11 @@ fn main() -> Result<()> {
     if !peruse_core::source::looks_like_glob(&file)
         && let Ok(full) = std::fs::canonicalize(&file)
     {
-        config.remember_file(&peruse_core::source::tidy_path(&full));
-        if let Some(p) = Config::path() {
-            // A list that Peruse cannot write is not a reason to stop. The
-            // user came here to look at a file.
-            let _ = config.save_to(&p);
-        }
+        remember_recent(
+            &mut config,
+            &peruse_core::source::tidy_path(&full),
+            Config::path().as_deref(),
+        );
     }
 
     let auto_index = !(cli.no_index || config.no_index.unwrap_or(false));
@@ -317,6 +316,26 @@ fn main() -> Result<()> {
     application.start(auto_index);
 
     run(&mut application, mouse)
+}
+
+/// Puts a file at the top of the list of recent files, and keeps the list in
+/// the settings file when that file has no fault.
+///
+/// A settings file that Peruse cannot read gives the built-in settings. A write
+/// of those settings replaces the whole file, so one typing mistake in it would
+/// cost the user each setting and each note, at the next file that the user
+/// opens. The file therefore stays as it is, as for each other write. Refer to
+/// `app::write_blocked`.
+///
+/// A list that Peruse cannot write is not a reason to stop. The user came here
+/// to look at a file.
+fn remember_recent(config: &mut Config, file: &str, path: Option<&std::path::Path>) {
+    config.remember_file(file);
+    if let Some(p) = path
+        && app::write_blocked(p).is_none()
+    {
+        let _ = config.save_to(p);
+    }
 }
 
 /// What the table picker gave back.
@@ -596,6 +615,33 @@ fn handle_event(application: &mut App, ev: Event) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_settings_file_with_a_fault_is_not_written_over_by_the_list_of_recent_files() {
+        let dir = std::env::temp_dir().join("peruse-recent-blocked");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+
+        // One typing mistake. The load gives the built-in settings.
+        let bad = "theme = \"nord\"\nstep = 25\nthheme = \"x\"\n";
+        std::fs::write(&path, bad).unwrap();
+        let (mut config, why) = Config::load_from(&path);
+        assert!(why.is_some(), "the file must have a fault for this test");
+        remember_recent(&mut config, "/data/a.csv", Some(&path));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), bad, "the file was written over");
+        assert_eq!(config.recent.first().map(String::as_str), Some("/data/a.csv"));
+
+        // A file with no fault gets the list, and keeps its settings.
+        std::fs::write(&path, "theme = \"nord\"\nstep = 25\n").unwrap();
+        let (mut config, why) = Config::load_from(&path);
+        assert!(why.is_none());
+        remember_recent(&mut config, "/data/a.csv", Some(&path));
+        let (back, _) = Config::load_from(&path);
+        assert_eq!(back.recent, vec!["/data/a.csv".to_string()]);
+        assert_eq!(back.step, Some(25));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn the_ddl_name_comes_from_the_table_of_a_database() {
