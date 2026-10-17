@@ -73,8 +73,8 @@ The function `coalesce` uses four rules:
 - The function keeps the requests with the newest epoch only. A request from an
   old view is work with no result, because the user interface discards the
   response.
-- The index request is the one exception to that rule. See
-  [Work that has no view](#work-that-has-no-view).
+- The index request, the metadata request and the configure request are the
+  exceptions to that rule. See [Work that has no view](#work-that-has-no-view).
 - Of each kind, the function keeps the last request only. The newer request
   takes the position of the older one, so the order of the kinds does not
   change.
@@ -110,7 +110,8 @@ numbers of those two describe the rows of one view.
 ## Work that has no view
 
 Two operations describe the file, and not the view: the index and the file
-metadata. The epoch must not touch them.
+metadata. A third one, `Configure`, changes the connection. The epoch must not
+touch them.
 
 `App::new` sends the index request at the start. A start with `--filter` or
 with `--query` then changes the view immediately, and the epoch goes from 1 to
@@ -125,7 +126,11 @@ with `--query` then changes the view immediately, and the epoch goes from 1 to
 
 Two rules stop this:
 
-- `coalesce` keeps a request `Index` whatever its epoch is.
+- `coalesce` keeps a request `Index`, `Meta` or `Configure` whatever its epoch
+  is. The metadata needs the same rule as the index: the user interface asks
+  for it one time and sets a latch, so a request that went away left the
+  metadata panel and the detail band of a Parquet file empty for the whole
+  session.
 - `App::on_response` applies the responses `Indexed` and `Meta` in front of the
   test of the epoch.
 
@@ -164,7 +169,14 @@ statement after it, and that text is too long for a status line of one row.
 
 The `Drop` code of the `Worker` does these steps:
 
-1. It stops the query that runs now. Without this step, the join below would
-   wait for the end of a long query.
+1. It sets a flag that the thread reads before each request. The thread then
+   starts no other request of the group that it works on.
 2. It sends the request `Shutdown`.
-3. It waits for the end of the thread.
+3. It stops the query that runs now, and it does that again every 10
+   milliseconds until the thread ends. Then it waits for the end of the thread.
+
+One interrupt is not sufficient. DuckDB clears an interrupt when the next
+statement starts, so an interrupt that arrives between two statements has no
+effect. A new view runs three statements, and a group can hold more requests.
+Without the loop, the next statement ran to its end, and the program did not
+stop when the user quit.

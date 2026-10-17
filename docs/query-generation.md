@@ -32,10 +32,19 @@ Three private functions build the parts that each statement needs:
 |---|---|---|
 | `relation()` | `src AS q` | `(<statement>) AS q` |
 | `where_clause()` | `` (empty) `` or ` WHERE (<filter>)` | The same |
-| `order_clause()` | `` (empty) `` or ` ORDER BY "a" ASC, "b" DESC` | The same |
+| `order_clause()` | `` (empty) `` or ` ORDER BY "a" ASC, "b" DESC, COLUMNS(*)` | The same |
 
 The function `relation()` removes a semicolon at the end of a statement from
 the user. Each statement uses the same name `q` for its one relation.
+
+The part `COLUMNS(*)` at the end of a sort is necessary. The sort of DuckDB is
+not stable, and it uses each thread, so two rows with the same sort value can
+come in a different order in each statement. Each page is one statement. Without
+the part, a sort on a column with repeated values showed some rows on two pages
+and other rows on none, and the same page changed when the user scrolled back to
+it. With the part, the database sorts such rows by each of their values, and two
+rows that it still cannot put in order look the same. On a Parquet file of 20
+million rows, the first sorted page costs about 200 milliseconds and not 80.
 
 Two public functions join those parts:
 
@@ -152,13 +161,20 @@ The last four values follow the family of the column:
 
 | Family | Minimum and maximum | Mean and deviation |
 |---|---|---|
-| Number | `min()` and `max()` | `avg()` and `stddev_samp()` |
+| Number | `min()` and `max()` | `avg()` and `stddev_samp()`, over the value as a DOUBLE |
 | Text, Bool, Temporal | `min()` and `max()` | `NULL` |
 | Binary, Nested | `NULL` | `NULL` |
 
 The minimum and the maximum have a meaning for each type that has an order. The
 mean and the deviation do not. A call to `avg()` on a VARCHAR column gives an
 error, and not a NULL.
+
+The mean and the deviation read the value as a DOUBLE. The sum behind `avg()`
+over a HUGEINT is a HUGEINT, and three large values gave an overflow. The
+deviation also leaves out each value that is not finite. One NaN made
+`stddev_samp()` fail with "out of range", and pandas writes NaN for each missing
+value of a column of floating-point numbers. The mean keeps such a value, so the
+panel shows `nan` and the user sees that the column holds one.
 
 A column of numbers gets two more values at the end: the smallest value and the
 largest value as a DOUBLE. The histogram needs those two edges, and this

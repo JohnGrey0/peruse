@@ -221,6 +221,10 @@ mod row_count_tests {
 /// a summary does not need more than six of them.
 fn trim_float(s: &str) -> String {
     match s.parse::<f64>() {
+        // A value below one thousandth loses its significant digits at six
+        // decimal places, and the mean 0.0000004 would show as 0. The text of
+        // DuckDB is the short and exact form of such a value, so it stays.
+        Ok(v) if v != 0.0 && v.abs() < 1e-3 => s.to_string(),
         Ok(v) if v.fract() != 0.0 => format!("{v:.6}")
             .trim_end_matches('0')
             .trim_end_matches('.')
@@ -298,5 +302,17 @@ mod tests {
         assert_eq!(trim_float("42"), "42");
         assert_eq!(trim_float("2.5"), "2.5");
         assert_eq!(trim_float("not a number"), "not a number");
+    }
+
+    #[test]
+    fn a_small_mean_keeps_its_digits() {
+        // A column of small probabilities has a mean far below one. A cut at
+        // six decimal places showed such a mean as 0, and a deviation of 0
+        // says that every value is the same.
+        assert_eq!(trim_float("4e-07"), "4e-07");
+        assert_eq!(trim_float("-1.25e-05"), "-1.25e-05");
+        assert_eq!(trim_float("0.000123"), "0.000123");
+        assert_eq!(trim_float("0.0"), "0.0");
+        assert_eq!(trim_float("0.0012345678"), "0.001235");
     }
 }

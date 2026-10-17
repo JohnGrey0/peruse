@@ -108,6 +108,36 @@ fn effective_extension(path: &Path) -> (Option<String>, bool) {
     (ext, compressed)
 }
 
+/// The number of bytes that [`sniff_magic`] reads from the start of a file.
+const MAGIC_HEAD_LEN: usize = 4096;
+
+/// The byte order mark of UTF-8.
+const UTF8_BOM: &[u8] = b"\xEF\xBB\xBF";
+
+/// Gives `true` when a JSON file starts with a byte order mark and then a list.
+///
+/// The JSON reader of DuckDB does not see the list behind such a mark. It reads
+/// the whole file as one row, with one column `json` that holds the list. The
+/// caller then tells the reader that the file holds a list. Refer to
+/// `build_read_expr` in [`crate::engine`].
+///
+/// A program on Windows writes such a file often: PowerShell 5 writes the mark
+/// for each file that it writes as UTF-8.
+pub fn json_list_behind_bom(path: &Path) -> bool {
+    use std::io::Read;
+    let Ok(f) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut head = Vec::with_capacity(MAGIC_HEAD_LEN);
+    if f.take(MAGIC_HEAD_LEN as u64).read_to_end(&mut head).is_err() {
+        return false;
+    }
+    let Some(text) = head.strip_prefix(UTF8_BOM) else {
+        return false;
+    };
+    text.iter().find(|b| !b.is_ascii_whitespace()) == Some(&b'[')
+}
+
 /// Reads the first bytes of the file and finds the format from them.
 ///
 /// A Parquet file starts with `PAR1`, and an Arrow IPC file starts with
@@ -115,19 +145,26 @@ fn effective_extension(path: &Path) -> (Option<String>, bool) {
 /// are sufficient to tell such a file from a text file with rows.
 fn sniff_magic(path: &Path) -> Option<Format> {
     use std::io::Read;
-    let mut f = std::fs::File::open(path).ok()?;
-    let mut buf = [0u8; 16];
-    // Read what the file holds. A file of eight bytes is short, but it is
-    // still a file, and `read_exact` would give an error for it.
-    let n = f.read(&mut buf).ok()?;
-    let head = &buf[..n];
+    let f = std::fs::File::open(path).ok()?;
+    // Read what the file holds, up to the limit. A file of eight bytes is
+    // short, but it is still a file, and `read_exact` would give an error for
+    // it. One call to `read` can give fewer bytes than the caller asked for,
+    // so `read_to_end` over a reader with a limit fills the head.
+    //
+    // The head is long enough for the spaces and the empty lines that can
+    // come before the first `{` of a JSON file.
+    let mut head = Vec::with_capacity(MAGIC_HEAD_LEN);
+    f.take(MAGIC_HEAD_LEN as u64).read_to_end(&mut head).ok()?;
     if head.starts_with(b"PAR1") {
         return Some(Format::Parquet);
     }
     if head.starts_with(b"ARROW1") {
         return Some(Format::Arrow);
     }
-    match head.iter().find(|b| !b.is_ascii_whitespace()) {
+    // A program on Windows often writes a byte order mark in front of UTF-8
+    // text. The mark is not a part of the data.
+    let text = head.strip_prefix(UTF8_BOM).unwrap_or(&head);
+    match text.iter().find(|b| !b.is_ascii_whitespace()) {
         Some(b'{') | Some(b'[') => Some(Format::Json),
         _ => None,
     }
@@ -194,7 +231,11 @@ pub fn by_extension(path: &Path) -> Option<(Format, Option<char>)> {
     match ext.as_deref() {
         Some("parquet" | "parq" | "pq") => Some((Format::Parquet, None)),
         Some("tsv" | "tab") => Some((Format::Csv, Some('\t'))),
-        Some("csv") => Some((Format::Csv, Some(','))),
+        // The name `.csv` does not give the delimiter. A spreadsheet program
+        // in a country that writes a decimal comma saves a `.csv` file with a
+        // semicolon between the values, so the sniffer must decide. With a
+        // comma here, each such file showed as one column.
+        Some("csv") => Some((Format::Csv, None)),
         Some("psv") => Some((Format::Csv, Some('|'))),
         Some("json" | "ndjson" | "jsonl") => Some((Format::Json, None)),
         Some("arrow" | "ipc" | "feather" | "arrows") => Some((Format::Arrow, None)),
@@ -238,12 +279,9 @@ pub fn detect(path: &Path) -> (Format, Option<char>, bool) {
     }
 }
 
-/// The number of bytes that [`json_depth_over`] examines.
-///
-/// A file that nests too deep does so at its start, because each level is a
-/// character. This limit keeps the test at a few milliseconds for a file of
-/// any size.
-const JSON_SCAN_BYTES: u64 = 8 * 1024 * 1024;
+/// The number of records that the JSON reader of DuckDB examines to find the
+/// columns, when the user gives no `--sample-size`.
+pub const JSON_SAMPLE_RECORDS: u64 = 20_480;
 
 /// Gives `true` when a JSON file nests deeper than `limit`.
 ///
@@ -253,25 +291,39 @@ const JSON_SCAN_BYTES: u64 = 8 * 1024 * 1024;
 /// fault that Rust can catch, so Peruse has to see such a file before it
 /// gives the file to the reader.
 ///
+/// The reader goes that deep only in the records that it examines to find the
+/// columns, and those are the first `records` records of the file. A record
+/// after them goes into a column that is known already, and it does not fill
+/// the stack. The function therefore examines the same records, and `None`
+/// examines the whole file, as `--sample-size -1` does. A record is a value at
+/// the top of the file, or a value inside the list at the top of the file.
+///
+/// A test of the first 8 MB alone was not sufficient. A file with one record
+/// on each line can hold a deep record at line 9,000, and the reader examines
+/// that line.
+///
 /// This function counts the levels with a loop and a number, so it can never
 /// fill the stack itself. It stops at the first level above the limit, so a
 /// file that is made to be deep costs almost nothing to refuse.
 ///
 /// A brace inside a value in quotation marks is a character of that value,
 /// and not a level. The function therefore follows the quotation marks.
-pub fn json_depth_over(path: &Path, limit: usize) -> bool {
+pub fn json_depth_over(path: &Path, limit: usize, records: Option<u64>) -> bool {
     use std::io::Read;
-    let Ok(file) = std::fs::File::open(path) else {
+    let Ok(mut file) = std::fs::File::open(path) else {
         return false;
     };
-    let mut reader = std::io::BufReader::new(file.take(JSON_SCAN_BYTES));
-    let mut buf = [0u8; 64 * 1024];
+    let mut buf = vec![0u8; 64 * 1024];
 
     let mut depth = 0usize;
     let mut in_string = false;
     let mut escaped = false;
+    // `true` when the file is one list, so that its records are one level
+    // down.
+    let mut in_list = false;
+    let mut seen = 0u64;
     loop {
-        let n = match reader.read(&mut buf) {
+        let n = match file.read(&mut buf) {
             Ok(0) => return false,
             Ok(n) => n,
             Err(_) => return false,
@@ -292,12 +344,23 @@ pub fn json_depth_over(path: &Path, limit: usize) -> bool {
             match b {
                 b'"' => in_string = true,
                 b'{' | b'[' => {
+                    if depth == 0 {
+                        in_list = b == b'[';
+                    }
                     depth += 1;
                     if depth > limit {
                         return true;
                     }
                 }
-                b'}' | b']' => depth = depth.saturating_sub(1),
+                b'}' | b']' => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 || (depth == 1 && in_list) {
+                        seen += 1;
+                        if records.is_some_and(|max| seen >= max) {
+                            return false;
+                        }
+                    }
+                }
                 _ => {}
             }
         }
@@ -394,7 +457,10 @@ mod tests {
     fn extensions_map_to_formats() {
         assert_eq!(detect(Path::new("a.parquet")).0, Format::Parquet);
         assert_eq!(detect(Path::new("a.pq")).0, Format::Parquet);
-        assert_eq!(detect(Path::new("a.csv")).1, Some(','));
+        assert_eq!(detect(Path::new("a.csv")).0, Format::Csv);
+        // The sniffer finds the delimiter of a `.csv` file. Refer to
+        // `by_extension`.
+        assert_eq!(detect(Path::new("a.csv")).1, None);
         assert_eq!(detect(Path::new("a.tsv")).1, Some('\t'));
         assert_eq!(detect(Path::new("a.psv")).1, Some('|'));
         assert_eq!(detect(Path::new("a.json")).0, Format::Json);
@@ -471,6 +537,26 @@ mod tests {
             std::fs::write(&p, body).unwrap();
             assert_eq!(detect(&p).0, want, "file {name}");
         }
+        // A JSON file can start with many spaces or empty lines, or with the
+        // byte order mark that a program on Windows writes. The head of 16
+        // bytes saw neither, and such a file went to the CSV reader.
+        let cases: [(&str, &[u8]); 2] = [
+            ("f.txt", b"                              \r\n\r\n  [{\"a\": 1}]"),
+            ("g.txt", b"\xEF\xBB\xBF{\"a\": 1}\n"),
+        ];
+        for (name, body) in cases {
+            let p = dir.join(name);
+            std::fs::write(&p, body).unwrap();
+            assert_eq!(detect(&p).0, Format::Json, "file {name}");
+        }
+        let p = dir.join("h.json");
+        std::fs::write(&p, b"\xEF\xBB\xBF  [{\"a\": 1}]").unwrap();
+        assert!(json_list_behind_bom(&p));
+        std::fs::write(&p, b"[{\"a\": 1}]").unwrap();
+        assert!(!json_list_behind_bom(&p), "no mark, no change");
+        std::fs::write(&p, b"\xEF\xBB\xBF{\"a\": 1}").unwrap();
+        assert!(!json_list_behind_bom(&p), "an object is not a list");
+
         // A file that holds nothing is not a reason to stop the program.
         let empty = dir.join("empty.bin");
         std::fs::write(&empty, b"").unwrap();
@@ -502,8 +588,36 @@ mod tests {
         for (d, want) in [(5, false), (100, false), (127, false), (128, true), (5000, true)] {
             let p = dir.join(format!("d{d}.json"));
             std::fs::write(&p, nested(d)).unwrap();
-            assert_eq!(json_depth_over(&p, 128), want, "depth {d}");
+            assert_eq!(json_depth_over(&p, 128, Some(JSON_SAMPLE_RECORDS)), want, "depth {d}");
         }
+    }
+
+    #[test]
+    fn a_deep_record_after_the_first_megabytes_is_seen() {
+        // The reader of DuckDB examines the first 20,480 records to find the
+        // columns. With records of one kilobyte, that is 20 MB, and a test of
+        // the first 8 MB did not see a deep record at line 9,000. The program
+        // then stopped.
+        let dir = std::env::temp_dir().join("peruse-depth-late");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let line = format!("{{\"a\": \"{}\"}}\n", "x".repeat(1000));
+        let mut body = line.repeat(9_000);
+        body.push_str(&format!("{{\"a\": {}1{}}}\n", "{\"b\":".repeat(3000), "}".repeat(3000)));
+        let p = dir.join("late.ndjson");
+        std::fs::write(&p, &body).unwrap();
+        assert!(json_depth_over(&p, 128, Some(JSON_SAMPLE_RECORDS)));
+        // A record after the sample does not reach the deep part of the
+        // reader, so the test stops at the end of the sample.
+        assert!(!json_depth_over(&p, 128, Some(9_000)));
+        // The value -1 of `--sample-size` examines each record.
+        assert!(json_depth_over(&p, 128, None));
+
+        // The records of a file that is one list are the values inside it.
+        let list = format!("[{}{{\"a\": {}1{}}}]", "{\"a\": 1},".repeat(10), "[".repeat(200), "]".repeat(200));
+        std::fs::write(&p, &list).unwrap();
+        assert!(json_depth_over(&p, 128, Some(11)));
+        assert!(!json_depth_over(&p, 128, Some(10)));
     }
 
     #[test]
@@ -517,17 +631,17 @@ mod tests {
         let p = dir.join("braces.json");
         let body = format!("[{{\"a\": \"{}\"}}]", "{".repeat(500));
         std::fs::write(&p, body).unwrap();
-        assert!(!json_depth_over(&p, 128), "a brace in a value counted");
+        assert!(!json_depth_over(&p, 128, Some(JSON_SAMPLE_RECORDS)), "a brace in a value counted");
 
         // A quotation mark that a backslash holds does not end the value.
         let p = dir.join("escaped.json");
         std::fs::write(&p, format!("[{{\"a\": \"\\\"{}\"}}]", "[".repeat(500))).unwrap();
-        assert!(!json_depth_over(&p, 128), "an escaped mark ended the value");
+        assert!(!json_depth_over(&p, 128, Some(JSON_SAMPLE_RECORDS)), "an escaped mark ended the value");
     }
 
     #[test]
     fn a_file_that_is_not_there_is_not_too_deep() {
-        assert!(!json_depth_over(Path::new("/no/such/file.json"), 128));
+        assert!(!json_depth_over(Path::new("/no/such/file.json"), 128, None));
     }
 
     #[test]

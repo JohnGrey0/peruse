@@ -90,7 +90,8 @@ that holds a SQLite database therefore gets a message about SQLite, and not a
 parse failure from the CSV reader. The marks are `DUCK` after the eight bytes of
 the checksum for DuckDB, and `SQLite format 3` and one zero byte for SQLite.
 For the third test the marks are `PAR1` for Parquet, `ARROW1` for Arrow, and `{`
-or `[` for JSON, after any spaces.
+or `[` for JSON, after any spaces and after a byte order mark. The head for this
+test is 4096 bytes long, so a JSON file can start with some empty lines.
 
 The function reads the head of the file with a limit and `read_to_end`, and not
 with one call to `read`. One call can give fewer bytes than the caller asked
@@ -105,7 +106,10 @@ to change the file to Parquet.
 
 For a CSV file, the expression takes more options:
 
-- `delim`, when the user or the file extension gives a delimiter
+- `delim`, when the user or the file extension gives a delimiter. The
+  extensions `.tsv` and `.tab` give a tab, and `.psv` gives `|`. The extension
+  `.csv` gives none: a spreadsheet program in a country that writes a decimal
+  comma saves a `.csv` file with a semicolon, so the sniffer decides.
 - `header`, when the user gives the option `--no-header`
 - `all_varchar`, `ignore_errors` and `sample_size`, from the options
 - `union_by_name`, when the source holds more than one file
@@ -127,10 +131,28 @@ Two rules stop it:
 - The function `source::json_depth_over` counts the levels with a loop and a
   number, so it can never fill the stack itself. It stops at the first level
   above 128, so a file that is made to be deep costs almost nothing to refuse.
-  It reads 8 MB of the file at the most: a file that nests too deep does so at
-  its start, because each level is one character.
+  It examines the records that the reader examines to find the columns: the
+  first 20,480, or the number of `--sample-size`, or each record for the value
+  -1. A record after those goes into a column that is known already, and it
+  does not fill the stack. A test of the first 8 MB alone was not sufficient: a
+  file with one record of 1 KB on each line held a deep record at line 9,000,
+  and the reader examined it. The function examines each file of a glob too,
+  because the reader examines a part of each file of a set. One deep file of a
+  set stopped the program before this rule.
+
+  A compressed file (`.json.gz`, `.json.zst`) is still open to this fault. The
+  function reads the bytes of the file, and Peruse holds no code to decompress
+  them.
 - The read call also holds `maximum_depth = 128`. The reader then stops at that
-  level and gives the value below it as text.
+  level and gives the value below it as text. This limit does not protect the
+  part of the reader that finds the columns, so the first rule is necessary.
+
+A JSON file that holds a list behind a byte order mark needs one more option.
+PowerShell 5 writes the mark in front of each file that it writes as UTF-8. The
+reader of DuckDB does not see the list behind the mark, and it reads the whole
+file as one row with one column `json`. The function
+`source::json_list_behind_bom` finds such a file, and the read call then holds
+`format = 'array'`.
 
 ## One examination of a file of text
 

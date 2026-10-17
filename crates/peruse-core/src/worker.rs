@@ -14,8 +14,10 @@
 use anyhow::Result;
 use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
 use duckdb::InterruptHandle;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
+use std::time::Duration;
 
 use crate::engine::{ColumnBrief, Engine, OpenOptions};
 use crate::meta::FileMeta;
@@ -131,6 +133,15 @@ impl Request {
         }
     }
 
+    /// Gives `true` when the answer describes the view, so that a change of the
+    /// view makes the request useless. Refer to [`coalesce`].
+    fn follows_the_view(&self) -> bool {
+        !matches!(
+            self,
+            Request::Index { .. } | Request::Meta { .. } | Request::Configure { .. }
+        )
+    }
+
     /// Gives a number for the kind of the request. A newer request of one kind
     /// replaces an older request of the same kind.
     fn kind(&self) -> u8 {
@@ -202,6 +213,9 @@ pub struct Worker {
     tx: Sender<Request>,
     rx: Receiver<Response>,
     interrupt: Arc<InterruptHandle>,
+    /// Set to `true` when the worker must stop. The thread reads it before each
+    /// request, so a group of requests in the queue does not run to its end.
+    stop: Arc<AtomicBool>,
     handle: Option<thread::JoinHandle<()>>,
 }
 
@@ -218,6 +232,8 @@ impl Worker {
         let (ready_tx, ready_rx) = bounded::<Result<(Opened, Arc<InterruptHandle>)>>(1);
 
         let input = input.to_string();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_in_thread = Arc::clone(&stop);
         let handle = thread::Builder::new()
             .name("peruse-engine".into())
             .spawn(move || {
@@ -240,7 +256,7 @@ impl Worker {
                 if ready_tx.send(Ok((opened, engine.interrupt_handle()))).is_err() {
                     return;
                 }
-                run(&mut engine, &req_rx, &resp_tx);
+                run(&mut engine, &req_rx, &resp_tx, &stop_in_thread);
             })?;
 
         let (opened, interrupt) = ready_rx.recv()??;
@@ -249,6 +265,7 @@ impl Worker {
                 tx: req_tx,
                 rx: resp_rx,
                 interrupt,
+                stop,
                 handle: Some(handle),
             },
             opened,
@@ -278,13 +295,22 @@ impl Worker {
 
 impl Drop for Worker {
     fn drop(&mut self) {
-        // Stop a long query first. If it continues, the join below waits for
-        // the end of that query.
-        self.interrupt.interrupt();
+        // Tell the thread to start no more requests, and stop the query that
+        // runs now. If that query continues, the join below waits for its end.
+        self.stop.store(true, Ordering::SeqCst);
         let _ = self.tx.send(Request::Shutdown);
-        if let Some(h) = self.handle.take() {
-            let _ = h.join();
+        let Some(h) = self.handle.take() else { return };
+        // One interrupt is not sufficient. DuckDB forgets an interrupt that
+        // arrives between two statements, because each new statement clears
+        // it. The thread can be between two statements of one request, such as
+        // the page and the count of a new view. The next statement then runs to
+        // its end, and on a large file of text that takes some minutes. The
+        // loop therefore interrupts again until the thread stops.
+        while !h.is_finished() {
+            self.interrupt.interrupt();
+            thread::sleep(Duration::from_millis(10));
         }
+        let _ = h.join();
     }
 }
 
@@ -296,13 +322,21 @@ fn coalesce(mut batch: Vec<Request>) -> Vec<Request> {
     // A request from an old view is work with no result, because the user
     // interface discards the response.
     //
-    // The index is the one exception. It builds a table of the row positions
-    // of the file, and that table has no connection to the view. A start with
-    // `--filter` sends the index request and then changes the view, and
-    // without this exception the index would never be built at all.
+    // Three kinds of request have no connection to the view, so they are the
+    // exceptions:
+    //
+    // * The index builds a table of the row positions of the file. A start
+    //   with `--filter` sends the index request and then changes the view,
+    //   and without this exception the index would never be built at all.
+    // * The metadata describes the file. The user interface asks for it one
+    //   time in a session and then waits for the answer, so a request that
+    //   goes away here leaves the metadata panel and the detail band empty
+    //   until the program stops.
+    // * The settings of DuckDB belong to the connection. A change that goes
+    //   away here is a change that the user made and that has no effect.
     let newest = batch.iter().map(Request::epoch).filter(|g| *g != u64::MAX).max();
     if let Some(newest) = newest {
-        batch.retain(|r| r.epoch() == newest || matches!(r, Request::Index { .. }));
+        batch.retain(|r| r.epoch() == newest || !r.follows_the_view());
     }
     // In the newest epoch, keep the last request of each kind.
     let mut out: Vec<Request> = Vec::new();
@@ -316,7 +350,7 @@ fn coalesce(mut batch: Vec<Request>) -> Vec<Request> {
 }
 
 /// The main loop of the worker thread.
-fn run(engine: &mut Engine, rx: &Receiver<Request>, tx: &Sender<Response>) {
+fn run(engine: &mut Engine, rx: &Receiver<Request>, tx: &Sender<Response>, stop: &AtomicBool) {
     loop {
         // Wait for the first request, then take each request behind it. A key
         // that the user holds down therefore does not build a long queue.
@@ -334,6 +368,12 @@ fn run(engine: &mut Engine, rx: &Receiver<Request>, tx: &Sender<Response>) {
             return;
         }
         for req in batch {
+            // The owner of the worker went away while this group ran. The
+            // remaining requests have no reader, and each of them can be a
+            // full scan of the file.
+            if stop.load(Ordering::SeqCst) {
+                return;
+            }
             if handle(engine, req, tx).is_err() {
                 return;
             }
@@ -511,6 +551,46 @@ mod tests {
     }
 
     #[test]
+    fn a_metadata_request_survives_a_change_of_the_view() {
+        // The user interface asks for the metadata one time in a session, and
+        // it sets a latch when it asks. A sort that the user starts before the
+        // worker reads the queue changes the epoch. Without this rule, the
+        // request went away, no answer and no error came, and the metadata
+        // panel and the detail band of a Parquet file stayed empty for the
+        // whole session.
+        let out = coalesce(vec![
+            Request::Meta { epoch: 1 },
+            Request::SetView {
+                epoch: 2,
+                view: View::default(),
+                limit: 50,
+            },
+        ]);
+        assert!(
+            out.iter().any(|r| matches!(r, Request::Meta { .. })),
+            "the metadata request went away: {out:?}"
+        );
+        assert_eq!(out.len(), 2);
+    }
+
+    #[test]
+    fn a_change_of_the_settings_survives_a_change_of_the_view() {
+        // The settings belong to the connection, and not to the view.
+        let out = coalesce(vec![
+            Request::Configure {
+                epoch: 1,
+                threads: Some(2),
+                memory_limit: None,
+            },
+            page(2, 0),
+        ]);
+        assert!(
+            out.iter().any(|r| matches!(r, Request::Configure { threads: Some(2), .. })),
+            "the change of the settings went away: {out:?}"
+        );
+    }
+
+    #[test]
     fn a_page_request_from_an_old_view_still_goes_away() {
         let out = coalesce(vec![page(1, 0), page(2, 500)]);
         assert_eq!(out.len(), 1);
@@ -603,6 +683,63 @@ mod tests {
         Worker::spawn(path.to_str().unwrap(), OpenOptions::default())
             .expect("the worker did not open the file")
             .0
+    }
+
+    #[test]
+    fn the_end_of_the_worker_stops_each_request_in_the_queue() {
+        // Each request here reads one million million rows, which takes some
+        // minutes. The end of the worker must not wait for them. A single
+        // interrupt stopped the first one only: DuckDB clears an interrupt
+        // when the next statement starts, so the request behind it then ran
+        // to its end, and the program did not stop when the user quit.
+        let dir = std::env::temp_dir().join("peruse-worker-drop-queue");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.csv");
+        std::fs::write(&path, "id\n1\n").unwrap();
+        // One thread keeps the cost of this test small on a shared machine.
+        let opts = OpenOptions {
+            threads: Some(1),
+            ..OpenOptions::default()
+        };
+        let (worker, _) = Worker::spawn(path.to_str().unwrap(), opts).unwrap();
+
+        let slow = View {
+            base: Base::Sql("SELECT i FROM range(1000000000000) t(i) WHERE i < 0".into()),
+            ..View::default()
+        };
+        worker.send(Request::SetView { epoch: 1, view: slow.clone(), limit: 50 });
+        worker.send(Request::Band {
+            epoch: 1,
+            view: slow.clone(),
+            columns: vec![Column::new("i", "BIGINT", false)],
+            values: false,
+        });
+        worker.send(Request::Stats {
+            epoch: 1,
+            view: slow,
+            column: Column::new("i", "BIGINT", false),
+            top_k: 0,
+        });
+        // Wait until the worker is inside the first slow statement.
+        loop {
+            match worker.responses().recv_timeout(std::time::Duration::from_secs(30)) {
+                Ok(Response::Schema { .. }) => break,
+                Ok(_) => {}
+                Err(e) => panic!("the worker gave no schema: {e}"),
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
+        let (done_tx, done_rx) = bounded::<()>(1);
+        std::thread::spawn(move || {
+            drop(worker);
+            let _ = done_tx.send(());
+        });
+        assert!(
+            done_rx.recv_timeout(std::time::Duration::from_secs(20)).is_ok(),
+            "the end of the worker waited for the slow requests in the queue"
+        );
     }
 
     #[test]

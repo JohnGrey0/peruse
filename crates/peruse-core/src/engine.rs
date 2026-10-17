@@ -226,6 +226,13 @@ pub fn footer_briefs(meta: &FileMeta, columns: &[Column]) -> Option<Vec<ColumnBr
     let mut out = Vec::with_capacity(columns.len());
     for c in columns {
         let f = meta.columns.iter().find(|f| f.name == c.name)?;
+        // A set of files with `union_by_name` can hold a column in one file and
+        // not in another. The rows of the other file are NULL in the view, and
+        // the footer of that file counts none of them. The NULL count of the
+        // footer is then too small, so the footer cannot answer.
+        if f.rows != n_total {
+            return None;
+        }
         let nulls = f.null_count?;
         out.push(ColumnBrief {
             column: c.name.clone(),
@@ -502,13 +509,31 @@ impl Engine {
         // level, and a stack that is full is not a fault that Rust can
         // catch. Peruse therefore counts the levels with a loop of its own
         // before it gives the file to that reader.
+        //
+        // Each file of a set needs the test. The reader examines a part of each
+        // file of a set to find its columns, and one deep file of a glob
+        // stopped the program as surely as one deep file alone.
+        //
+        // The test examines the records that the reader examines: the number
+        // of `--sample-size`, and each record for the value -1.
+        let sample = match opts.sample_size {
+            None => Some(source::JSON_SAMPLE_RECORDS),
+            Some(n) if n < 0 => None,
+            Some(n) => Some(n.max(1) as u64),
+        };
         if src.format == Format::Json
-            && source::json_depth_over(&src.files[0], MAX_JSON_DEPTH as usize)
+            && let Some(deep) = src
+                .files
+                .iter()
+                .find(|f| source::json_depth_over(f, MAX_JSON_DEPTH as usize, sample))
         {
+            let name = deep
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| src.label.clone());
             bail!(
-                "{}: this file nests deeper than {MAX_JSON_DEPTH} levels.\n\
-                 A file that deep stops the reader of DuckDB, so Peruse does not open it.",
-                src.label
+                "{name}: this file nests deeper than {MAX_JSON_DEPTH} levels.\n\
+                 A file that deep stops the reader of DuckDB, so Peruse does not open it."
             );
         }
 
@@ -1314,7 +1339,8 @@ impl Engine {
                     coalesce(sum(total_compressed_size), 0)::BIGINT, \
                     coalesce(sum(total_uncompressed_size), 0)::BIGINT, \
                     string_agg(DISTINCT compression, '/'), \
-                    string_agg(DISTINCT encodings, '/') \
+                    string_agg(DISTINCT encodings, '/'), \
+                    coalesce(sum(row_group_num_rows), 0)::BIGINT \
              FROM parquet_metadata({list}) GROUP BY 1"
         ))?;
         let mut rows = stmt.query([])?;
@@ -1329,6 +1355,7 @@ impl Engine {
                 uncompressed: r.get::<_, i64>(3)?.max(0) as u64,
                 compression: r.get::<_, Option<String>>(4)?.unwrap_or_default(),
                 encodings: r.get::<_, Option<String>>(5)?.unwrap_or_default(),
+                rows: r.get::<_, i64>(6)?.max(0) as u64,
             });
         }
         Ok(out)
@@ -2051,11 +2078,26 @@ fn pinned_json_expr(src: &Source, schema: &Schema) -> Option<String> {
         .iter()
         .map(|c| format!("{}: {}", quote_str(&c.name), quote_str(&c.sql_type)))
         .collect();
+    let format = json_format_option(src)
+        .map(|f| format!(", {f}"))
+        .unwrap_or_default();
     Some(format!(
-        "read_json({}, maximum_depth = {MAX_JSON_DEPTH}, columns = {{{}}})",
+        "read_json({}, maximum_depth = {MAX_JSON_DEPTH}{format}, columns = {{{}}})",
         file_list(&src.files),
         cols.join(", ")
     ))
+}
+
+/// Gives the option `format = 'array'` when each file of a JSON source holds a
+/// list behind a byte order mark.
+///
+/// The JSON reader of DuckDB does not see the list behind the mark, and it
+/// reads the whole file as one row. Refer to [`source::json_list_behind_bom`].
+/// A file with no mark keeps the reader that finds the form of the file itself.
+fn json_format_option(src: &Source) -> Option<&'static str> {
+    let all = !src.files.is_empty()
+        && src.files.iter().all(|f| source::json_list_behind_bom(f));
+    all.then_some("format = 'array'")
 }
 
 /// Builds the `read_parquet` call or the `read_csv` call for this source.
@@ -2108,6 +2150,9 @@ fn build_read_expr(src: &Source, opts: &OpenOptions) -> String {
             // view of a strange file, and it is much better than a program
             // that goes away.
             let mut args = vec![list, format!("maximum_depth = {MAX_JSON_DEPTH}")];
+            if let Some(f) = json_format_option(src) {
+                args.push(f.to_string());
+            }
             if let Some(n) = opts.sample_size {
                 // The reader looks at this number of rows before it decides
                 // the types. The value -1 reads the whole file.
@@ -2540,9 +2585,7 @@ mod tests {
     #[test]
     fn the_pinned_read_call_keeps_a_delimiter_that_the_sniffer_found() {
         // The extension `.dat` names no delimiter, so the sniffer finds the
-        // semicolon. The pinned call must carry what the sniffer found. A file
-        // with the extension `.csv` always uses a comma, and it would not test
-        // this path.
+        // semicolon. The pinned call must carry what the sniffer found.
         let d = tmpdir("pin-semicolon");
         let p = write_csv(&d, "s.dat", "a;b;c\n1;two;3.5\n4;five;6.5\n");
         let e = Engine::open(p.to_str().unwrap(), &OpenOptions::default()).unwrap();
@@ -3740,5 +3783,279 @@ mod tests {
         assert_eq!(page.cell(0, 0), Some("[1, 2, 3]"));
         assert_eq!(page.cell(0, 1), Some("{'k': v}"));
     }
-}
 
+    // ---------------------------------------------- faults that a review found
+
+    /// Gives the cell `(row, col)` of a page as an owned text.
+    fn text_at(page: &RowPage, row: usize, col: usize) -> Option<String> {
+        page.cell(row, col).map(str::to_string)
+    }
+
+    #[test]
+    fn a_file_whose_name_holds_a_bracket_opens() {
+        // A bracket makes the name look like a glob, so the engine gives the
+        // name to the glob of DuckDB. That glob finds a file of the exact name
+        // too, and the open depends on it.
+        let d = tmpdir("bracket-name");
+        let p = write_csv(&d, "export[1].csv", "a\n1\n2\n");
+        let e = Engine::open(p.to_str().unwrap(), &OpenOptions::default()).unwrap();
+        assert_eq!(e.source.files.len(), 1);
+        assert_eq!(e.count(&View::default()).unwrap(), 2);
+    }
+
+    #[test]
+    fn a_verbatim_path_on_windows_opens() {
+        // The file chooser goes into a directory with `canonicalize`, and on
+        // Windows that gives a path that starts with `\\?\`. The `?` makes the
+        // path look like a glob, and the engine changes its separators. DuckDB
+        // still opens the file, and each file that the user chooses in a
+        // directory of the chooser depends on that.
+        if !cfg!(windows) {
+            return;
+        }
+        let d = tmpdir("verbatim");
+        let p = write_csv(&d, "t.csv", "a,b\n1,x\n");
+        let full = std::fs::canonicalize(&p).unwrap();
+        assert!(full.to_string_lossy().starts_with(r"\\?\"), "{full:?}");
+        let e = Engine::open(full.to_str().unwrap(), &OpenOptions::default()).unwrap();
+        assert_eq!(e.count(&View::default()).unwrap(), 1);
+        let rows = all_cells(&e);
+        assert_eq!(rows[0][1].as_deref(), Some("x"));
+    }
+
+    #[test]
+    fn a_csv_file_with_semicolons_gets_its_columns() {
+        // A spreadsheet program in a country that writes a decimal comma saves
+        // a `.csv` file with a semicolon between the values. The extension
+        // forced a comma, and each such file showed as one column.
+        let d = tmpdir("semicolon-csv");
+        let p = write_csv(&d, "export.csv", "id;name;amount\n1;alice;10,5\n2;bob;20,25\n");
+        let e = Engine::open(p.to_str().unwrap(), &OpenOptions::default()).unwrap();
+        let schema = e.describe(&View::default()).unwrap();
+        let names: Vec<&str> = schema.columns.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["id", "name", "amount"]);
+        assert_eq!(all_cells(&e)[1][1].as_deref(), Some("bob"));
+
+        // A plain file with commas still gets the comma.
+        let p = write_csv(&d, "plain.csv", SAMPLE);
+        let e = Engine::open(p.to_str().unwrap(), &OpenOptions::default()).unwrap();
+        assert_eq!(e.describe(&View::default()).unwrap().len(), 4);
+        // The option of the user still wins over the sniffer.
+        let opts = OpenOptions {
+            delimiter: Some(';'),
+            ..Default::default()
+        };
+        let e = Engine::open(p.to_str().unwrap(), &opts).unwrap();
+        assert_eq!(e.describe(&View::default()).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn the_footer_of_a_set_does_not_answer_for_a_column_that_one_file_lacks() {
+        // `union_by_name` fills the rows of a file that has no column `extra`
+        // with NULL. The footer of that file counts none of those NULL values,
+        // so the footer said that the column held no NULL at all.
+        let d = tmpdir("footer-set");
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(&format!(
+            "COPY (SELECT i AS id, 'x' AS extra FROM range(10) t(i)) TO '{}' (FORMAT parquet);\
+             COPY (SELECT i AS id FROM range(10) t(i)) TO '{}' (FORMAT parquet);",
+            db_path(&d.join("a.parquet")),
+            db_path(&d.join("b.parquet"))
+        ))
+        .unwrap();
+        let pattern = format!("{}/*.parquet", db_path(&d));
+        let e = Engine::open(&pattern, &OpenOptions::default()).unwrap();
+        let schema = e.describe(&View::default()).unwrap();
+        let meta = e.file_meta().unwrap();
+        let scanned = e.column_band(&View::default(), &schema.columns, false).unwrap();
+        let extra = scanned.iter().find(|b| b.column == "extra").unwrap();
+        assert_eq!(extra.null_count(), 10, "the scan is the truth");
+        if let Some(footer) = footer_briefs(&meta, &schema.columns) {
+            for (f, s) in footer.iter().zip(&scanned) {
+                assert_eq!(f.n_present, s.n_present, "column {}", f.column);
+            }
+        }
+
+        // A set of files with the same columns still gets its answer from the
+        // footer.
+        std::fs::remove_file(d.join("a.parquet")).unwrap();
+        conn.execute_batch(&format!(
+            "COPY (SELECT i AS id FROM range(5) t(i)) TO '{}' (FORMAT parquet);",
+            db_path(&d.join("a.parquet"))
+        ))
+        .unwrap();
+        let e = Engine::open(&pattern, &OpenOptions::default()).unwrap();
+        let schema = e.describe(&View::default()).unwrap();
+        let meta = e.file_meta().unwrap();
+        let footer = footer_briefs(&meta, &schema.columns).expect("the footer answers");
+        assert_eq!(footer[0].n_total, 15);
+        assert_eq!(footer[0].null_count(), 0);
+    }
+
+    #[test]
+    fn a_sorted_view_gives_each_row_on_one_page_only() {
+        // The sort of DuckDB is not stable. On a column with repeated values,
+        // each page statement put the rows of one value in its own order, so
+        // a row came on two pages and another row on none. The same page also
+        // changed from one read to the next.
+        let d = tmpdir("sort-ties");
+        let p = d.join("t.parquet");
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(&format!(
+            "COPY (SELECT i AS id, i % 3 AS k FROM range(100000) t(i)) TO '{}' \
+             (FORMAT parquet, ROW_GROUP_SIZE 5000);",
+            db_path(&p)
+        ))
+        .unwrap();
+        let opts = OpenOptions {
+            threads: Some(4),
+            ..Default::default()
+        };
+        let e = Engine::open(p.to_str().unwrap(), &opts).unwrap();
+        let view = View {
+            sort: vec![crate::query::SortKey {
+                column: "k".into(),
+                dir: crate::query::SortDir::Asc,
+            }],
+            ..Default::default()
+        };
+        let schema = e.describe(&view).unwrap();
+        let mut seen = std::collections::HashSet::new();
+        for n in 0..60u64 {
+            let page = e.page(&view, &schema, 50, 20_000 + n * 50).unwrap();
+            assert_eq!(page.nrows, 50);
+            for r in 0..page.nrows {
+                let id = text_at(&page, r, 0).unwrap();
+                assert!(seen.insert(id.clone()), "row {id} came on two pages");
+            }
+        }
+        // The rows of one value come in the order of the other values, which
+        // is the order of the file here.
+        let page = e.page(&view, &schema, 3, 0).unwrap();
+        assert_eq!(text_at(&page, 0, 0).as_deref(), Some("0"));
+        assert_eq!(text_at(&page, 2, 0).as_deref(), Some("6"));
+
+        // The cell inspector, the record view and the search read the same
+        // order.
+        assert_eq!(e.cell(&view, "id", 2).unwrap().as_deref(), Some("6"));
+        let json = e.row_json(&view, &schema, 2).unwrap().unwrap();
+        assert!(json.contains("\"id\":6"), "{json}");
+        let hits = e.search(&view, &schema, "99999", 0, 100_000, 10).unwrap();
+        let page = e.page(&view, &schema, 1, hits[0]).unwrap();
+        assert_eq!(text_at(&page, 0, 0).as_deref(), Some("99999"));
+    }
+
+    #[test]
+    fn a_column_of_uuid_values_has_a_record_view_and_a_search() {
+        // The grid shows a UUID, a BIGNUM and an ENUM as text, and the
+        // statements for the record view and the search used the column as
+        // VARCHAR. `substr` and `lower` read VARCHAR only, so each of the two
+        // failed for the whole row, and the search failed for the whole file.
+        let d = tmpdir("uuid");
+        let p = d.join("t.parquet");
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(&format!(
+            "COPY (SELECT 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::UUID AS id, 'x' AS name) \
+             TO '{}' (FORMAT parquet);",
+            db_path(&p)
+        ))
+        .unwrap();
+        let e = Engine::open(p.to_str().unwrap(), &OpenOptions::default()).unwrap();
+        let view = View::default();
+        let schema = e.describe(&view).unwrap();
+        assert_eq!(schema.columns[0].sql_type, "UUID");
+        let json = e.row_json(&view, &schema, 0).unwrap().unwrap();
+        assert!(json.contains("a0eebc99"), "{json}");
+        assert_eq!(e.search(&view, &schema, "6BB9", 0, 10, 10).unwrap(), vec![0]);
+
+        for sql in [
+            "SELECT 12345678901234567890123::BIGNUM AS b",
+            "SELECT 'ok'::ENUM('ok', 'no') AS e",
+        ] {
+            let view = View {
+                base: crate::query::Base::Sql(sql.into()),
+                ..Default::default()
+            };
+            let schema = e.describe(&view).unwrap();
+            assert!(e.row_json(&view, &schema, 0).unwrap().is_some(), "{sql}");
+            assert!(e.search(&view, &schema, "zz", 0, 10, 10).is_ok(), "{sql}");
+        }
+    }
+
+    #[test]
+    fn the_statistics_of_a_column_with_nan_or_a_huge_integer_arrive() {
+        // A writer such as pandas stores a missing floating-point value as
+        // NaN. One NaN made `stddev_samp` fail with "out of range", and the
+        // column inspector showed no statistics at all. A HUGEINT column with
+        // large values made `avg` fail with an overflow in the same way.
+        let d = tmpdir("stats-nan");
+        let p = write_csv(&d, "t.csv", "a\n1\n");
+        let e = Engine::open(p.to_str().unwrap(), &OpenOptions::default()).unwrap();
+        let view = View {
+            base: crate::query::Base::Sql(
+                "SELECT * FROM (VALUES \
+                 (1.0::DOUBLE, 170141183460469231731687303715884105727::HUGEINT), \
+                 ('nan'::DOUBLE, 170141183460469231731687303715884105727::HUGEINT), \
+                 (3.0::DOUBLE, 170141183460469231731687303715884105727::HUGEINT)) v(x, h)"
+                    .into(),
+            ),
+            ..Default::default()
+        };
+        let schema = e.describe(&view).unwrap();
+        let x = e.column_stats(&view, &schema.columns[0], 5).unwrap();
+        assert_eq!(x.n_present, 3);
+        assert_eq!(x.min.as_deref(), Some("1.0"));
+        // The deviation leaves the NaN out, and the mean keeps it.
+        let std: f64 = x.std.as_deref().unwrap().parse().unwrap();
+        assert!((std - 2f64.sqrt()).abs() < 1e-9, "{std}");
+        assert_eq!(x.avg.as_deref(), Some("nan"));
+
+        let h = e.column_stats(&view, &schema.columns[1], 5).unwrap();
+        assert_eq!(h.n_present, 3);
+        assert!(h.avg.is_some());
+    }
+
+    #[test]
+    fn a_json_list_behind_a_byte_order_mark_gives_one_row_for_each_object() {
+        // PowerShell 5 writes a byte order mark in front of each UTF-8 file.
+        // The JSON reader of DuckDB then does not see the list, and it read the
+        // whole file as one row with one column `json`.
+        let d = tmpdir("json-bom");
+        let p = d.join("rows.json");
+        std::fs::write(
+            &p,
+            b"\xEF\xBB\xBF[\r\n {\"a\": 1, \"b\": \"x\"},\r\n {\"a\": 2, \"b\": \"y\"}\r\n]\r\n",
+        )
+        .unwrap();
+        let e = Engine::open(p.to_str().unwrap(), &OpenOptions::default()).unwrap();
+        let schema = e.describe(&View::default()).unwrap();
+        let names: Vec<&str> = schema.columns.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["a", "b"]);
+        assert_eq!(e.count(&View::default()).unwrap(), 2);
+        assert_eq!(all_cells(&e)[1][1].as_deref(), Some("y"));
+
+        // A file of one object on each line with the same mark keeps its form.
+        let p = d.join("rows.ndjson");
+        std::fs::write(&p, b"\xEF\xBB\xBF{\"a\": 1}\n{\"a\": 2}\n").unwrap();
+        let e = Engine::open(p.to_str().unwrap(), &OpenOptions::default()).unwrap();
+        assert_eq!(e.count(&View::default()).unwrap(), 2);
+    }
+
+    #[test]
+    fn a_deep_file_in_a_glob_is_refused_and_does_not_stop_the_program() {
+        // The test of the depth looked at the first file of a set only. The
+        // reader examines each file of a set, so a deep second file filled the
+        // stack and stopped the whole program.
+        let d = tmpdir("json-deep-glob");
+        write_csv(&d, "a.json", "[{\"a\": 1}]");
+        let deep = format!("[{}1{}]", "{\"a\":".repeat(3000), "}".repeat(3000));
+        write_csv(&d, "b.json", &deep);
+        let pattern = format!("{}/*.json", db_path(&d));
+        let err = Engine::open(&pattern, &OpenOptions::default())
+            .map(|_| ())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("b.json"), "the message names the deep file: {err}");
+        assert!(err.contains("nests deeper"), "{err}");
+    }
+}
