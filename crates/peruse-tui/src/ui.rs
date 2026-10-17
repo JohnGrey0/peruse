@@ -242,6 +242,12 @@ fn draw_title(f: &mut Frame, area: Rect, app: &App, p: &Paint) {
     put(&human_bytes(app.source.bytes), p.on(t.dim, t.bg_alt), buf, &mut x);
     put("  ", base, buf, &mut x);
     put(&app.source.format.to_string(), p.on(t.dim, t.bg_alt), buf, &mut x);
+    // The file is on a network drive, and the grid reads a copy of it on the
+    // local disk. The metadata panel names the source and the copy.
+    if app.source.local_copy.is_some() {
+        put("  ", base, buf, &mut x);
+        put("local copy", p.on(t.ok, t.bg_alt), buf, &mut x);
+    }
 
     // Show each part of the view that removes rows or columns. The user
     // must always know why the grid shows fewer rows than the file holds.

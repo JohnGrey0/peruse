@@ -341,6 +341,8 @@ pub enum Setting {
     Band,
     /// The number of rows or columns that one step moves.
     Step,
+    /// When Peruse copies a file from a network drive to the local disk.
+    LocalCopy,
 }
 
 impl Setting {
@@ -354,6 +356,7 @@ impl Setting {
         Setting::Panels,
         Setting::Band,
         Setting::Step,
+        Setting::LocalCopy,
     ];
 
     /// The name that the page shows.
@@ -367,6 +370,7 @@ impl Setting {
             Setting::Panels => "panels",
             Setting::Band => "column details",
             Setting::Step => "step",
+            Setting::LocalCopy => "local copy",
         }
     }
 
@@ -381,6 +385,7 @@ impl Setting {
             Setting::Panels => "keep at the side: none, meta, stats or both",
             Setting::Band => "rows under the headers: off, compact or detailed. d cycles",
             Setting::Step => "rows or columns that J, K, H and L move",
+            Setting::LocalCopy => "copy a file from a network drive first: auto, always, never",
         }
     }
 
@@ -390,7 +395,7 @@ impl Setting {
     /// and the index do their work when a file opens, so a change to them
     /// cannot reach the file that is open already.
     pub fn at_next_file(self) -> bool {
-        matches!(self, Setting::SampleSize | Setting::NoIndex)
+        matches!(self, Setting::SampleSize | Setting::NoIndex | Setting::LocalCopy)
     }
 }
 
@@ -2581,6 +2586,10 @@ impl App {
                 .map(|s| s.to_string())
                 .collect(),
             Setting::NoIndex => vec!["yes".into(), "no".into()],
+            Setting::LocalCopy => ["auto", "always", "never"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
             Setting::Threads | Setting::MemoryLimit | Setting::SampleSize | Setting::Step => {
                 Vec::new()
             }
@@ -3216,6 +3225,7 @@ impl App {
             Setting::Panels => self.config.panels.clone().unwrap_or_default(),
             Setting::Band => self.config.band.clone().unwrap_or_default(),
             Setting::Step => self.config.step.map(|v| v.to_string()).unwrap_or_default(),
+            Setting::LocalCopy => self.config.local_copy.clone().unwrap_or_default(),
         }
     }
 
@@ -3234,6 +3244,12 @@ impl App {
             Setting::Panels => "none".into(),
             Setting::Band => "off".into(),
             Setting::Step => format!("{DEFAULT_STEP} rows or columns"),
+            Setting::LocalCopy => format!(
+                "auto, from {} MB",
+                self.config
+                    .local_copy_min_mb
+                    .unwrap_or(peruse_core::cache::DEFAULT_MIN_MB)
+            ),
         }
     }
 
@@ -3318,6 +3334,30 @@ impl App {
             return Err(why);
         }
         self.config.save_to(p).map(|_| ())
+    }
+
+    /// Removes the local copies of files from network drives.
+    ///
+    /// A copy that a Peruse reads now stays, and that includes the copy of
+    /// this session. The next open of a file from a network drive copies it
+    /// again.
+    fn clear_copies(&mut self) {
+        let Some(dir) = peruse_core::cache::copies_dir() else {
+            self.info("this system gives no directory for local copies");
+            return;
+        };
+        let c = peruse_core::cache::clear(&dir);
+        let mut msg = format!(
+            "removed {} local {}, {}",
+            c.removed,
+            if c.removed == 1 { "copy" } else { "copies" },
+            peruse_core::source::human_bytes(c.bytes)
+        );
+        if c.kept > 0 {
+            let verb = if c.kept == 1 { "stays" } else { "stay" };
+            msg.push_str(&format!(". {} in use now {verb}", c.kept));
+        }
+        self.ok(msg);
     }
 
     /// Opens the settings page.
@@ -3459,6 +3499,21 @@ impl App {
                         _ => {
                             self.error(format!(
                                 "step: write a number from 1 to {MAX_STEP} (got {t:?})"
+                            ));
+                            return;
+                        }
+                    }
+                }
+            }
+            Setting::LocalCopy => {
+                if empty {
+                    self.config.local_copy = None;
+                } else {
+                    match peruse_core::cache::Policy::parse(t) {
+                        Some(pol) => self.config.local_copy = Some(pol.name().to_string()),
+                        None => {
+                            self.error(format!(
+                                "local copy: write auto, always or never (got {t:?})"
                             ));
                             return;
                         }
@@ -4324,6 +4379,7 @@ impl App {
                 self.mode = Mode::ThemePicker;
             }
             Cmd::Settings => self.open_settings(),
+            Cmd::ClearCopies => self.clear_copies(),
         }
     }
 }

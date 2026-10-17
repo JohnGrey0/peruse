@@ -71,6 +71,7 @@ pub enum Cmd {
     ThemeNext,
     ThemePicker,
     Settings,
+    ClearCopies,
     Help,
     Palette,
     Cancel,
@@ -477,6 +478,13 @@ pub static BINDINGS: &[Binding] = &[
         keys: &[(KeyCode::Char(','), N)],
         label: ",",
         desc: "settings, and what this machine gives",
+        group: "Other",
+    },
+    Binding {
+        cmd: Cmd::ClearCopies,
+        keys: &[(KeyCode::Char('C'), N)],
+        label: "C",
+        desc: "clear the local copies of files from network drives",
         group: "Other",
     },
     Binding {
