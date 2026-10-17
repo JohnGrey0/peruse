@@ -3236,3 +3236,24 @@ fn the_statistics_panel_shows_a_line_end_inside_a_value_as_a_mark() {
     assert!(s.contains("x␊y"), "the panel lost the mark\n{s}");
 }
 
+#[test]
+fn the_inspector_shows_a_tab_and_an_escape_as_the_grid_does() {
+    // The grid writes a control character as a visible mark. The inspector
+    // dropped it, so `a<tab>b` read as `ab`, and an escape sequence lost its
+    // first character and read as a plain `[31m`.
+    let p = write_sample("inspect-ctrl", "a,b\n1,\"x\ty\x1b[31mz\"\n", "csv");
+    let (mut app, mut term) = open(&p);
+    settle(&mut app, &mut term);
+    // The column is narrow, so the grid cuts the value after the marks.
+    assert!(screen(&term).contains("x␉y·["), "the grid lost the marks\n{}", screen(&term));
+
+    app.run(Cmd::ColRight);
+    app.run(Cmd::InspectCell);
+    settle(&mut app, &mut term);
+    assert_eq!(app.mode, Mode::Cell);
+    assert!(
+        screen(&term).contains("x␉y·[31mz"),
+        "the inspector lost the marks\n{}",
+        screen(&term)
+    );
+}

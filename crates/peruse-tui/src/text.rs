@@ -181,11 +181,21 @@ pub fn wrap(s: &str, w: usize) -> Vec<String> {
         }
         let mut cur = String::new();
         let mut cur_w = 0;
+        // Ends the line that is in `cur`. A line that holds spaces only goes
+        // away: it is the space after a word that filled the line before it,
+        // and as a line of its own it reads as a blank line in the value.
+        let flush = |out: &mut Vec<String>, cur: &mut String, cur_w: &mut usize| {
+            if cur.trim().is_empty() {
+                cur.clear();
+            } else {
+                out.push(std::mem::take(cur));
+            }
+            *cur_w = 0;
+        };
         for word in line.split_inclusive(' ') {
             let ww = width(word);
             if cur_w + ww > w && !cur.is_empty() {
-                out.push(std::mem::take(&mut cur));
-                cur_w = 0;
+                flush(&mut out, &mut cur, &mut cur_w);
             }
             // A word that is longer than one line must break in the
             // middle of the word.
@@ -193,8 +203,7 @@ pub fn wrap(s: &str, w: usize) -> Vec<String> {
                 for c in word.chars() {
                     let cw = c.width().unwrap_or(0);
                     if cur_w + cw > w {
-                        out.push(std::mem::take(&mut cur));
-                        cur_w = 0;
+                        flush(&mut out, &mut cur, &mut cur_w);
                     }
                     cur.push(c);
                     cur_w += cw;
@@ -346,5 +355,15 @@ mod tests {
         assert_eq!(lines.len(), 3);
         assert!(lines.iter().all(|l| width(l) <= 10));
         assert_eq!(lines.concat(), "x".repeat(25));
+    }
+
+    #[test]
+    fn wrapping_never_gives_a_line_of_spaces_only() {
+        // The space after `hello` filled the line, and the next word started a
+        // new line. The space then stood on a line of its own, and it read as
+        // a blank line inside the value.
+        assert_eq!(wrap("hello world", 5), vec!["hello", "world"]);
+        assert_eq!(wrap("hello world", 6), vec!["hello ", "world"]);
+        assert_eq!(wrap("ab cdefghij", 5), vec!["ab ", "cdefg", "hij"]);
     }
 }
