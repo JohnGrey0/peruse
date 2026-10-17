@@ -164,7 +164,15 @@ statement after it, and that text is too long for a status line of one row.
 
 The `Drop` code of the `Worker` does these steps:
 
-1. It stops the query that runs now. Without this step, the join below would
-   wait for the end of a long query.
+1. It sets a flag that the thread reads before each request. A batch of slow
+   requests then stops after the request that runs now.
 2. It sends the request `Shutdown`.
-3. It waits for the end of the thread.
+3. It stops the query that runs now, and it does that again every 5
+   milliseconds until the thread ends. DuckDB forgets an interrupt at the start
+   of each statement, so one interrupt between two statements of a request
+   would stop nothing, and the end of the program would wait for the next
+   statement.
+4. It waits for the end of the thread, for 2 seconds at the most. A read that
+   DuckDB cannot interrupt, such as a read from a network drive that does not
+   answer, must not keep the program on the screen after the user quits. The
+   thread then ends with the process.

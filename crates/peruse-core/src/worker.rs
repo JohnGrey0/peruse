@@ -14,8 +14,10 @@
 use anyhow::Result;
 use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
 use duckdb::InterruptHandle;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
+use std::time::{Duration, Instant};
 
 use crate::engine::{ColumnBrief, Engine, OpenOptions};
 use crate::meta::FileMeta;
@@ -183,6 +185,15 @@ pub enum Response {
     Error { epoch: u64, context: String, message: String },
 }
 
+/// The longest time that the end of the worker waits for the engine thread.
+///
+/// The engine thread stops each statement when it receives an interrupt, so it
+/// ends in some milliseconds. A read that DuckDB cannot interrupt, such as a
+/// read from a network drive that does not answer, can take much longer. The
+/// user asked to quit, so the program then goes without the thread, and the
+/// system stops the thread with the process.
+const SHUTDOWN_WAIT: Duration = Duration::from_secs(2);
+
 /// What the caller learns when the file opens, before Peruse draws a frame.
 #[derive(Clone, Debug)]
 pub struct Opened {
@@ -202,6 +213,9 @@ pub struct Worker {
     tx: Sender<Request>,
     rx: Receiver<Response>,
     interrupt: Arc<InterruptHandle>,
+    /// `true` after the caller drops the worker. The engine thread then does
+    /// no more requests.
+    stop: Arc<AtomicBool>,
     handle: Option<thread::JoinHandle<()>>,
 }
 
@@ -218,6 +232,8 @@ impl Worker {
         let (ready_tx, ready_rx) = bounded::<Result<(Opened, Arc<InterruptHandle>)>>(1);
 
         let input = input.to_string();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_flag = Arc::clone(&stop);
         let handle = thread::Builder::new()
             .name("peruse-engine".into())
             .spawn(move || {
@@ -240,7 +256,7 @@ impl Worker {
                 if ready_tx.send(Ok((opened, engine.interrupt_handle()))).is_err() {
                     return;
                 }
-                run(&mut engine, &req_rx, &resp_tx);
+                run(&mut engine, &req_rx, &resp_tx, &stop_flag);
             })?;
 
         let (opened, interrupt) = ready_rx.recv()??;
@@ -249,6 +265,7 @@ impl Worker {
                 tx: req_tx,
                 rx: resp_rx,
                 interrupt,
+                stop,
                 handle: Some(handle),
             },
             opened,
@@ -278,13 +295,25 @@ impl Worker {
 
 impl Drop for Worker {
     fn drop(&mut self) {
-        // Stop a long query first. If it continues, the join below waits for
-        // the end of that query.
-        self.interrupt.interrupt();
+        // The flag stops each request that waits in the batch of the engine
+        // thread. The interrupt stops the statement that runs now.
+        self.stop.store(true, Ordering::SeqCst);
         let _ = self.tx.send(Request::Shutdown);
-        if let Some(h) = self.handle.take() {
-            let _ = h.join();
+        let Some(h) = self.handle.take() else { return };
+        // DuckDB forgets an interrupt at the start of each statement. An
+        // interrupt that arrives between two statements of one request
+        // therefore stops nothing, so the loop sends it again until the
+        // thread ends.
+        let deadline = Instant::now() + SHUTDOWN_WAIT;
+        while !h.is_finished() {
+            if Instant::now() >= deadline {
+                // Leave the thread. It ends with the process.
+                return;
+            }
+            self.interrupt.interrupt();
+            thread::sleep(Duration::from_millis(5));
         }
+        let _ = h.join();
     }
 }
 
@@ -316,7 +345,7 @@ fn coalesce(mut batch: Vec<Request>) -> Vec<Request> {
 }
 
 /// The main loop of the worker thread.
-fn run(engine: &mut Engine, rx: &Receiver<Request>, tx: &Sender<Response>) {
+fn run(engine: &mut Engine, rx: &Receiver<Request>, tx: &Sender<Response>, stop: &AtomicBool) {
     loop {
         // Wait for the first request, then take each request behind it. A key
         // that the user holds down therefore does not build a long queue.
@@ -334,7 +363,7 @@ fn run(engine: &mut Engine, rx: &Receiver<Request>, tx: &Sender<Response>) {
             return;
         }
         for req in batch {
-            if handle(engine, req, tx).is_err() {
+            if stop.load(Ordering::SeqCst) || handle(engine, req, tx).is_err() {
                 return;
             }
         }
@@ -603,6 +632,53 @@ mod tests {
         Worker::spawn(path.to_str().unwrap(), OpenOptions::default())
             .expect("the worker did not open the file")
             .0
+    }
+
+    #[test]
+    fn the_end_of_the_program_stops_each_request_in_the_queue() {
+        // The user quits while the worker has a batch of slow requests. One
+        // interrupt stops the statement that runs now, and DuckDB forgets an
+        // interrupt at the start of the next statement. Before this test, the
+        // drop sent one interrupt and then waited for the rest of the batch,
+        // so the program stayed on the screen for each slow request after
+        // the first.
+        let dir = std::env::temp_dir().join("peruse-worker-quit");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.csv");
+        std::fs::write(&path, "id\n1\n").unwrap();
+        let opts = OpenOptions { threads: Some(2), ..OpenOptions::default() };
+        let worker = Worker::spawn(path.to_str().unwrap(), opts).unwrap().0;
+
+        // Each of these statements reads some thousand million rows.
+        let slow = View {
+            base: Base::Sql(
+                "SELECT count(*) AS n FROM range(4000000000) t(i) WHERE hash(i) % 7 = 3".into(),
+            ),
+            ..View::default()
+        };
+        let n = Column::new("n", "BIGINT", false);
+        worker.send(Request::SetView { epoch: 1, view: slow.clone(), limit: 50 });
+        worker.send(Request::Stats { epoch: 1, view: slow.clone(), column: n.clone(), top_k: 0 });
+        worker.send(Request::Band { epoch: 1, view: slow, columns: vec![n], values: true });
+        loop {
+            match worker.responses().recv_timeout(std::time::Duration::from_secs(30)) {
+                Ok(Response::Busy(true)) => break,
+                Ok(_) => {}
+                Err(e) => panic!("the worker did not start: {e}"),
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(300));
+
+        let (done_tx, done_rx) = bounded::<()>(1);
+        std::thread::spawn(move || {
+            drop(worker);
+            let _ = done_tx.send(());
+        });
+        assert!(
+            done_rx.recv_timeout(std::time::Duration::from_secs(8)).is_ok(),
+            "the end of the worker waited for the slow requests"
+        );
     }
 
     #[test]
