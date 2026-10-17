@@ -32,10 +32,19 @@ Three private functions build the parts that each statement needs:
 |---|---|---|
 | `relation()` | `src AS q` | `(<statement>) AS q` |
 | `where_clause()` | `` (empty) `` or ` WHERE (<filter>)` | The same |
-| `order_clause()` | `` (empty) `` or ` ORDER BY "a" ASC, "b" DESC` | The same |
+| `order_clause()` | `` (empty) `` or ` ORDER BY "a" ASC, "b" DESC, COLUMNS(*)` | The same |
 
 The function `relation()` removes a semicolon at the end of a statement from
 the user. Each statement uses the same name `q` for its one relation.
+
+The part `COLUMNS(*)` at the end of a sort is necessary. The sort of DuckDB is
+not stable, and it uses each thread, so two rows with the same sort value can
+come in a different order in each statement. Each page is one statement. Without
+the part, a sort on a column with repeated values showed some rows on two pages
+and other rows on none, and the same page changed when the user scrolled back to
+it. With the part, the database sorts such rows by each of their values, and two
+rows that it still cannot put in order look the same. On a Parquet file of 20
+million rows, the first sorted page costs about 200 milliseconds and not 80.
 
 Two public functions join those parts:
 
