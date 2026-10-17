@@ -303,7 +303,12 @@ impl View {
                 let id = quote_ident(&c.name);
                 let value = match c.kind {
                     CellKind::Binary => format!("('blob ' || octet_length({id}) || ' B')"),
-                    CellKind::Text => format!("substr({id}, 1, {MAX_CELL_CHARS})"),
+                    // A UUID, a BIGNUM and an ENUM are text for the grid, but
+                    // `substr` reads VARCHAR only. Without the cast, a file
+                    // with a UUID column had no record view at all.
+                    CellKind::Text => {
+                        format!("substr(CAST({id} AS VARCHAR), 1, {MAX_CELL_CHARS})")
+                    }
                     _ => id,
                 };
                 format!("{}: {value}", quote_str(&c.name))
@@ -552,7 +557,9 @@ impl View {
                 match c.kind {
                     // The column is text already. A cast would copy each
                     // value and give no gain.
-                    CellKind::Text => format!("contains(lower({id}), {low})"),
+                    CellKind::Text if c.sql_type.eq_ignore_ascii_case("VARCHAR") => {
+                        format!("contains(lower({id}), {low})")
+                    }
                     // The grid shows the size of a BLOB value, and not its
                     // bytes. A match on those bytes would confuse the user.
                     CellKind::Binary => String::new(),

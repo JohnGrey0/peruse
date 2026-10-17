@@ -3800,4 +3800,41 @@ mod tests {
         let page = e.page(&view, &schema, 1, hits[0]).unwrap();
         assert_eq!(text_at(&page, 0, 0).as_deref(), Some("99999"));
     }
+
+    #[test]
+    fn a_column_of_uuid_values_has_a_record_view_and_a_search() {
+        // The grid shows a UUID, a BIGNUM and an ENUM as text, and the
+        // statements for the record view and the search used the column as
+        // VARCHAR. `substr` and `lower` read VARCHAR only, so each of the two
+        // failed for the whole row, and the search failed for the whole file.
+        let d = tmpdir("uuid");
+        let p = d.join("t.parquet");
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(&format!(
+            "COPY (SELECT 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::UUID AS id, 'x' AS name) \
+             TO '{}' (FORMAT parquet);",
+            db_path(&p)
+        ))
+        .unwrap();
+        let e = Engine::open(p.to_str().unwrap(), &OpenOptions::default()).unwrap();
+        let view = View::default();
+        let schema = e.describe(&view).unwrap();
+        assert_eq!(schema.columns[0].sql_type, "UUID");
+        let json = e.row_json(&view, &schema, 0).unwrap().unwrap();
+        assert!(json.contains("a0eebc99"), "{json}");
+        assert_eq!(e.search(&view, &schema, "6BB9", 0, 10, 10).unwrap(), vec![0]);
+
+        for sql in [
+            "SELECT 12345678901234567890123::BIGNUM AS b",
+            "SELECT 'ok'::ENUM('ok', 'no') AS e",
+        ] {
+            let view = View {
+                base: crate::query::Base::Sql(sql.into()),
+                ..Default::default()
+            };
+            let schema = e.describe(&view).unwrap();
+            assert!(e.row_json(&view, &schema, 0).unwrap().is_some(), "{sql}");
+            assert!(e.search(&view, &schema, "zz", 0, 10, 10).is_ok(), "{sql}");
+        }
+    }
 }
