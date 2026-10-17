@@ -37,6 +37,28 @@ pub fn sanitize(s: &str) -> String {
         .collect()
 }
 
+/// Makes a text safe to write to the terminal outside the frame, as a message
+/// on the standard error.
+///
+/// The function keeps a line end and a tab, because a message uses them. It
+/// writes each other control character as an escape, such as `\u{1b}`. The
+/// terminal then shows the character, and it does not obey it.
+pub fn for_terminal(s: &str) -> String {
+    let unsafe_char = |c: char| c.is_control() && c != '\n' && c != '\t';
+    if !s.chars().any(unsafe_char) {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len() + 16);
+    for c in s.chars() {
+        if unsafe_char(c) {
+            out.push_str(&format!("\\u{{{:x}}}", c as u32));
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 /// Cuts a text to `max` screen columns. The character `...` shows the cut.
 pub fn truncate(s: &str, max: usize) -> String {
     if max == 0 {
@@ -198,6 +220,22 @@ mod tests {
         assert_eq!(sanitize("a\tb"), "a␉b");
         assert_eq!(sanitize("plain"), "plain");
         assert_eq!(width(&sanitize("a\nb")), 3, "stays one column per char");
+    }
+
+    #[test]
+    fn a_message_for_the_terminal_shows_an_escape_and_does_not_send_it() {
+        // A CSV file can put these into an error message of DuckDB.
+        let msg = "Original Line: 2,\x1b[2J\x1b]0;PWNED\x07\u{9b}31m\r\nnext\tline";
+        let safe = for_terminal(msg);
+        assert!(
+            !safe.chars().any(|c| c.is_control() && c != '\n' && c != '\t'),
+            "{safe:?}"
+        );
+        assert_eq!(
+            safe,
+            "Original Line: 2,\\u{1b}[2J\\u{1b}]0;PWNED\\u{7}\\u{9b}31m\\u{d}\nnext\tline"
+        );
+        assert_eq!(for_terminal("plain\ntext"), "plain\ntext");
     }
 
     #[test]
