@@ -2978,6 +2978,15 @@ fn the_mouse_does_not_stop_the_program_on_a_small_terminal() {
 
 // ------------------------------------------------ the state of the grid
 
+/// Takes each response of the worker and gives none of them to the program.
+///
+/// A test that makes its own response, such as a count that stopped, needs the
+/// true answer out of the way.
+fn drop_responses(app: &App) {
+    let rx = app.worker.responses().clone();
+    while rx.recv_timeout(Duration::from_millis(300)).is_ok() {}
+}
+
 /// A file of one column of numbers, with `n` rows.
 fn numbers(n: usize) -> String {
     let mut s = String::from("id\n");
@@ -3110,4 +3119,189 @@ fn the_cursor_stays_on_the_screen_when_the_grid_loses_rows() {
     let mut small = Terminal::new(TestBackend::new(110, 12)).unwrap();
     settle(&mut app, &mut small);
     assert!(app.cursor_row < app.top_row + app.viewport_rows as u64);
+}
+
+#[test]
+fn a_full_first_page_is_not_the_last_page_on_a_tall_terminal() {
+    use peruse_core::Response;
+    // The first view asks for the rows of a terminal of 20 rows, because the
+    // true height is known after the first frame only. The first frame of a
+    // taller terminal then asks for more rows while the first page is on its
+    // way. That page is full, and it must not count as the end of the view.
+    let p = write_sample("tall-first-page", &numbers(3000), "csv");
+    let (mut app, _) = open(&p);
+    let mut term = Terminal::new(TestBackend::new(110, 60)).unwrap();
+    term.draw(|f| ui::draw(f, &mut app, Depth::True)).unwrap();
+    app.ensure_rows();
+
+    let rx = app.worker.responses().clone();
+    loop {
+        let r = rx.recv_timeout(Duration::from_secs(20)).expect("no page arrived");
+        let is_page = matches!(r, Response::Page { .. });
+        let is_count = matches!(r, Response::Count { .. });
+        app.on_response(r);
+        if is_count {
+            panic!("the count arrived before the first page");
+        }
+        if is_page {
+            break;
+        }
+    }
+    assert!(app.page.nrows > 0);
+    assert_eq!(
+        app.max_row(),
+        u64::MAX,
+        "a full page of {} rows counted as the last page",
+        app.page.nrows
+    );
+}
+
+#[test]
+fn a_new_view_reads_its_first_page_one_time() {
+    use peruse_core::Response;
+    // The request SetView reads the first page. A second request for the same
+    // rows repeats the query, and over a sort of a large file that is a second
+    // sort of the whole file.
+    let p = write_sample("one-first-page", &numbers(2000), "csv");
+    let (mut app, mut term) = open(&p);
+    settle(&mut app, &mut term);
+    app.run(Cmd::SortCycle);
+    let rx = app.worker.responses().clone();
+    let mut pages = 0;
+    let mut quiet = 0;
+    while quiet < 4 {
+        term.draw(|f| ui::draw(f, &mut app, Depth::True)).unwrap();
+        app.ensure_rows();
+        let mut got = false;
+        while let Ok(r) = rx.recv_timeout(Duration::from_millis(75)) {
+            if matches!(r, Response::Page { .. }) {
+                pages += 1;
+            }
+            app.on_response(r);
+            got = true;
+        }
+        quiet = if got { 0 } else { quiet + 1 };
+    }
+    assert_eq!(pages, 1, "the first page of the sorted view was read {pages} times");
+}
+
+#[test]
+fn a_count_that_stopped_starts_again_when_a_command_needs_it() {
+    use peruse_core::Response;
+    let p = write_sample("count-stopped", SAMPLE, "csv");
+    let (mut app, mut term) = open(&p);
+    settle(&mut app, &mut term);
+
+    // A new view, and then the key Esc stops its count.
+    app.run(Cmd::SortCycle);
+    drop_responses(&app);
+    app.on_response(Response::Error {
+        epoch: app.epoch(),
+        context: "count".into(),
+        message: "INTERRUPT Error: Interrupted!".into(),
+    });
+    settle(&mut app, &mut term);
+    assert!(
+        !screen(&term).contains("counting"),
+        "the screen says counting for a count that stopped\n{}",
+        screen(&term)
+    );
+
+    // The last row needs the count. The key starts it again, and a second
+    // press then does its work.
+    app.run(Cmd::Bottom);
+    settle(&mut app, &mut term);
+    app.run(Cmd::Bottom);
+    assert_eq!(app.cursor_row, 4, "G never reached the last row");
+    settle(&mut app, &mut term);
+    assert!(screen(&term).contains("5 × 4"), "{}", screen(&term));
+}
+
+#[test]
+fn a_failed_index_never_leaves_the_index_running() {
+    use peruse_core::Response;
+    let p = write_sample("index-failed", SAMPLE, "csv");
+    let (mut app, mut term) = open(&p);
+    settle(&mut app, &mut term);
+    app.seekable = false;
+
+    // The index takes some seconds, and the user changes the view in that
+    // time. The failure then carries the epoch of an older view.
+    app.indexing = true;
+    let old = app.epoch();
+    app.run(Cmd::SortCycle);
+    app.on_response(Response::Error {
+        epoch: old,
+        context: "indexing".into(),
+        message: "INTERRUPT Error: Interrupted!".into(),
+    });
+    assert!(!app.indexing, "the footer would say indexing for ever");
+    assert!(app.status.as_ref().is_some_and(|s| s.text.contains("indexing")));
+
+    // A failure of another request leaves the index running.
+    app.indexing = true;
+    app.on_response(Response::Error {
+        epoch: app.epoch(),
+        context: "filter".into(),
+        message: "bad".into(),
+    });
+    assert!(app.indexing, "a bad filter does not stop the index");
+}
+
+#[test]
+fn an_old_answer_for_another_cell_does_not_replace_the_inspector() {
+    use peruse_core::Response;
+    let p = write_sample("cell-stale", SAMPLE, "csv");
+    let (mut app, mut term) = open(&p);
+    settle(&mut app, &mut term);
+    app.run(Cmd::ColRight);
+    app.run(Cmd::InspectCell);
+    settle(&mut app, &mut term);
+    assert_eq!(app.cell_value.as_deref(), Some("alice"));
+
+    // The answer for a cell that the user opened before arrives late.
+    app.on_response(Response::Cell {
+        epoch: app.epoch(),
+        row: 3,
+        column: "name".into(),
+        value: Some("dave".into()),
+    });
+    assert_eq!(app.cell_value.as_deref(), Some("alice"));
+}
+
+#[test]
+fn an_old_part_of_a_search_does_not_move_the_cursor_of_a_new_one() {
+    use peruse_core::Response;
+    let p = write_sample("search-stale", SAMPLE, "csv");
+    let (mut app, mut term) = open(&p);
+    settle(&mut app, &mut term);
+
+    app.run(Cmd::Search);
+    type_text(&mut app, "erin");
+    press(&mut app, ratatui::crossterm::event::KeyCode::Enter);
+    drop_responses(&app);
+    // A part of an older search arrives. It examined other rows.
+    app.on_response(Response::Search {
+        epoch: app.epoch(),
+        hits: vec![2],
+        from: 1000,
+        scan: 7,
+    });
+    assert_eq!(app.cursor_row, 0, "the match of an older search moved the cursor");
+}
+
+#[test]
+fn a_view_from_the_command_line_is_the_first_view_that_the_worker_reads() {
+    // A start with --filter must send one view. The worker would otherwise be
+    // busy with the whole file first.
+    let p = write_sample("startup-view", SAMPLE, "csv");
+    let (worker, opened) = Worker::spawn(p.to_str().unwrap(), OpenOptions::default()).unwrap();
+    let mut app = App::idle(worker, opened, peruse_core::theme::builtin("peruse-dark").unwrap());
+    app.config_path = p.parent().map(|d| d.join("config.toml"));
+    app.set_raw_filter("region = 'EU'");
+    app.start(false);
+    assert_eq!(app.epoch(), 1, "more than one view went to the worker");
+    let mut term = Terminal::new(TestBackend::new(110, 24)).unwrap();
+    settle(&mut app, &mut term);
+    assert!(screen(&term).contains("3 × 4"), "{}", screen(&term));
 }

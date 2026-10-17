@@ -295,7 +295,9 @@ fn main() -> Result<()> {
     // the mouse in the usual way. A user who copies out of the grid with the
     // mouse each day can therefore turn the mouse off.
     let mouse = !cli.no_mouse && config.mouse.unwrap_or(true);
-    let mut application = App::new(worker, opened, theme, auto_index);
+    // The view of the command line goes in before the first request. Refer to
+    // `App::idle`.
+    let mut application = App::idle(worker, opened, theme);
     application.config = config;
     // The user asked for these panels in an earlier session. Put them on the
     // screen, and ask for what they need.
@@ -312,9 +314,7 @@ fn main() -> Result<()> {
     if let Some(f) = cli.filter {
         application.set_raw_filter(&f);
     }
-    if application.view != View::default() {
-        application.run_startup_view();
-    }
+    application.start(auto_index);
 
     run(&mut application, mouse)
 }
@@ -551,7 +551,11 @@ fn run(application: &mut App, mouse: bool) -> Result<()> {
                 }
             }
             recv(resp_rx) -> resp => {
-                let Ok(resp) = resp else { break Ok(()) };
+                // The engine thread stopped while the program runs. That is
+                // a fault, and the exit code must say so.
+                let Ok(resp) = resp else {
+                    break Err(anyhow::anyhow!("the engine stopped unexpectedly"));
+                };
                 dirty |= application.on_response(resp);
                 while let Ok(resp) = resp_rx.try_recv() {
                     dirty |= application.on_response(resp);

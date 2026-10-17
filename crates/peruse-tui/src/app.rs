@@ -755,6 +755,13 @@ struct Scan {
     total: u64,
     /// The number of rows that the next part covers.
     chunk: u64,
+    /// The first row and the number of rows of the part that is on its way.
+    ///
+    /// A new search, or the key `n`, starts a new scan while a part of the old
+    /// one is still on its way. The epoch cannot see that, because the view did
+    /// not change. Without this test, the matches of the old value would move
+    /// the cursor of the new search.
+    asked: (u64, u64),
 }
 
 /// One view that the user had, for the keys that go back and forward.
@@ -813,6 +820,26 @@ pub struct App {
     page_limit: u32,
     /// The offset and the limit of the page request that has no answer yet.
     requested: Option<(u64, u32)>,
+    /// The offset and the limit of each page request of this view that has no
+    /// answer yet, in the order that Peruse sent them. The request `SetView`
+    /// is the first one, because it also reads a page.
+    ///
+    /// A page holds no record of the limit that asked for it, and a page with
+    /// fewer rows than its limit is the last page. Two requests with two limits
+    /// can be on their way together: a terminal that grows asks for more rows
+    /// while the first page is still on its way. A comparison of the first page
+    /// against the newer limit then calls a full page the last one, and the
+    /// grid stops at row 520 of a file of millions until the count arrives.
+    /// Refer to [`App::limit_of`].
+    inflight: Vec<(u64, u32)>,
+    /// `true` after a page request failed or the user cancelled it.
+    ///
+    /// The grid then asks for no page until the next key. Without the flag, the
+    /// grid would never ask again for the rows at the start of the view: the
+    /// record of the request in flight still names them. A clear of that record
+    /// alone would ask again at each frame, and a request that fails each time
+    /// would make a storm.
+    rows_error: bool,
     /// The number of rows in the view.
     pub total: RowCount,
 
@@ -943,6 +970,13 @@ pub struct App {
     /// The title of the cell inspector, when the value comes from a path
     /// inside a structure and not from a column.
     pub cell_title: Option<String>,
+    /// The row and the column of the cell request that has no answer yet.
+    ///
+    /// The user can close the inspector and open it on another cell while an
+    /// answer is on its way. The epoch cannot see that, because the view did not
+    /// change, so the cell itself is the test. A value from the record view
+    /// asks the engine for nothing, and it holds `None`.
+    cell_asked: Option<(u64, String)>,
 
     /// The selected line of the record view, as a position in the list from
     /// [`App::record_lines`].
@@ -1021,12 +1055,29 @@ impl App {
     ///
     /// If `auto_index` is `true` and the CSV file is small, this function also
     /// asks the worker to index the file.
+    ///
+    /// The tests use this function. The program sets the view of the command
+    /// line between [`App::idle`] and [`App::start`].
+    #[cfg(test)]
     pub fn new(worker: Worker, opened: Opened, theme: Theme, auto_index: bool) -> App {
+        let mut app = App::idle(worker, opened, theme);
+        app.start(auto_index);
+        app
+    }
+
+    /// Makes the application state, and asks the worker for nothing.
+    ///
+    /// The caller sets the view of the command line, and then calls
+    /// [`App::start`]. A start with `--filter` therefore sends one view to the
+    /// worker, and not two. The first view would read the whole file: the
+    /// worker can be busy with it before the second one arrives, and the count
+    /// of a large file of text then delays the first frame by some seconds.
+    pub fn idle(worker: Worker, opened: Opened, theme: Theme) -> App {
         let ncols = opened.schema.len();
         let themes = peruse_core::theme::available();
         let theme_idx = themes.iter().position(|t| t.name == theme.name).unwrap_or(0);
 
-        let mut app = App {
+        App {
             worker,
             source: opened.source,
             read_expr: opened.read_expr,
@@ -1045,6 +1096,8 @@ impl App {
             page: RowPage::default(),
             page_limit: 0,
             requested: None,
+            inflight: Vec::new(),
+            rows_error: false,
             total: RowCount::Counting,
 
             cursor_row: 0,
@@ -1089,6 +1142,7 @@ impl App {
             cell_scroll: 0,
             cell_from_record: false,
             cell_title: None,
+            cell_asked: None,
 
             record_sel: 0,
             record_find: String::new(),
@@ -1123,17 +1177,21 @@ impl App {
             seekable: opened.seekable,
             indexing: false,
             quit: false,
-        };
-        app.reload(true);
-        if auto_index
-            && !app.seekable
-            && app.source.bytes < AUTO_INDEX_BYTES
-            && app.schema.len() <= AUTO_INDEX_COLUMNS
-        {
-            app.indexing = true;
-            app.worker.send(Request::Index { epoch: app.epoch });
         }
-        app
+    }
+
+    /// Asks for the first view, and indexes a small file of text when
+    /// `auto_index` is `true`.
+    pub fn start(&mut self, auto_index: bool) {
+        self.reload(true);
+        if auto_index
+            && !self.seekable
+            && self.source.bytes < AUTO_INDEX_BYTES
+            && self.schema.len() <= AUTO_INDEX_COLUMNS
+        {
+            self.indexing = true;
+            self.worker.send(Request::Index { epoch: self.epoch });
+        }
     }
 
     // ------------------------------------------------------- helper functions
@@ -1206,7 +1264,7 @@ impl App {
         self.total = RowCount::Counting;
         self.page = RowPage::default();
         self.page_limit = 0;
-        self.requested = None;
+        self.rows_error = false;
         // The statistics describe the rows of one view. A new view therefore
         // makes each answer wrong. The facts of the band follow the same rule.
         self.stats_cache.clear();
@@ -1225,7 +1283,28 @@ impl App {
             self.cursor_row = 0;
             self.top_row = 0;
         }
+        self.send_set_view();
+        // The worker keeps the requests of the newest view only, and it can
+        // therefore drop a metadata request that is still in its queue. The
+        // answer would then never come, and the metadata panel would stay
+        // empty for the whole session. Ask again with the new epoch. A second
+        // answer only replaces the first one.
+        if self.meta_asked && self.meta.is_none() && !self.meta_error {
+            self.worker.send(Request::Meta { epoch: self.epoch });
+        }
+    }
+
+    /// Sends the request `SetView` for the current view and epoch.
+    ///
+    /// The request reads the page at the start of the view. That page counts as
+    /// the page request in flight, so the first frame does not ask for the same
+    /// rows a second time. A second read of the first page repeats the complete
+    /// query, and over a sort of a large file that is a second sort.
+    fn send_set_view(&mut self) {
         let limit = self.window_limit();
+        self.inflight.clear();
+        self.inflight.push((0, limit));
+        self.requested = Some((0, limit));
         self.worker.send(Request::SetView {
             epoch: self.epoch,
             view: self.view.clone(),
@@ -1233,9 +1312,39 @@ impl App {
         });
     }
 
-    /// Applies a view that the command line gives, after the start.
+    /// Gives the limit of the request that a page of rows answers, and removes
+    /// that request and each older one from the list in flight.
+    ///
+    /// The worker does the requests of one view in the order that Peruse sent
+    /// them, and it can drop an older page request for a newer one. A page
+    /// therefore answers the oldest request in flight with its offset, or a
+    /// newer request with the same offset. Of those, the function gives the
+    /// smallest limit. A page with fewer rows than that limit is the last page
+    /// whichever request it answers, so the grid never stops before the end.
+    fn limit_of(&mut self, offset: u64) -> Option<u32> {
+        let i = self.inflight.iter().position(|(o, _)| *o == offset)?;
+        let limit = self.inflight[i..]
+            .iter()
+            .filter(|(o, _)| *o == offset)
+            .map(|(_, l)| *l)
+            .min();
+        self.inflight.drain(..=i);
+        limit
+    }
+
+    /// Applies a view that a test sets, after the start.
+    ///
+    /// The program does not use it: the view of the command line goes in
+    /// before the start. Refer to [`App::idle`].
+    #[cfg(test)]
     pub fn run_startup_view(&mut self) {
         self.reload(true);
+    }
+
+    /// Gives the epoch of the current view, for a test that makes a response.
+    #[cfg(test)]
+    pub fn epoch(&self) -> u64 {
+        self.epoch
     }
 
     /// Gives the number of rows to ask for in one page request.
@@ -1250,7 +1359,7 @@ impl App {
     pub fn ensure_rows(&mut self) {
         self.ensure_stats();
         self.ensure_band();
-        if self.schema.is_empty() {
+        if self.schema.is_empty() || self.rows_error {
             return;
         }
         let visible = self.viewport_rows.max(1) as u64;
@@ -1265,6 +1374,7 @@ impl App {
             return;
         }
         self.requested = Some((start, limit));
+        self.inflight.push((start, limit));
         self.worker.send(Request::Page {
             epoch: self.epoch,
             view: self.view.clone(),
@@ -1599,6 +1709,16 @@ impl App {
             Response::Error { ref context, .. } if context == "metadata" => {
                 self.meta_error = true;
             }
+            // A failure of the index also describes the file. The index takes
+            // some seconds, and the user changes the view in that time, so the
+            // epoch of the answer is old more often than not. Without this, the
+            // footer would say "indexing" for the whole session, and the key `I`
+            // would answer "already indexing" for ever.
+            Response::Error { ref context, ref message, .. } if context == "indexing" => {
+                self.indexing = false;
+                self.report_error(context, message);
+                return true;
+            }
             _ => {}
         }
         let epoch = match &resp {
@@ -1641,9 +1761,14 @@ impl App {
                 }
             }
             Response::Page { page, .. } => {
-                self.page_limit = self.requested.map(|(_, l)| l).unwrap_or(page.nrows as u32);
+                // With no request on record, the page counts as a full page. A
+                // wrong "full" costs one more request, and a wrong "last" stops
+                // the grid before the end of the data.
+                self.page_limit = self.limit_of(page.offset).unwrap_or(page.nrows as u32);
                 self.page = page;
-                self.requested = None;
+                // The newest request can still be on its way. Without this, the
+                // next frame would send the same request again.
+                self.requested = self.inflight.last().copied();
                 if !self.widths_fitted && self.page.nrows > 0 {
                     self.fit_widths();
                 }
@@ -1693,7 +1818,11 @@ impl App {
                 let n = self.record_lines().len();
                 self.record_sel = self.record_sel.min(n.saturating_sub(1));
             }
-            Response::Cell { value, .. } => {
+            Response::Cell { row, column, value, .. } => {
+                if self.cell_asked.as_ref() != Some(&(row, column)) {
+                    return false;
+                }
+                self.cell_asked = None;
                 self.cell_value = Some(value.unwrap_or_else(|| "NULL".into()));
                 self.cell_scroll = 0;
             }
@@ -1701,11 +1830,15 @@ impl App {
                 self.duck_threads = threads;
                 self.duck_memory = memory_limit;
             }
-            Response::Search { hits, .. } => self.apply_search(hits),
+            Response::Search { hits, from, scan, .. } => {
+                if self.scan.is_none_or(|s| s.asked != (from, scan)) {
+                    return false;
+                }
+                self.apply_search(hits);
+            }
             // The code above handles these two, before the test of the epoch.
             Response::Indexed { .. } | Response::Meta { .. } => {}
             Response::Error { context, message, .. } => {
-                self.indexing = false;
                 // A request that failed must not leave its part of the screen
                 // waiting for ever. Each of these two parts asks one time and
                 // then waits for the answer, so a failure has to say that no
@@ -1718,6 +1851,14 @@ impl App {
                 // next frame, and a request that fails every time would then make
                 // a storm. The key of each part clears the flag instead.
                 match context.as_str() {
+                    // A count that stopped never arrives, so the screen must
+                    // not say "counting" for ever. The commands that need the
+                    // count start it again. Refer to `App::wait_for_count`.
+                    "count" => self.total = RowCount::Unknown,
+                    "rows" => {
+                        self.rows_error = true;
+                        self.requested = None;
+                    }
                     "column band" => self.band_error = true,
                     "column stats" => {
                         self.stats_error = true;
@@ -1725,14 +1866,19 @@ impl App {
                     }
                     _ => {}
                 }
-                // The first line holds the useful part. DuckDB adds the full
-                // statement after it, and that text is too long for a status
-                // line of one row.
-                let first = message.lines().next().unwrap_or(&message).trim().to_string();
-                self.error(format!("{context}: {first}"));
+                self.report_error(&context, &message);
             }
         }
         true
+    }
+
+    /// Shows the failure of a request on the status line.
+    fn report_error(&mut self, context: &str, message: &str) {
+        // The first line holds the useful part. DuckDB adds the full
+        // statement after it, and that text is too long for a status
+        // line of one row.
+        let first = message.lines().next().unwrap_or(message).trim().to_string();
+        self.error(format!("{context}: {first}"));
     }
 
     /// Finds the nearest known match in the given direction. The function does
@@ -1768,6 +1914,22 @@ impl App {
             format!("{n}+")
         };
         self.ok(format!("match {at}/{total}{note}"));
+    }
+
+    /// Tells the user that a command needs the number of rows, which is not
+    /// known yet.
+    ///
+    /// A count that failed, or that the key `Esc` stopped, gives no answer. The
+    /// function then starts it again: the user asked for something that needs
+    /// the count, and a message that says "try again" must be true.
+    fn wait_for_count(&mut self) {
+        if self.total == RowCount::Unknown {
+            self.total = RowCount::Counting;
+            self.send_set_view();
+            self.info("counting the rows again — try again in a moment (Esc stops it)");
+        } else {
+            self.info("still counting — try again in a moment");
+        }
     }
 
     /// Moves the cursor to the next match or to the previous match.
@@ -1808,7 +1970,7 @@ impl App {
         let Some(total) = self.total.value() else {
             // A row offset has a meaning only with a known number of rows.
             // The worker counts the rows already, so the user can try again.
-            self.info("still counting — try again in a moment");
+            self.wait_for_count();
             return;
         };
         self.scan = Some(Scan {
@@ -1818,6 +1980,7 @@ impl App {
             examined: 0,
             total,
             chunk: SEARCH_CHUNK,
+            asked: (0, 0),
         });
         self.request_scan_chunk();
     }
@@ -1846,6 +2009,7 @@ impl App {
             s.next = from;
             (from, end - from)
         };
+        s.asked = (from, len);
         s.examined = s.examined.saturating_add(len);
         let pct = (s.examined.min(s.total) * 100) / s.total.max(1);
         self.info(format!("searching… {pct}%  (Esc cancels)"));
@@ -1916,6 +2080,9 @@ impl App {
     /// Gives one key to the part of Peruse that has the focus.
     pub fn on_key(&mut self, key: &KeyEvent) {
         self.status = None;
+        // A key is the way back after a page request that failed. Refer to
+        // `App::rows_error`.
+        self.rows_error = false;
         match self.mode {
             Mode::Prompt(kind) => self.prompt_key(kind, key),
             Mode::Help => self.overlay_key(key, |app, d| {
@@ -1948,7 +2115,7 @@ impl App {
         // the grid can never join into one double click.
         let double = ev.kind == MouseEventKind::Down(MouseButton::Left)
             && self.clicks.press_now(ev.column, ev.row);
-        match self.mode {
+        let acted = match self.mode {
             Mode::Normal => self.grid_mouse(ev, double),
             // A prompt keeps the grid on the screen, and a user who writes a
             // filter looks at the data while doing it. The wheel therefore
@@ -1956,7 +2123,13 @@ impl App {
             // the prompt, and a click does nothing.
             Mode::Prompt(_) => self.wheel_grid(ev),
             _ => self.overlay_mouse(ev, double),
+        };
+        // An event that acts is the way back after a page request that failed,
+        // as a key is. Refer to `App::rows_error`.
+        if acted {
+            self.rows_error = false;
         }
+        acted
     }
 
     /// Gives one key to the program, as a press with no modifier.
@@ -2840,7 +3013,7 @@ impl App {
                         // fit in 64 bits.
                         let max = self.max_row();
                         if max == u64::MAX {
-                            self.info("still counting — try again in a moment");
+                            self.wait_for_count();
                             return;
                         }
                         self.cursor_row = (n - 1).min(max);
@@ -3176,6 +3349,7 @@ impl App {
         // already, and the inspector takes it as it is.
         self.cell_value = Some(v);
         self.cell_scroll = 0;
+        self.cell_asked = None;
         self.cell_from_record = true;
         self.cell_title = Some(line.path_text());
         self.mode = Mode::Cell;
@@ -4133,7 +4307,7 @@ impl App {
             Cmd::Bottom => {
                 let max = self.max_row();
                 if max == u64::MAX {
-                    self.info("still counting — try again in a moment");
+                    self.wait_for_count();
                 } else {
                     self.cursor_row = max;
                     self.follow_cursor();
@@ -4155,7 +4329,7 @@ impl App {
                 // nothing happened, reads as a fault in the program.
                 let max = self.max_row();
                 if max == u64::MAX {
-                    self.info("still counting — try again in a moment");
+                    self.wait_for_count();
                     return;
                 }
                 self.move_cols(self.schema.len() as i64);
@@ -4290,6 +4464,7 @@ impl App {
                 self.mode = Mode::Cell;
                 // Ask the engine for the complete value. The copy in the
                 // grid stops at the limit, in the middle of the value.
+                self.cell_asked = Some((self.cursor_row, col.name.clone()));
                 self.worker.send(Request::Cell {
                     epoch: self.epoch,
                     view: self.view.clone(),
