@@ -282,6 +282,8 @@ pub enum PromptKind {
     Search,
     /// A row number to move to.
     Goto,
+    /// The name of a column to move to.
+    Column,
 }
 
 impl PromptKind {
@@ -292,6 +294,7 @@ impl PromptKind {
             PromptKind::Sql => "sql",
             PromptKind::Search => "search",
             PromptKind::Goto => "row",
+            PromptKind::Column => "column",
         }
     }
 }
@@ -850,6 +853,13 @@ pub struct App {
     /// alone would ask again at each frame, and a request that fails each time
     /// would make a storm.
     rows_error: bool,
+    /// `true` after the schema of the current view arrived.
+    ///
+    /// A page request carries the schema, and a new view can have other
+    /// columns. A request with the schema of the old view therefore fails with
+    /// a message about a column that the new view does not hold, while the grid
+    /// is correct. [`App::ensure_rows`] waits for the schema instead.
+    schema_ready: bool,
     /// The number of rows in the view.
     pub total: RowCount,
 
@@ -1062,6 +1072,12 @@ pub struct App {
     hits_complete: bool,
     /// The search that runs now.
     scan: Option<Scan>,
+    /// The row of a match whose column the cursor must still move to.
+    ///
+    /// A match is a row, and the column that holds the value can be outside
+    /// the screen. The cursor moves to that column when the page holds the row.
+    /// A page that is still on its way sets this, and the page answers it.
+    hit_col_pending: Option<u64>,
 
     /// The position of the selected command in the palette.
     pub palette_sel: usize,
@@ -1130,6 +1146,7 @@ impl App {
             requested: None,
             inflight: Vec::new(),
             rows_error: false,
+            schema_ready: false,
             total: RowCount::Counting,
 
             cursor_row: 0,
@@ -1203,6 +1220,7 @@ impl App {
             hits: Vec::new(),
             hits_complete: false,
             scan: None,
+            hit_col_pending: None,
 
             palette_sel: 0,
             help_scroll: 0,
@@ -1314,6 +1332,7 @@ impl App {
         self.hits.clear();
         self.hits_complete = false;
         self.scan = None;
+        self.hit_col_pending = None;
         if reset_cursor {
             self.cursor_row = 0;
             self.top_row = 0;
@@ -1339,6 +1358,12 @@ impl App {
         let limit = self.window_limit();
         self.inflight.clear();
         self.inflight.push((0, limit));
+        // The request below answers with the schema and with the first page.
+        // The first page covers the window from the row 0, so the frame after
+        // this must not ask for it again. And no page request can leave before
+        // the schema of the new view is here: a request that carries the old
+        // schema fails on a column that the new view does not hold.
+        self.schema_ready = false;
         self.requested = Some((0, limit));
         self.worker.send(Request::SetView {
             epoch: self.epoch,
@@ -1394,7 +1419,7 @@ impl App {
     pub fn ensure_rows(&mut self) {
         self.ensure_stats();
         self.ensure_band();
-        if self.schema.is_empty() || self.rows_error {
+        if self.schema.is_empty() || self.rows_error || !self.schema_ready {
             return;
         }
         let visible = self.viewport_rows.max(1) as u64;
@@ -1787,6 +1812,7 @@ impl App {
                         .zip(&self.schema.columns)
                         .any(|(a, b)| a.name != b.name);
                 self.schema = schema;
+                self.schema_ready = true;
                 if changed {
                     self.widths = vec![12; self.schema.len()];
                     self.hidden = vec![false; self.schema.len()];
@@ -1813,6 +1839,10 @@ impl App {
                 if self.cursor_row > max {
                     self.cursor_row = max;
                     self.follow_cursor();
+                }
+                // A match that waited for this page can now find its column.
+                if self.hit_col_pending == Some(self.cursor_row) {
+                    self.focus_hit_column();
                 }
             }
             Response::Count { total, .. } => {
@@ -1970,10 +2000,40 @@ impl App {
         }
     }
 
+    /// Moves the cursor to the first column on the screen that holds the
+    /// search value, on the row of the cursor.
+    ///
+    /// The engine reports a match as a row. The column that holds the value
+    /// can be far outside the screen, and a match that the user cannot see
+    /// looks like no match at all. The page holds the row, so the cursor can
+    /// find the column without a second question to the engine.
+    ///
+    /// A page that does not hold the row yet cannot answer. The function then
+    /// leaves a note, and the page answers it when it arrives.
+    fn focus_hit_column(&mut self) {
+        let Some(r) = self.page_row() else {
+            self.hit_col_pending = Some(self.cursor_row);
+            return;
+        };
+        self.hit_col_pending = None;
+        if self.needle.is_empty() {
+            return;
+        }
+        let found = self.visible_columns().into_iter().find(|ci| {
+            self.page
+                .cell(r, *ci)
+                .is_some_and(|v| crate::text::find_ci(v, &self.needle).is_some())
+        });
+        if let Some(ci) = found {
+            self.cursor_col = ci;
+        }
+    }
+
     /// Moves the cursor to a match and reports the position of that match.
     fn goto_hit(&mut self, row: u64, note: &str) {
         self.cursor_row = row;
         self.follow_cursor();
+        self.focus_hit_column();
         let at = self.hits.iter().position(|h| *h == row).unwrap_or(0) + 1;
         let n = self.hits.len();
         let total = if self.hits_complete {
@@ -2798,6 +2858,13 @@ impl App {
         }
         match self.mode {
             Mode::Prompt(PromptKind::Filter) | Mode::Prompt(PromptKind::Sql) => self.ghost_column(),
+            // The prompt asks for the name of one column, so the list is the
+            // columns of the view and nothing more.
+            Mode::Prompt(PromptKind::Column) => {
+                let names: Vec<String> =
+                    self.schema.columns.iter().map(|c| c.name.clone()).collect();
+                ghost_from(&self.input.text(), &names)
+            }
             Mode::FilterBuild if self.build == Build::Raw => self.ghost_column(),
             Mode::Record if self.record_finding => {
                 let names: Vec<String> = self
@@ -2928,6 +2995,11 @@ impl App {
                 return;
             }
         }
+        // The column prompt holds one name, so the key Tab takes the name that
+        // the ghost shows, as it does in the find box of the record view.
+        if kind == PromptKind::Column && self.take_ghost(key).is_some() {
+            return;
+        }
         match self.input.handle(key) {
             Action::Cancel => {
                 // Keep the line in the history before the prompt closes. The key
@@ -2949,7 +3021,8 @@ impl App {
                     PromptKind::Filter => self.filter_input = self.input.clone(),
                     PromptKind::Sql => self.sql_input = self.input.clone(),
                     PromptKind::Search => self.search_input = self.input.clone(),
-                    PromptKind::Goto => {}
+                    // These two prompts keep no history between two opens.
+                    PromptKind::Goto | PromptKind::Column => {}
                 }
                 self.mode = Mode::Normal;
                 self.prompt_error = None;
@@ -3116,7 +3189,48 @@ impl App {
                     _ => self.error(format!("not a row number: {trimmed:?}")),
                 }
             }
+            PromptKind::Column => {
+                self.mode = Mode::Normal;
+                if trimmed.is_empty() {
+                    return;
+                }
+                let Some(c) = self.find_column(&trimmed) else {
+                    self.error(format!("no column named {trimmed:?}"));
+                    return;
+                };
+                let name = self.schema.columns[c].name.clone();
+                // The user asked for this column by name, so a column that the
+                // grid hides comes back. A cursor on a hidden column would be
+                // a cursor that the user cannot see.
+                if self.hidden[c] {
+                    self.hidden[c] = false;
+                    self.ok(format!("{name} was hidden, and is shown again"));
+                }
+                self.cursor_col = c;
+            }
         }
+    }
+
+    /// Finds the column that a name points at.
+    ///
+    /// The exact name wins. After it, the name that starts with the text, then
+    /// the name that holds the text, and then the name that holds each of its
+    /// characters in order. The user can therefore type a part of a long name.
+    /// The comparison ignores the case of the letters.
+    fn find_column(&self, text: &str) -> Option<usize> {
+        let want = text.to_lowercase();
+        let names: Vec<String> = self
+            .schema
+            .columns
+            .iter()
+            .map(|c| c.name.to_lowercase())
+            .collect();
+        names
+            .iter()
+            .position(|n| *n == want)
+            .or_else(|| names.iter().position(|n| n.starts_with(&want)))
+            .or_else(|| names.iter().position(|n| n.contains(&want)))
+            .or_else(|| names.iter().position(|n| commands::fuzzy_match(&want, n)))
     }
 
     /// Opens the prompt and fills it with the text that the user needs.
@@ -3148,13 +3262,22 @@ impl App {
                 i.set(&self.needle);
                 i
             }
-            PromptKind::Goto => {
-                let mut i = LineInput::default();
-                i.clear();
-                i
-            }
+            PromptKind::Goto | PromptKind::Column => LineInput::default(),
         };
         self.mode = Mode::Prompt(kind);
+    }
+
+    /// Gives the message for a key that needs a row where there is none.
+    ///
+    /// A view with no row at all gets a plain answer. The word "yet" belongs to
+    /// a row that the engine is still reading, and it would send the user to
+    /// wait for a row that never comes.
+    fn no_row_message(&self) -> &'static str {
+        if self.is_empty() {
+            "the view holds no row"
+        } else {
+            "no row here yet"
+        }
     }
 
     /// Copies a text to the clipboard and reports the result.
@@ -3238,7 +3361,7 @@ impl App {
             return;
         }
         if self.page_row().is_none() {
-            self.error("no row here yet");
+            self.error(self.no_row_message());
             return;
         }
         self.record_find.clear();
@@ -3556,7 +3679,9 @@ impl App {
                 .map(|gb| format!("{gb} GB (half of this machine)"))
                 .unwrap_or_else(|| "the rule of DuckDB".into()),
             Setting::SampleSize => "20,480 rows".into(),
-            Setting::NoIndex => "yes, below 256 MB".into(),
+            // The two limits come from the constants, so the page can never
+            // name a number that the program does not use.
+            Setting::NoIndex => format!("yes, below {} MB", AUTO_INDEX_BYTES / (1024 * 1024)),
             Setting::Panels => "none".into(),
             Setting::Band => "off".into(),
             Setting::Step => format!("{DEFAULT_STEP} rows or columns"),
@@ -4328,7 +4453,7 @@ impl App {
             return;
         };
         let Some(r) = self.page_row() else {
-            self.error("no row here yet");
+            self.error(self.no_row_message());
             return;
         };
         // The grid shows the size of a BLOB value, and not its bytes. A
@@ -4446,6 +4571,13 @@ impl App {
                 self.follow_cursor();
             }
             Cmd::GotoRow => self.open_prompt(PromptKind::Goto),
+            Cmd::GotoColumn => {
+                if self.schema.is_empty() {
+                    self.error("no columns");
+                    return;
+                }
+                self.open_prompt(PromptKind::Column);
+            }
 
             Cmd::SortCycle => {
                 let Some(col) = self.schema.columns.get(self.cursor_col) else {
@@ -4487,6 +4619,29 @@ impl App {
                 }
             }
             Cmd::Sql => self.open_prompt(PromptKind::Sql),
+            // One statement over the view of the moment: each value of the
+            // column, with the number of rows that hold it. The statement
+            // replaces the grid, so the title says `query`, the key `e` shows
+            // the statement, and the key `u` gives the view back.
+            Cmd::ValueCounts => {
+                let Some(col) = self.schema.columns.get(self.cursor_col) else {
+                    return;
+                };
+                let name = col.name.clone();
+                let stmt = format!(
+                    "SELECT {} , count(*) AS count {} GROUP BY 1 ORDER BY 2 DESC, 1",
+                    peruse_core::query::quote_ident(&name),
+                    self.view.scan_from()
+                );
+                self.view.base = Base::Sql(stmt);
+                // The filter is inside the statement now, and a sort on the
+                // old columns would be wrong.
+                self.fset.clear();
+                self.view.filter = None;
+                self.view.sort.clear();
+                self.reload(true);
+                self.ok(format!("each value of {name}, with its count — u goes back"));
+            }
             Cmd::Undo => self.step_history(true),
             Cmd::Redo => self.step_history(false),
             Cmd::ResetView => {
@@ -4553,7 +4708,7 @@ impl App {
             Cmd::InspectCell => {
                 // An empty view has no cell to show.
                 if self.is_empty() {
-                    self.error("no rows here");
+                    self.error(self.no_row_message());
                     return;
                 }
                 let Some(col) = self.schema.columns.get(self.cursor_col) else {
@@ -4570,6 +4725,10 @@ impl App {
                 // instead, with the column already open.
                 if col.kind == peruse_core::CellKind::Nested {
                     self.open_record_at_column();
+                    return;
+                }
+                if self.page_row().is_none() {
+                    self.error(self.no_row_message());
                     return;
                 }
                 self.cell_value = self.current_cell_text();
@@ -4629,22 +4788,17 @@ impl App {
             }
 
             Cmd::CopyCell => {
-                let Some(v) = self.current_cell_text() else {
-                    self.error("no cell here yet");
+                let Some(v) = self.page_row().and_then(|_| self.current_cell_text()) else {
+                    self.error(self.no_row_message());
                     return;
                 };
                 self.copy(&v, "cell");
             }
             Cmd::CopyRow => {
-                let Some(r) = self.cursor_row.checked_sub(self.page.offset) else {
-                    self.error("no row here yet");
+                let Some(r) = self.page_row() else {
+                    self.error(self.no_row_message());
                     return;
                 };
-                let r = r as usize;
-                if r >= self.page.nrows {
-                    self.error("no row here yet");
-                    return;
-                }
                 // A missing value copies as the word NULL, and not as an
                 // empty text. Peruse shows the two as different values
                 // everywhere else, and the clipboard must not lose that

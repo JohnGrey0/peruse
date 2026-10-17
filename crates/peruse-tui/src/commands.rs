@@ -36,6 +36,7 @@ pub enum Cmd {
     Origin,
     LastCell,
     GotoRow,
+    GotoColumn,
     // The commands that change the view.
     SortCycle,
     SortClear,
@@ -45,6 +46,7 @@ pub enum Cmd {
     FilterExcludeValue,
     FilterClear,
     Sql,
+    ValueCounts,
     Undo,
     Redo,
     ResetView,
@@ -259,6 +261,15 @@ pub static BINDINGS: &[Binding] = &[
         desc: "jump to row number",
         group: "Move",
     },
+    // A file with 300 columns needs a way to one column by its name. The
+    // letter `c` is for the column, and the prompt completes the name.
+    Binding {
+        cmd: Cmd::GotoColumn,
+        keys: &[(KeyCode::Char('c'), N)],
+        label: "c",
+        desc: "jump to a column by name",
+        group: "Move",
+    },
     Binding {
         cmd: Cmd::SortCycle,
         keys: &[(KeyCode::Char('s'), N)],
@@ -313,6 +324,16 @@ pub static BINDINGS: &[Binding] = &[
         keys: &[(KeyCode::Char('e'), N)],
         label: "e",
         desc: "edit the SQL query behind the grid",
+        group: "Query",
+    },
+    // The statistics panel shows the eight most frequent values. This command
+    // shows each value with its count, as a grid, so the user can read and
+    // sort the whole list. The key `u` goes back.
+    Binding {
+        cmd: Cmd::ValueCounts,
+        keys: &[(KeyCode::Char('v'), N)],
+        label: "v",
+        desc: "count the rows of each value in this column (u goes back)",
         group: "Query",
     },
     Binding {
@@ -499,7 +520,7 @@ pub static BINDINGS: &[Binding] = &[
         cmd: Cmd::Cancel,
         keys: &[(KeyCode::Esc, N)],
         label: "Esc",
-        desc: "cancel the running query",
+        desc: "cancel the running query, or close the side panels",
         group: "Other",
     },
     Binding {
@@ -583,7 +604,7 @@ mod tests {
         assert_eq!(resolve(&ev(KeyCode::Char('j'), N)), Some(Cmd::RowDown));
         assert_eq!(resolve(&ev(KeyCode::Down, N)), Some(Cmd::RowDown));
         assert_eq!(resolve(&ev(KeyCode::Char('q'), N)), Some(Cmd::Quit));
-        assert_eq!(resolve(&ev(KeyCode::Char('v'), N)), None);
+        assert_eq!(resolve(&ev(KeyCode::Char('b'), N)), None);
     }
 
     #[test]
@@ -637,7 +658,18 @@ mod tests {
         assert_eq!(resolve(&ev(KeyCode::Char('f'), N)), Some(Cmd::FilterBuild));
         assert_eq!(resolve(&ev(KeyCode::Char('f'), CTRL)), Some(Cmd::PageDown));
         assert_eq!(resolve(&ev(KeyCode::Char('c'), CTRL)), Some(Cmd::Quit));
-        assert_eq!(resolve(&ev(KeyCode::Char('c'), N)), None);
+        assert_eq!(resolve(&ev(KeyCode::Char('c'), N)), Some(Cmd::GotoColumn));
+        assert_eq!(resolve(&ev(KeyCode::Char('b'), CTRL)), Some(Cmd::PageUp));
+        assert_eq!(resolve(&ev(KeyCode::Char('b'), N)), None);
+    }
+
+    #[test]
+    fn a_column_and_its_values_have_a_key_each() {
+        // A file with 300 columns needs a way to one column by its name, and
+        // the question "which values does this column hold, and how often"
+        // needs one key and not a statement.
+        assert_eq!(resolve(&ev(KeyCode::Char('c'), N)), Some(Cmd::GotoColumn));
+        assert_eq!(resolve(&ev(KeyCode::Char('v'), N)), Some(Cmd::ValueCounts));
     }
 
     #[test]

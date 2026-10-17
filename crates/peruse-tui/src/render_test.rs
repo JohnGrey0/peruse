@@ -3820,3 +3820,785 @@ fn an_empty_view_has_no_cell_to_copy_or_to_show() {
     app.run(Cmd::InspectCell);
     assert_eq!(app.mode, Mode::Normal, "Enter opened a cell of an empty view");
 }
+
+// ------------------------------------------------ the changes of the ux review
+
+#[test]
+fn a_statement_that_changes_the_columns_leaves_no_error_behind() {
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    // The request for a new view answers with the schema and the first page.
+    // The frame after it asked for the page again, with the schema of the old
+    // view, and that request failed on a column that the new view does not
+    // hold. The grid was correct, and the status line said "Binder Error".
+    let p = write_sample("sql-no-stale-error", SAMPLE, "csv");
+    let (mut app, mut term) = open(&p);
+    settle(&mut app, &mut term);
+
+    press_char(&mut app, 'e');
+    app.on_key(&KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+    type_text(&mut app, "SELECT region, count(*) AS n FROM src GROUP BY 1 ORDER BY 1");
+    press(&mut app, KeyCode::Enter);
+    settle(&mut app, &mut term);
+    let s = screen(&term);
+    assert!(s.contains("3 × 2"), "the statement did not run\n{s}");
+    assert!(!s.contains("Binder"), "an error of the old schema stayed\n{s}");
+    assert!(
+        !matches!(app.status, Some(crate::app::Status { kind: crate::app::StatusKind::Error, .. })),
+        "the status line holds an error: {:?}",
+        app.status
+    );
+
+    // The same from the command line: --query runs before the first frame.
+    let p = write_sample("sql-no-stale-error-cli", SAMPLE, "csv");
+    let (mut app, mut term) = open(&p);
+    app.view.base = Base::Sql("SELECT name FROM src".into());
+    app.run_startup_view();
+    settle(&mut app, &mut term);
+    let s = screen(&term);
+    assert!(s.contains("5 × 1"), "{s}");
+    assert!(!s.contains('✕'), "an error of the old schema stayed\n{s}");
+}
+
+#[test]
+fn a_search_moves_the_cursor_to_the_column_that_holds_the_value() {
+    // A match is a row. The column that holds the value can be far outside
+    // the screen, and a match that the user cannot see looks like no match.
+    let p = write_sample("search-column", &wide_sample(), "csv");
+    let (mut app, mut term) = open(&p);
+    settle(&mut app, &mut term);
+    assert_eq!(app.cursor_col, 0);
+
+    type_search(&mut app, &mut term, "v57");
+    assert_eq!(app.cursor_col, 57, "the cursor did not move to the column");
+    let s = screen(&term);
+    assert!(s.contains("col_57"), "the column is not on the screen\n{s}");
+    assert!(s.contains("match 1/"), "{s}");
+
+    // The keys n and N move to the next row and find the column there too.
+    let p = write_sample("search-column-next", SAMPLE, "csv");
+    let (mut app, mut term) = open(&p);
+    settle(&mut app, &mut term);
+    type_search(&mut app, &mut term, "EU");
+    assert_eq!((app.cursor_row, app.cursor_col), (0, 3), "the first match is region on the first row");
+    app.run(Cmd::ColFirst);
+    app.run(Cmd::SearchNext);
+    settle(&mut app, &mut term);
+    assert_eq!((app.cursor_row, app.cursor_col), (2, 3));
+
+    // A value that no cell of the row holds in full leaves the column alone.
+    app.run(Cmd::ColFirst);
+    app.needle = "carol".into();
+    app.hits.clear();
+    app.run(Cmd::SearchNext);
+    settle(&mut app, &mut term);
+    assert_eq!((app.cursor_row, app.cursor_col), (2, 1), "carol is in the column name");
+}
+
+#[test]
+fn a_long_statement_moves_left_so_that_the_cursor_stays_on_the_screen() {
+    use ratatui::crossterm::event::KeyCode;
+    // The prompt is one row. A statement that is longer than the row went
+    // past the right edge, and the user typed into a part of the line that
+    // was not on the screen.
+    let p = write_sample("prompt-scroll", SAMPLE, "csv");
+    let (mut app, mut term) = open(&p);
+    settle(&mut app, &mut term);
+
+    press_char(&mut app, 'e');
+    let tail = "amount > 100 AND region = 'EU' AND ";
+    for _ in 0..6 {
+        type_text(&mut app, tail);
+    }
+    type_text(&mut app, "name = 'zoe'");
+    settle(&mut app, &mut term);
+    let rows = lines(&term);
+    let prompt = &rows[rows.len() - 2];
+    assert!(prompt.starts_with("sql › …"), "no mark for the part at the left: {prompt:?}");
+    assert!(prompt.contains("name = 'zoe'"), "the end of the line is not on the screen: {prompt:?}");
+    assert!(!prompt.contains("SELECT"), "the start of the line is still there: {prompt:?}");
+
+    // The cursor is inside the row, after the last character.
+    let cursor = term.get_cursor_position().unwrap();
+    assert_eq!(cursor.y, (rows.len() - 2) as u16);
+    assert!(cursor.x < 110, "the cursor is outside the screen");
+    // The row holds characters of more than one byte, so count the columns
+    // and not the bytes.
+    let at = prompt.find("name = 'zoe'").unwrap();
+    let col = prompt[..at].chars().count() + "name = 'zoe'".len();
+    assert_eq!(cursor.x as usize, col, "the cursor is not after the last character");
+
+    // Home moves the cursor to the start, and the line follows it back.
+    press(&mut app, KeyCode::Home);
+    settle(&mut app, &mut term);
+    let prompt = lines(&term)[rows.len() - 2].clone();
+    assert!(prompt.starts_with("sql › SELECT"), "{prompt:?}");
+
+    // A short line draws as before, with no mark.
+    app.input.set("SELECT 1");
+    settle(&mut app, &mut term);
+    let prompt = lines(&term)[rows.len() - 2].clone();
+    assert!(prompt.starts_with("sql › SELECT 1"), "{prompt:?}");
+}
+
+#[test]
+fn the_cell_inspector_counts_one_line_in_the_singular() {
+    let p = write_sample("inspector-plural", SAMPLE, "csv");
+    let (mut app, mut term) = open(&p);
+    settle(&mut app, &mut term);
+    app.run(Cmd::ColRight);
+    app.run(Cmd::InspectCell);
+    settle(&mut app, &mut term);
+    let s = screen(&term);
+    assert!(s.contains("5 chars · 1 line ·"), "{s}");
+}
+
+#[test]
+fn a_narrow_terminal_keeps_the_filter_key_in_the_footer() {
+    // The note about the index took the room of four key hints on a terminal
+    // of 80 columns. The short form keeps the key and gives the hints back.
+    let p = write_sample("footer-narrow", SAMPLE, "csv");
+    let (mut app, _) = open(&p);
+    let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    settle(&mut app, &mut term);
+    assert!(!app.seekable);
+    let last = lines(&term).pop().unwrap();
+    assert!(last.contains("press I to index"), "the key I is gone: {last:?}");
+    assert!(last.contains("f filter"), "the filter hint is gone: {last:?}");
+    assert!(last.contains("u undo"), "the undo hint is gone: {last:?}");
+
+    // A wide terminal keeps the long form.
+    let mut term = Terminal::new(TestBackend::new(160, 24)).unwrap();
+    settle(&mut app, &mut term);
+    let last = lines(&term).pop().unwrap();
+    assert!(last.contains("for instant jumps"), "{last:?}");
+}
+
+#[test]
+fn the_settings_page_names_the_true_limits_of_the_index() {
+    // The page said "below 256 MB", and the program indexes below 64 MB.
+    let p = write_sample("settings-index-limit", SAMPLE, "csv");
+    let (mut app, mut term) = open(&p);
+    settle(&mut app, &mut term);
+    app.run(Cmd::Settings);
+    settle(&mut app, &mut term);
+    let s = screen(&term);
+    assert!(s.contains("yes, below 64 MB"), "{s}");
+    assert!(!s.contains("256 MB"), "{s}");
+}
+
+#[test]
+fn a_view_with_no_row_says_so_and_not_yet() {
+    // "no row here yet" sends the user to wait for a row that never comes.
+    let p = write_sample("no-rows-message", "a,b\n", "csv");
+    let (mut app, mut term) = open(&p);
+    settle(&mut app, &mut term);
+    assert!(app.is_empty());
+    for cmd in [Cmd::Record, Cmd::CopyCell, Cmd::CopyRow, Cmd::FilterThisValue, Cmd::InspectCell] {
+        app.run(cmd);
+        assert_eq!(app.mode, Mode::Normal, "{cmd:?} opened a box over no row");
+        assert_eq!(
+            app.status.as_ref().map(|s| s.text.as_str()),
+            Some("the view holds no row"),
+            "{cmd:?}"
+        );
+    }
+    // A row that is still on its way keeps the old message.
+    let p = write_sample("no-rows-message-yet", SAMPLE, "csv");
+    let (mut app, _) = open(&p);
+    app.run(Cmd::Record);
+    assert_eq!(app.status.as_ref().map(|s| s.text.as_str()), Some("no row here yet"));
+}
+
+#[test]
+fn the_key_v_counts_the_rows_of_each_value_of_the_column() {
+    let p = write_sample("value-counts", SAMPLE, "csv");
+    let (mut app, mut term) = open(&p);
+    settle(&mut app, &mut term);
+
+    app.run(Cmd::ColLast); // region
+    app.run(Cmd::ValueCounts);
+    settle(&mut app, &mut term);
+    let s = screen(&term);
+    assert!(s.contains("3 × 2"), "three values, two columns\n{s}");
+    assert!(s.contains("count"), "no count column\n{s}");
+    assert!(s.contains("query"), "the title does not say that a statement runs\n{s}");
+    let eu = lines(&term).into_iter().find(|l| l.contains("EU")).expect("no row for EU");
+    assert!(eu.contains('3'), "EU occurs three times: {eu:?}");
+    assert!(!s.contains('✕'), "an error\n{s}");
+
+    // The key u gives the file back.
+    app.run(Cmd::Undo);
+    settle(&mut app, &mut term);
+    assert!(screen(&term).contains("5 × 4"), "{}", screen(&term));
+
+    // The counts follow the filter of the moment.
+    app.run(Cmd::ColLast);
+    app.run(Cmd::FilterThisValue); // region = EU
+    settle(&mut app, &mut term);
+    app.run(Cmd::ColFirst);
+    app.run(Cmd::ColRight); // name
+    app.run(Cmd::ValueCounts);
+    settle(&mut app, &mut term);
+    let s = screen(&term);
+    assert!(s.contains("3 × 2"), "alice, carol and erin are in the EU\n{s}");
+    assert!(!s.contains("dave"), "a row outside the filter\n{s}");
+}
+
+#[test]
+fn the_key_c_moves_to_a_column_by_its_name() {
+    use ratatui::crossterm::event::KeyCode;
+    let p = write_sample("goto-column", SAMPLE, "csv");
+    let (mut app, mut term) = open(&p);
+    settle(&mut app, &mut term);
+
+    press_char(&mut app, 'c');
+    assert_eq!(app.mode, Mode::Prompt(PromptKind::Column));
+    type_text(&mut app, "reg");
+    settle(&mut app, &mut term);
+    assert!(screen(&term).contains("column › region"), "{}", screen(&term));
+    press(&mut app, KeyCode::Enter);
+    assert_eq!(app.mode, Mode::Normal);
+    assert_eq!(app.cursor_col, 3, "a part of the name finds the column");
+
+    // The ghost completion and the key Tab work as in the other prompts.
+    press_char(&mut app, 'c');
+    type_text(&mut app, "am");
+    assert_eq!(app.ghost().as_deref(), Some("ount"));
+    press(&mut app, KeyCode::Tab);
+    assert_eq!(app.input.text(), "amount");
+    press(&mut app, KeyCode::Enter);
+    assert_eq!(app.cursor_col, 2);
+
+    // A hidden column comes back, because the user asked for it by name.
+    app.run(Cmd::ColFirst);
+    app.run(Cmd::ColRight);
+    app.run(Cmd::HideColumn);
+    assert!(app.hidden[1]);
+    press_char(&mut app, 'c');
+    type_text(&mut app, "NAME");
+    press(&mut app, KeyCode::Enter);
+    assert_eq!(app.cursor_col, 1);
+    assert!(!app.hidden[1], "the column stays hidden");
+
+    // A name that no column holds gives a message and moves nothing.
+    press_char(&mut app, 'c');
+    type_text(&mut app, "zzz");
+    press(&mut app, KeyCode::Enter);
+    assert_eq!(app.cursor_col, 1);
+    assert!(app.status.as_ref().is_some_and(|s| s.text.contains("no column named")));
+}
+
+#[test]
+fn a_count_that_stopped_does_not_say_still_counting_for_ever() {
+    // Esc stops the count of a large file, and the worker answers with an
+    // error for it. The count then stayed "counting", and G said "still
+    // counting" until the user changed the view.
+    let p = write_sample("count-cancelled", &wide_sample(), "csv");
+    let (mut app, mut term) = open(&p);
+    // The first frame goes out before the count arrives.
+    term.draw(|f| ui::draw(f, &mut app, Depth::True)).unwrap();
+    assert!(matches!(app.total, peruse_core::model::RowCount::Counting));
+
+    let changed = app.on_response(peruse_core::Response::Error {
+        epoch: app.epoch(),
+        context: "count".into(),
+        message: "INTERRUPT Error: Interrupted!".into(),
+    });
+    assert!(changed);
+    assert!(matches!(app.total, peruse_core::model::RowCount::Unknown));
+
+    // The key that needs the count starts the count again, and says so.
+    app.run(Cmd::Bottom);
+    let msg = app.status.as_ref().map(|s| s.text.clone()).unwrap_or_default();
+    assert!(msg.contains("counting the rows again"), "{msg:?}");
+    assert!(!msg.contains("still counting"), "{msg:?}");
+    assert!(matches!(app.total, peruse_core::model::RowCount::Counting));
+
+    // The view still works, and R counts again.
+    app.run(Cmd::ResetView);
+    settle(&mut app, &mut term);
+    assert!(screen(&term).contains("2 × 60"), "{}", screen(&term));
+}
+
+// ------------------------------------------------ the screens, for a review
+
+/// A tool for a review of the user interface. It draws each screen of Peruse at
+/// one size of the terminal and writes the characters to a file.
+///
+///     PERUSE_UX_DUMP_DIR=C:\dir cargo test -p peruse-tui ux_dump -- --ignored
+///
+/// The file is `screens-<w>x<h>.txt` in that directory. The test asserts
+/// nothing: a person reads the file.
+#[test]
+#[ignore = "writes the screens to a file instead of asserting"]
+fn ux_dump_all_screens() {
+    use peruse_core::model::RowCount;
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use std::fmt::Write as _;
+
+    let Ok(dir) = std::env::var("PERUSE_UX_DUMP_DIR") else {
+        eprintln!("set PERUSE_UX_DUMP_DIR");
+        return;
+    };
+    let dir = PathBuf::from(dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // A file with a realistic shape: many columns of mixed families, long text,
+    // NULL values, and enough rows to scroll.
+    let mut body = String::from(
+        "order_id,customer_name,amount_paid,ordered_at,shipped,region,notes,qty,unit_price,discount_pct,sku,warehouse\n",
+    );
+    let names = ["alice", "bob", "carol", "dave", "erin", "frank", "grace", "heidi"];
+    let regions = ["EU", "US", "APAC", "LATAM"];
+    for i in 0..300u32 {
+        let amount = if i % 7 == 2 { String::new() } else { format!("{:.2}", (i as f64) * 13.37) };
+        let notes = if i % 5 == 0 {
+            "A long free-text note that goes well past the width of the column and keeps going".to_string()
+        } else if i % 11 == 0 {
+            String::new()
+        } else {
+            format!("note {i}")
+        };
+        let _ = writeln!(
+            body,
+            "{},{},{},2024-01-{:02} 09:{:02}:00,{},{},{},{},{:.2},{},SKU-{:05},WH-{}",
+            1000 + i,
+            names[(i as usize) % names.len()],
+            amount,
+            (i % 28) + 1,
+            i % 60,
+            i % 3 == 0,
+            regions[(i as usize) % regions.len()],
+            notes,
+            (i % 9) + 1,
+            4.5 + (i % 17) as f64,
+            if i % 4 == 0 { "" } else { "10" },
+            i * 7,
+            (i % 4) + 1
+        );
+    }
+    let realistic = write_sample("ux-realistic", &body, "csv");
+    let nested = write_sample(
+        "ux-nested",
+        concat!(
+            "[{\"id\":\"2489651045\",\"type\":\"CreateEvent\",",
+            "\"actor\":{\"id\":665991,\"login\":\"petroav\",\"gravatar_id\":\"\",\"url\":\"https://api.github.com/users/petroav\"},",
+            "\"repo\":{\"id\":28688495,\"name\":\"petroav/6.828\",\"url\":\"https://api.github.com/repos/petroav/6.828\"},",
+            "\"payload\":{\"ref\":\"master\",\"ref_type\":\"branch\",\"push_id\":null,",
+            "\"commits\":[{\"sha\":\"aa\",\"message\":\"one\"},{\"sha\":\"bb\",\"message\":\"two\"}]},\"org\":null},",
+            "{\"id\":\"2489651051\",\"type\":\"PushEvent\",",
+            "\"actor\":{\"id\":3854017,\"login\":\"rspt\",\"gravatar_id\":\"\",\"url\":\"https://api.github.com/users/rspt\"},",
+            "\"repo\":{\"id\":28671719,\"name\":\"rspt/rspt-theme\",\"url\":\"https://api.github.com/repos/rspt/rspt-theme\"},",
+            "\"payload\":{\"ref\":null,\"ref_type\":null,\"push_id\":536863970,\"commits\":null},\"org\":null}]"
+        ),
+        "json",
+    );
+    let empty = write_sample("ux-empty", "a,b,c\n", "csv");
+    let key = |c: char| KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
+
+    for (w, h) in [(80u16, 24u16), (160, 45)] {
+        let mut out = String::new();
+        let mut put = |title: &str, term: &Terminal<TestBackend>| {
+            let _ = writeln!(out, "\n===== {title} ({w}x{h}) =====");
+            let _ = writeln!(out, "{}", screen(term));
+        };
+
+        // ---- the chooser
+        {
+            let d = std::env::temp_dir().join("peruse-ux-chooser");
+            let _ = std::fs::remove_dir_all(&d);
+            std::fs::create_dir_all(d.join("archive")).unwrap();
+            std::fs::create_dir_all(d.join("raw")).unwrap();
+            for (n, size) in [
+                ("trips.parquet", 1_300_000usize),
+                ("sales.csv", 4_200),
+                ("events.ndjson", 88_000),
+                ("readme.txt", 300),
+                ("shop.duckdb", 12_000),
+                ("very_long_file_name_that_goes_on_and_on_for_a_while_2024_export_final.csv", 900),
+            ] {
+                std::fs::write(d.join(n), "x".repeat(size)).unwrap();
+            }
+            let config = peruse_core::config::Config {
+                recent: vec![
+                    d.join("sales.csv").to_string_lossy().into_owned(),
+                    realistic.to_string_lossy().into_owned(),
+                ],
+                ..Default::default()
+            };
+            let theme = peruse_core::theme::builtin("peruse-dark").unwrap();
+            let mut b = crate::browser::Browser::new(d.clone(), &config);
+            let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+            term.draw(|f| {
+                crate::browser::draw(f, &mut b, &theme, Depth::True);
+            })
+            .unwrap();
+            put("chooser", &term);
+
+            b.on_key(&key('/'));
+            b.on_key(&key('s'));
+            b.on_key(&key('a'));
+            term.draw(|f| {
+                if let Some(pos) = crate::browser::draw(f, &mut b, &theme, Depth::True) {
+                    f.set_cursor_position(pos);
+                }
+            })
+            .unwrap();
+            put("chooser, find box", &term);
+
+            let mut e = crate::browser::Browser::new(d.join("raw"), &config);
+            term.draw(|f| {
+                crate::browser::draw(f, &mut e, &theme, Depth::True);
+            })
+            .unwrap();
+            put("chooser, empty directory", &term);
+
+            let mut bad = crate::browser::Browser::new(
+                PathBuf::from("/no/such/dir"),
+                &peruse_core::config::Config::default(),
+            );
+            term.draw(|f| {
+                crate::browser::draw(f, &mut bad, &theme, Depth::True);
+            })
+            .unwrap();
+            put("chooser, unreadable directory", &term);
+
+            let tables = vec![
+                peruse_core::engine::DbTable { schema: "main".into(), name: "customers".into(), is_view: false, rows: Some(12_480) },
+                peruse_core::engine::DbTable { schema: "main".into(), name: "orders".into(), is_view: false, rows: Some(3_102_556) },
+                peruse_core::engine::DbTable { schema: "staging".into(), name: "orders_raw".into(), is_view: false, rows: None },
+                peruse_core::engine::DbTable { schema: "main".into(), name: "recent_orders".into(), is_view: true, rows: None },
+            ];
+            let mut t = crate::browser::Browser::of_database(Path::new("/data/shop.duckdb"), &tables);
+            term.draw(|f| {
+                crate::browser::draw(f, &mut t, &theme, Depth::True);
+            })
+            .unwrap();
+            put("table picker", &term);
+        }
+
+        // ---- the grid and its states
+        let (worker, opened) = Worker::spawn(realistic.to_str().unwrap(), OpenOptions::default()).unwrap();
+        let mut app = App::new(worker, opened, peruse_core::theme::builtin("peruse-dark").unwrap(), false);
+        app.config_path = realistic.parent().map(|d| d.join("config.toml"));
+        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+
+        term.draw(|f| ui::draw(f, &mut app, Depth::True)).unwrap();
+        put("grid, first frame before any answer", &term);
+
+        settle(&mut app, &mut term);
+        put("grid", &term);
+
+        for _ in 0..7 {
+            app.run(Cmd::ColRight);
+        }
+        app.run(Cmd::RowDown);
+        app.run(Cmd::RowDown);
+        settle(&mut app, &mut term);
+        put("grid, scrolled right to column 8, row 3", &term);
+
+        app.run(Cmd::Origin);
+        app.run(Cmd::ColRight);
+        app.run(Cmd::ColRight);
+        app.run(Cmd::SortCycle);
+        settle(&mut app, &mut term);
+        put("grid, sorted by amount_paid", &term);
+
+        app.run(Cmd::ColRight);
+        app.run(Cmd::ColRight);
+        app.run(Cmd::ColRight);
+        app.run(Cmd::FilterThisValue);
+        settle(&mut app, &mut term);
+        put("grid, sorted + quick filter on region", &term);
+
+        app.run(Cmd::ColLeft);
+        app.run(Cmd::HideColumn);
+        settle(&mut app, &mut term);
+        put("grid, with a hidden column", &term);
+
+        app.run(Cmd::ResetView);
+        settle(&mut app, &mut term);
+
+        app.busy = true;
+        term.draw(|f| ui::draw(f, &mut app, Depth::True)).unwrap();
+        put("grid, worker busy", &term);
+        app.busy = false;
+        let total = app.total;
+        app.total = RowCount::Counting;
+        term.draw(|f| ui::draw(f, &mut app, Depth::True)).unwrap();
+        put("grid, count still running", &term);
+        app.total = total;
+        app.indexing = true;
+        term.draw(|f| ui::draw(f, &mut app, Depth::True)).unwrap();
+        put("grid, indexing", &term);
+        app.indexing = false;
+
+        app.config.band = Some("compact".into());
+        term.draw(|f| ui::draw(f, &mut app, Depth::True)).unwrap();
+        put("band compact, facts not arrived", &term);
+        settle(&mut app, &mut term);
+        put("band compact", &term);
+        app.config.band = Some("detailed".into());
+        settle(&mut app, &mut term);
+        put("band detailed", &term);
+        app.config.band = None;
+
+        app.run(Cmd::Search);
+        type_text(&mut app, "carol");
+        term.draw(|f| ui::draw(f, &mut app, Depth::True)).unwrap();
+        put("search prompt", &term);
+        press(&mut app, KeyCode::Enter);
+        settle(&mut app, &mut term);
+        put("after a search", &term);
+        app.run(Cmd::SearchNext);
+        settle(&mut app, &mut term);
+        put("after n", &term);
+        app.needle.clear();
+        app.hits.clear();
+        app.run(Cmd::Top);
+        settle(&mut app, &mut term);
+
+        app.run(Cmd::Filter);
+        type_text(&mut app, "am");
+        term.draw(|f| ui::draw(f, &mut app, Depth::True)).unwrap();
+        put("filter prompt with ghost", &term);
+        press(&mut app, KeyCode::Tab);
+        type_text(&mut app, " > 100 AND (region = 'EU'");
+        term.draw(|f| ui::draw(f, &mut app, Depth::True)).unwrap();
+        put("filter prompt with an error", &term);
+        press(&mut app, KeyCode::Esc);
+
+        app.run(Cmd::Sql);
+        term.draw(|f| ui::draw(f, &mut app, Depth::True)).unwrap();
+        put("sql prompt, as it opens", &term);
+        app.input.clear();
+        type_text(&mut app, "SELECT region, count(*) AS n, avg(amount_paid) FROM src GROUP BY 1 ORDER BY 2 DESC");
+        term.draw(|f| ui::draw(f, &mut app, Depth::True)).unwrap();
+        put("sql prompt, typed", &term);
+        press(&mut app, KeyCode::Enter);
+        settle(&mut app, &mut term);
+        put("grid over a statement", &term);
+        app.run(Cmd::Sql);
+        app.input.clear();
+        type_text(&mut app, "DELETE FROM src");
+        term.draw(|f| ui::draw(f, &mut app, Depth::True)).unwrap();
+        put("sql prompt, refused statement", &term);
+        press(&mut app, KeyCode::Esc);
+        app.run(Cmd::ResetView);
+        settle(&mut app, &mut term);
+
+        app.run(Cmd::GotoRow);
+        type_text(&mut app, "250");
+        term.draw(|f| ui::draw(f, &mut app, Depth::True)).unwrap();
+        put("row prompt", &term);
+        press(&mut app, KeyCode::Enter);
+        settle(&mut app, &mut term);
+        put("after a jump to row 250", &term);
+        app.run(Cmd::Top);
+
+        app.view.filter = Some("no_such_column > 1".into());
+        app.run_startup_view();
+        settle(&mut app, &mut term);
+        put("error: bad filter from the command line", &term);
+        app.view.filter = None;
+        app.run_startup_view();
+        settle(&mut app, &mut term);
+        app.view.filter = Some("region = 'NOWHERE'".into());
+        app.run_startup_view();
+        settle(&mut app, &mut term);
+        put("empty: filter matches nothing", &term);
+        app.view.filter = None;
+        app.run_startup_view();
+        settle(&mut app, &mut term);
+
+        app.panel = Panel::Stats;
+        term.draw(|f| ui::draw(f, &mut app, Depth::True)).unwrap();
+        put("stats panel, computing", &term);
+        app.run(Cmd::ColRight);
+        app.run(Cmd::ColRight);
+        settle(&mut app, &mut term);
+        put("stats panel, amount_paid", &term);
+        app.run(Cmd::ColRight);
+        app.run(Cmd::ColRight);
+        app.run(Cmd::ColRight);
+        settle(&mut app, &mut term);
+        put("stats panel, region", &term);
+        app.panel = Panel::None;
+        app.run(Cmd::ToggleMeta);
+        term.draw(|f| ui::draw(f, &mut app, Depth::True)).unwrap();
+        put("meta panel, before the answer", &term);
+        settle(&mut app, &mut term);
+        put("meta panel", &term);
+        app.run(Cmd::ToggleStats);
+        settle(&mut app, &mut term);
+        put("both panels", &term);
+        app.panel = Panel::None;
+        app.run(Cmd::Origin);
+        settle(&mut app, &mut term);
+
+        app.run(Cmd::ColRight);
+        app.run(Cmd::InspectCell);
+        settle(&mut app, &mut term);
+        put("cell inspector", &term);
+        app.mode = Mode::Normal;
+        for _ in 0..5 {
+            app.run(Cmd::ColRight);
+        }
+        app.run(Cmd::InspectCell);
+        settle(&mut app, &mut term);
+        put("cell inspector, long text", &term);
+        app.mode = Mode::Normal;
+        app.run(Cmd::Origin);
+
+        app.run(Cmd::Record);
+        term.draw(|f| ui::draw(f, &mut app, Depth::True)).unwrap();
+        put("record view, reading", &term);
+        settle(&mut app, &mut term);
+        put("record view", &term);
+        press_char(&mut app, '/');
+        type_text(&mut app, "am");
+        term.draw(|f| ui::draw(f, &mut app, Depth::True)).unwrap();
+        put("record view, find box", &term);
+        press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Esc);
+
+        app.run(Cmd::FilterBuild);
+        settle(&mut app, &mut term);
+        put("filter builder, column step", &term);
+        type_text(&mut app, "reg");
+        term.draw(|f| ui::draw(f, &mut app, Depth::True)).unwrap();
+        put("filter builder, column step filtered", &term);
+        press(&mut app, KeyCode::Enter);
+        term.draw(|f| ui::draw(f, &mut app, Depth::True)).unwrap();
+        put("filter builder, operator step (text column)", &term);
+        press(&mut app, KeyCode::Enter);
+        type_text(&mut app, "EU");
+        term.draw(|f| ui::draw(f, &mut app, Depth::True)).unwrap();
+        put("filter builder, value step", &term);
+        press(&mut app, KeyCode::Enter);
+        term.draw(|f| ui::draw(f, &mut app, Depth::True)).unwrap();
+        put("filter builder, list with one condition", &term);
+        press_char(&mut app, 'a');
+        app.input.clear();
+        type_text(&mut app, "amount");
+        press(&mut app, KeyCode::Enter);
+        term.draw(|f| ui::draw(f, &mut app, Depth::True)).unwrap();
+        put("filter builder, operator step (number column)", &term);
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Enter);
+        type_text(&mut app, "100");
+        press(&mut app, KeyCode::Enter);
+        press_char(&mut app, 'r');
+        type_text(&mut app, "ordered_at > '2024-01-10'");
+        term.draw(|f| ui::draw(f, &mut app, Depth::True)).unwrap();
+        put("filter builder, raw SQL step", &term);
+        press(&mut app, KeyCode::Enter);
+        term.draw(|f| ui::draw(f, &mut app, Depth::True)).unwrap();
+        put("filter builder, list with three conditions", &term);
+        press(&mut app, KeyCode::Enter);
+        settle(&mut app, &mut term);
+        put("grid after the builder applied", &term);
+        app.run(Cmd::FilterBuild);
+        term.draw(|f| ui::draw(f, &mut app, Depth::True)).unwrap();
+        put("filter builder, reopened on the list", &term);
+        press(&mut app, KeyCode::Esc);
+        app.run(Cmd::FilterClear);
+        settle(&mut app, &mut term);
+
+        app.run(Cmd::Help);
+        settle(&mut app, &mut term);
+        put("help, top", &term);
+        app.help_scroll = 30;
+        term.draw(|f| ui::draw(f, &mut app, Depth::True)).unwrap();
+        put("help, scrolled 30", &term);
+        app.help_scroll = u16::MAX;
+        term.draw(|f| ui::draw(f, &mut app, Depth::True)).unwrap();
+        put("help, end", &term);
+        app.mode = Mode::Normal;
+
+        app.run(Cmd::Palette);
+        term.draw(|f| ui::draw(f, &mut app, Depth::True)).unwrap();
+        put("palette, empty", &term);
+        type_text(&mut app, "fil");
+        term.draw(|f| ui::draw(f, &mut app, Depth::True)).unwrap();
+        put("palette, query fil", &term);
+        app.input.clear();
+        type_text(&mut app, "zzzz");
+        term.draw(|f| ui::draw(f, &mut app, Depth::True)).unwrap();
+        put("palette, no match", &term);
+        app.mode = Mode::Normal;
+
+        app.run(Cmd::ThemePicker);
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Down);
+        term.draw(|f| ui::draw(f, &mut app, Depth::True)).unwrap();
+        put("theme picker", &term);
+        press(&mut app, KeyCode::Esc);
+
+        app.run(Cmd::Settings);
+        settle(&mut app, &mut term);
+        put("settings", &term);
+        press(&mut app, KeyCode::Enter);
+        app.input.clear();
+        type_text(&mut app, "dra");
+        term.draw(|f| ui::draw(f, &mut app, Depth::True)).unwrap();
+        put("settings, editing the theme", &term);
+        press(&mut app, KeyCode::Esc);
+        press_char(&mut app, 'j');
+        press(&mut app, KeyCode::Enter);
+        type_text(&mut app, "lots");
+        press(&mut app, KeyCode::Enter);
+        term.draw(|f| ui::draw(f, &mut app, Depth::True)).unwrap();
+        put("settings, bad value", &term);
+        press(&mut app, KeyCode::Esc);
+
+        if let Some(i) = app.themes.iter().position(|t| t.name == "peruse-light") {
+            app.theme = app.themes[i].clone();
+            app.mode = Mode::Normal;
+            settle(&mut app, &mut term);
+            put("grid, peruse-light", &term);
+        }
+        drop(app);
+
+        let (worker, opened) = Worker::spawn(nested.to_str().unwrap(), OpenOptions::default()).unwrap();
+        let mut app = App::new(worker, opened, peruse_core::theme::builtin("peruse-dark").unwrap(), false);
+        app.config_path = nested.parent().map(|d| d.join("config.toml"));
+        settle(&mut app, &mut term);
+        put("grid, nested JSON", &term);
+        app.run(Cmd::Record);
+        settle(&mut app, &mut term);
+        press_char(&mut app, 'j');
+        press_char(&mut app, 'j');
+        press_char(&mut app, 'l');
+        settle(&mut app, &mut term);
+        put("record view, nested JSON, actor open", &term);
+        press_char(&mut app, 'a');
+        settle(&mut app, &mut term);
+        put("record view, nested JSON, all open", &term);
+        app.mode = Mode::Normal;
+        app.run(Cmd::ToggleMeta);
+        app.run(Cmd::ColRight);
+        app.run(Cmd::ColRight);
+        settle(&mut app, &mut term);
+        put("meta panel, nested JSON, cursor on actor", &term);
+        drop(app);
+
+        let (worker, opened) = Worker::spawn(empty.to_str().unwrap(), OpenOptions::default()).unwrap();
+        let mut app = App::new(worker, opened, peruse_core::theme::builtin("peruse-dark").unwrap(), false);
+        app.config_path = empty.parent().map(|d| d.join("config.toml"));
+        settle(&mut app, &mut term);
+        put("grid, file with no rows", &term);
+        app.run(Cmd::Record);
+        settle(&mut app, &mut term);
+        put("record on a file with no rows", &term);
+        app.mode = Mode::Normal;
+        app.run(Cmd::ToggleStats);
+        settle(&mut app, &mut term);
+        put("stats on a file with no rows", &term);
+        drop(app);
+
+        std::fs::write(dir.join(format!("screens-{w}x{h}.txt")), out).unwrap();
+    }
+}
+

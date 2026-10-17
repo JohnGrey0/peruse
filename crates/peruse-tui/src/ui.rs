@@ -405,6 +405,13 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App, p: &Paint) -> Option<Positi
             }
         }
 
+        // A mark at the left edge says that the line goes on there. It covers
+        // the first character on the screen, and never the cursor: a line
+        // that scrolls has the cursor at its right end.
+        if skip > 0 && cursor_x > vx {
+            buf.set_stringn(vx, area.y, "…", 1, p.on(t.dim, t.bg));
+        }
+
         // The name of a column that the user did not type yet, in a dim
         // color, after the cursor. The key Tab and the key -> take it.
         if let Some(rest) = app.ghost()
@@ -545,10 +552,15 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App, p: &Paint) {
     // loss of the note costs the user the reason for a slow jump.
     let note = (!app.seekable && !app.indexing && app.mode == Mode::Normal)
         .then(|| {
-            format!(
-                "{}: press I to index for instant jumps",
-                app.source.format.to_string().to_uppercase()
-            )
+            let fmt = app.source.format.to_string().to_uppercase();
+            // The long form costs the hints for the filter, the undo and the
+            // record on a terminal of 80 columns. A narrow terminal therefore
+            // gets the short form, and the key is still in it.
+            if area.width >= 120 {
+                format!("{fmt}: press I to index for instant jumps")
+            } else {
+                format!("{fmt}: press I to index")
+            }
         })
         .filter(|n| text::width(n) + 12 < area.width as usize);
     let hint_budget = area.right() as usize
