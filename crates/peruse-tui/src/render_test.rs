@@ -3030,3 +3030,51 @@ fn an_escape_sequence_in_the_data_never_reaches_the_terminal() {
     settle(&mut app, &mut term);
     assert_eq!(control_cell(&term), None, "error\n{}", screen(&term));
 }
+
+#[test]
+fn a_very_small_terminal_never_stops_the_program() {
+    // A user can make the window as small as the system allows, and a tmux
+    // pane can be one row high. Each part of the screen must then draw what
+    // fits, and never index outside the frame.
+    let p = write_sample("tiny", SAMPLE, "csv");
+    let (mut app, mut term) = open(&p);
+    app.config.band = Some("detailed".into());
+    settle(&mut app, &mut term);
+
+    use ratatui::crossterm::event::KeyCode;
+    let sizes = [(0, 0), (1, 1), (2, 1), (1, 3), (3, 2), (8, 3), (12, 4), (20, 2), (30, 6), (200, 3)];
+    let draw_all = |app: &mut App, name: &str| {
+        for (w, h) in sizes {
+            let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                t.draw(|f| ui::draw(f, app, Depth::True)).unwrap();
+                t.draw(|f| ui::draw(f, app, Depth::Indexed256)).unwrap();
+            }));
+            assert!(r.is_ok(), "{name} at {w}x{h} stopped the program");
+        }
+    };
+    draw_all(&mut app, "grid");
+    for (name, cmd) in [
+        ("metadata", Cmd::ToggleMeta),
+        ("statistics", Cmd::ToggleStats),
+        ("help", Cmd::Help),
+        ("palette", Cmd::Palette),
+        ("cell", Cmd::InspectCell),
+        ("record", Cmd::Record),
+        ("settings", Cmd::Settings),
+        ("builder", Cmd::FilterBuild),
+        ("themes", Cmd::ThemePicker),
+        ("filter", Cmd::Filter),
+    ] {
+        app.run(cmd);
+        settle(&mut app, &mut term);
+        draw_all(&mut app, name);
+        press(&mut app, KeyCode::Esc);
+        settle(&mut app, &mut term);
+    }
+    // The panels stay on; draw both together.
+    app.run(Cmd::ToggleMeta);
+    app.run(Cmd::ToggleStats);
+    settle(&mut app, &mut term);
+    draw_all(&mut app, "both panels");
+}
