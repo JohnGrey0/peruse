@@ -279,11 +279,14 @@ fn main() -> Result<()> {
     if !peruse_core::source::looks_like_glob(&file)
         && let Ok(full) = std::fs::canonicalize(&file)
     {
-        config.remember_file(&peruse_core::source::tidy_path(&full));
+        let full = peruse_core::source::tidy_path(&full);
+        config.remember_file(&full);
         if let Some(p) = Config::path() {
             // A list that Peruse cannot write is not a reason to stop. The
-            // user came here to look at a file.
-            let _ = config.save_to(&p);
+            // user came here to look at a file. A settings file with a fault
+            // already gives its message, and the function does not replace
+            // that file with the built-in settings.
+            let _ = Config::remember_file_at(&p, &full);
         }
     }
 
