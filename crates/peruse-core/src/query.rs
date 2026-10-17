@@ -588,6 +588,7 @@ impl View {
         let any: Vec<String> = schema
             .columns
             .iter()
+            .filter(|c| text_can_hold(c, needle))
             .map(|c| {
                 let id = quote_ident(&c.name);
                 match c.kind {
@@ -612,6 +613,40 @@ impl View {
             self.select("*"),
             any.join(" OR ")
         )
+    }
+}
+
+/// Gives `false` when the text of no value of `column` can hold `needle`.
+///
+/// The search compares the needle with the text that DuckDB writes for each
+/// value. The text of a number, of a truth value and of a date or a time uses
+/// few characters, so a search for a name or a word can skip such a column.
+/// The cast of each value to text is the cost of a search, and on a file of
+/// 1000 columns a search for a word that the file does not hold cost 1.7 s.
+///
+/// Only a character of ASCII in the needle can cause a skip. DuckDB and Rust
+/// put such a character in lower case in the same way, and the text of these
+/// values holds ASCII only. Each set of characters below holds the characters
+/// that DuckDB writes, and some letters more as a margin.
+pub(crate) fn text_can_hold(column: &Column, needle: &str) -> bool {
+    let only = |chars: &str| {
+        needle
+            .chars()
+            .all(|c| !c.is_ascii() || chars.contains(c.to_ascii_lowercase()))
+    };
+    match column.kind {
+        // For example `-12.5`, `1e+20`, `inf` and `nan`.
+        CellKind::Number => only("0123456789+-.aefinty"),
+        CellKind::Bool => {
+            let n = needle.to_ascii_lowercase();
+            "true".contains(&n) || "false".contains(&n)
+        }
+        // For example `2024-01-01 12:00:00.5+00`, `0044-03-15 (BC)` and
+        // `infinity`. The text of an interval holds words, such as `days`.
+        CellKind::Temporal if !column.sql_type.trim().to_ascii_uppercase().starts_with("INTERVAL") => {
+            only("0123456789 ()+-.:abcdfinty")
+        }
+        _ => true,
     }
 }
 
@@ -656,6 +691,79 @@ mod tests {
                 Column::new("name", "VARCHAR", true),
                 Column::new("payload", "BLOB", true),
             ],
+        }
+    }
+
+    #[test]
+    fn a_search_for_a_word_skips_the_columns_whose_text_cannot_hold_it() {
+        let s = Schema {
+            columns: vec![
+                Column::new("id", "BIGINT", true),
+                Column::new("name", "VARCHAR", true),
+                Column::new("flag", "BOOLEAN", true),
+                Column::new("at", "TIMESTAMP", true),
+                Column::new("span", "INTERVAL", true),
+            ],
+        };
+        let searched = |needle: &str| -> Vec<&str> {
+            let sql = View::default().search_sql(&s, needle, 0, 100, 10);
+            ["id", "name", "flag", "at", "span"]
+                .into_iter()
+                .filter(|c| sql.contains(&format!("\"{c}\"")))
+                .collect()
+        };
+        assert_eq!(searched("Carol"), ["name", "span"]);
+        assert_eq!(searched("12"), ["id", "name", "at", "span"]);
+        assert_eq!(searched("TRU"), ["name", "flag", "span"]);
+        assert_eq!(searched("inf"), ["id", "name", "at", "span"]);
+        assert_eq!(searched("(bc)"), ["name", "at", "span"]);
+        // A character that is not ASCII does not cause a skip.
+        assert_eq!(searched("\u{212a}"), ["id", "name", "at", "span"]);
+        assert_eq!(searched(""), ["id", "name", "flag", "at", "span"]);
+    }
+
+    #[test]
+    fn the_text_of_each_value_that_a_search_can_skip_uses_the_known_characters() {
+        // A search skips a column when the needle holds a character that the
+        // text of no value of the column holds. Each character of the text of
+        // these values must therefore keep the column in the search. A change
+        // in a later version of DuckDB shows here.
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        let values = [
+            ("DOUBLE", "1.5e308, -2.2e-308, 'nan', 'inf', '-inf', -0.0, 5e-324, 0.1, 1e20, 1e-7"),
+            ("FLOAT", "3.4e38, 'nan', '-inf', 1e-40, -1.25"),
+            ("HUGEINT", "-170141183460469231731687303715884105727, 170141183460469231731687303715884105727"),
+            ("UHUGEINT", "340282366920938463463374607431768211455"),
+            ("DECIMAL(38,2)", "-12345678901234567.89, 0.01"),
+            ("DECIMAL(4,0)", "-1, 9999"),
+            ("TINYINT", "-128, 127"),
+            ("UBIGINT", "18446744073709551615"),
+            ("BOOLEAN", "true, false"),
+            ("DATE", "'infinity', '-infinity', '0044-03-15 (BC)', '294247-01-10', '2024-02-29'"),
+            ("TIMESTAMP", "'infinity', '-infinity', '2024-01-01 12:34:56.789012', '0044-03-15 (BC) 10:00:00'"),
+            ("TIMESTAMP_NS", "'2024-01-01 12:34:56.123456789'"),
+            ("TIMESTAMP_MS", "'2024-01-01 12:34:56.1'"),
+            ("TIMESTAMP_S", "'2024-01-01 12:34:56'"),
+            ("TIMESTAMPTZ", "'2024-01-01 12:34:56+05:30', 'infinity', '-infinity'"),
+            ("TIME", "'12:34:56.123456', '24:00:00'"),
+            ("TIMETZ", "'12:34:56+05:30', '01:02:03-05:45'"),
+        ];
+        for (ty, list) in values {
+            let column = Column::new("v", ty, true);
+            let sql = format!(
+                "SELECT DISTINCT unnest(string_split(lower(CAST(v AS VARCHAR)), '')) \
+                 FROM (SELECT unnest([{list}]::{ty}[]) AS v)"
+            );
+            let mut stmt = conn.prepare(&sql).unwrap();
+            let chars: Vec<String> = stmt
+                .query_map([], |r| r.get::<_, String>(0))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect();
+            assert!(!chars.is_empty(), "{ty}");
+            for c in chars {
+                assert!(text_can_hold(&column, &c), "{ty} writes {c:?}");
+            }
         }
     }
 
@@ -952,7 +1060,7 @@ mod tests {
 
     #[test]
     fn search_does_not_cast_text_or_probe_blobs() {
-        let sql = View::default().search_sql(&schema(), "x", 0, 100, 10);
+        let sql = View::default().search_sql(&schema(), "1", 0, 100, 10);
         assert!(sql.contains("contains(lower(\"name\")"), "VARCHAR should not be cast: {sql}");
         assert!(
             sql.contains("contains(lower(CAST(\"id\" AS VARCHAR))"),

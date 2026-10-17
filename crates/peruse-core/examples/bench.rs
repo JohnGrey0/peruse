@@ -146,6 +146,11 @@ fn main() -> Result<()> {
     time("search all columns", || {
         engine.search(&view, &schema, "carol", 0, 250_000, 100)
     })?;
+    // A search for a word that the file does not hold reads each row of its
+    // part of the view.
+    time("search, no match", || {
+        engine.search(&view, &schema, "quokka", 0, 250_000, 100)
+    })?;
     time("file metadata", || engine.file_meta())?;
 
     // The band measures the columns that fit the screen: about twenty.
