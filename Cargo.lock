@@ -1543,6 +1543,7 @@ dependencies = [
  "anyhow",
  "crossbeam-channel",
  "duckdb",
+ "libc",
  "serde",
  "sysinfo",
  "toml",
