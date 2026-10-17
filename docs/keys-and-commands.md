@@ -155,6 +155,18 @@ character that the terminal can print holds its own shift state: the character
 the capital letter, and some terminals do not. Peruse must accept the two
 forms.
 
+The function also removes two other modifier states that the user did not
+choose:
+
+- The key `AltGr` of a European keyboard gives characters such as `#`, `@`
+  and `[`. Windows reports that key as `Ctrl` and `Alt` together, so a French
+  keyboard sends `#` as `Ctrl-Alt-#`. A character with both modifier keys is
+  therefore the character alone. The editor of the prompt uses the same rule,
+  in `input::is_altgr`: without it, the prompt refuses each of those
+  characters, and a Polish user cannot type `ł`.
+- The terminal library sends `Shift-Tab` as the key `BackTab` with the shift
+  key, on each system. The name of the key holds the shift state already.
+
 A modifier key of a key that is not a character stays. The pair `Ctrl-F` is
 therefore different from the key `f`, and `Ctrl-Home` is different from `Home`.
 

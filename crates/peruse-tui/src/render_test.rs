@@ -2975,3 +2975,18 @@ fn the_mouse_does_not_stop_the_program_on_a_small_terminal() {
         }
     }
 }
+
+// ------------------------------------------------ the state of the grid
+
+#[test]
+fn shift_tab_moves_the_cursor_to_the_previous_column() {
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    let p = write_sample("shift-tab", SAMPLE, "csv");
+    let (mut app, mut term) = open(&p);
+    settle(&mut app, &mut term);
+    app.run(Cmd::ColRight);
+    app.run(Cmd::ColRight);
+    // The terminal library sends this form of Shift-Tab on each system.
+    app.on_key(&KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
+    assert_eq!(app.cursor_col, 1, "Shift-Tab did not move to the left");
+}

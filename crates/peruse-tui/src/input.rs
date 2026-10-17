@@ -20,6 +20,20 @@ pub fn plain(key: &KeyEvent) -> bool {
         .intersects(KeyModifiers::CONTROL.union(KeyModifiers::ALT))
 }
 
+/// Gives `true` when a character key comes from the key `AltGr`.
+///
+/// A European keyboard gives many characters with `AltGr`: `@`, `[`, `{`, `|`
+/// and `\` on a German keyboard, `#` on a French keyboard, and letters such
+/// as `ą` and `ł` on a Polish keyboard. Windows reports that key as Ctrl and
+/// Alt together. Such a key is a character to type, and not a chord: without
+/// this test, the prompt would refuse each of those characters.
+pub fn is_altgr(key: &KeyEvent) -> bool {
+    matches!(key.code, KeyCode::Char(_))
+        && key
+            .modifiers
+            .contains(KeyModifiers::CONTROL.union(KeyModifiers::ALT))
+}
+
 /// What the editor did with a key.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Action {
@@ -241,8 +255,10 @@ impl LineInput {
 
     /// Applies one key to the line and gives the result.
     pub fn handle(&mut self, key: &KeyEvent) -> Action {
-        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        // A character from AltGr is a character to type. Refer to `is_altgr`.
+        let altgr = is_altgr(key);
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL) && !altgr;
+        let alt = key.modifiers.contains(KeyModifiers::ALT) && !altgr;
         match key.code {
             KeyCode::Enter => Action::Submit,
             KeyCode::Esc => Action::Cancel,
@@ -366,6 +382,25 @@ mod tests {
             i.handle(&key(KeyCode::Char(c)));
         }
         i
+    }
+
+    #[test]
+    fn a_character_from_the_altgr_key_goes_into_the_line() {
+        // Windows reports AltGr as Ctrl and Alt together. A German keyboard
+        // gives `@`, `[` and `|` with it, and a Polish keyboard gives `ł`.
+        let altgr = KeyModifiers::CONTROL | KeyModifiers::ALT;
+        let mut i = typed("a ");
+        for c in ['|', '|', '[', '@', 'ł', '€'] {
+            assert_eq!(
+                i.handle(&KeyEvent::new(KeyCode::Char(c), altgr)),
+                Action::Changed,
+                "{c}"
+            );
+        }
+        assert_eq!(i.text(), "a ||[@ł€");
+        // Ctrl alone and Alt alone still give the keys of the editor.
+        i.handle(&ctrl('w'));
+        assert_eq!(i.text(), "a ");
     }
 
     #[test]
