@@ -3220,3 +3220,19 @@ fn the_prompt_scrolls_so_that_the_cursor_and_the_text_before_it_stay_on_the_scre
     assert!(row.contains("SELECT * FROM src"), "the start is not on the screen: {row:?}");
 }
 
+#[test]
+fn the_statistics_panel_shows_a_line_end_inside_a_value_as_a_mark() {
+    // The smallest value of a column of text can hold a line end. The panel
+    // wrote it as it was, the terminal library dropped it, and the two lines
+    // then read as one text.
+    let p = write_sample("stats-ctrl", "a,b\n1,\"x\ny\"\n2,zzz\n", "csv");
+    let (mut app, mut term) = open(&p);
+    settle(&mut app, &mut term);
+    app.run(Cmd::ColRight);
+    app.run(Cmd::ToggleStats);
+    settle(&mut app, &mut term);
+    let s = screen(&term);
+    assert!(s.contains("min"), "no smallest value\n{s}");
+    assert!(s.contains("x␊y"), "the panel lost the mark\n{s}");
+}
+
