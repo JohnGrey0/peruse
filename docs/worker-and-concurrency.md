@@ -40,6 +40,7 @@ stop again.
 | `Configure` | 8 | Change the settings that DuckDB accepts while it runs | `Configured` |
 | `Band` | 9 | Measure each column that the detail band draws | `Band` |
 | `Shutdown` | 10 | Stop the thread | None |
+| `Row` | 11 | Read one row with the columns that the grid does not hide, for the clipboard | `Row` |
 
 The worker also sends `Busy(true)` before a group of requests and `Busy(false)`
 after it, and `Error` when one request fails.

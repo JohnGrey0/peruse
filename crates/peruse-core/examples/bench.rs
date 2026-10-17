@@ -57,6 +57,13 @@ fn main() -> Result<()> {
 
     time("first screen (50 rows)", || engine.page(&view, &schema, 50, 0))?;
     time("first window (550 rows)", || engine.page(&view, &schema, WINDOW, 0))?;
+    // A page of a wide file holds the columns near the screen only. Refer to
+    // `WIDE_COLUMNS` in the user interface.
+    if schema.len() > 64 {
+        time("first window, 64 columns", || {
+            engine.page_columns(&view, &schema, Some((0, 64)), WINDOW, 0)
+        })?;
+    }
     let total = time("count(*)", || engine.count(&view))?;
     println!("{:<34} {}", "rows", peruse_core::source::human_count(total));
 

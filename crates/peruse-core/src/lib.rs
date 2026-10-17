@@ -11,7 +11,7 @@
 //!
 //! let (worker, opened) = Worker::spawn("trips.parquet", OpenOptions::default())?;
 //! println!("{} columns", opened.schema.len());
-//! worker.send(Request::SetView { epoch: 1, view: View::default(), limit: 50 });
+//! worker.send(Request::SetView { epoch: 1, view: View::default(), limit: 50, cols: None });
 //! # Ok::<(), anyhow::Error>(())
 //! ```
 

@@ -34,6 +34,10 @@ pub enum Request {
         epoch: u64,
         view: View,
         limit: u32,
+        /// The columns of the first page, as positions in the schema from the
+        /// first one up to, and not including, the second one. `None` reads
+        /// each column. Refer to [`Engine::page_columns`].
+        cols: Option<(usize, usize)>,
     },
     /// Read one page of rows.
     Page {
@@ -42,6 +46,18 @@ pub enum Request {
         schema: Schema,
         offset: u64,
         limit: u32,
+        /// The columns of the page, in the same form as in `SetView`.
+        cols: Option<(usize, usize)>,
+    },
+    /// Read one row with the columns of `schema`, for the clipboard.
+    ///
+    /// A page of a wide file holds the columns near the screen only, and the
+    /// key that copies a row copies each column that the grid does not hide.
+    Row {
+        epoch: u64,
+        view: View,
+        schema: Schema,
+        row: u64,
     },
     /// Calculate the statistics of one column.
     Stats {
@@ -122,6 +138,7 @@ impl Request {
             | Request::Stats { epoch, .. }
             | Request::Band { epoch, .. }
             | Request::Cell { epoch, .. }
+            | Request::Row { epoch, .. }
             | Request::RowJson { epoch, .. }
             | Request::Configure { epoch, .. }
             | Request::Search { epoch, .. }
@@ -146,6 +163,7 @@ impl Request {
             Request::Configure { .. } => 8,
             Request::Band { .. } => 9,
             Request::Shutdown => 10,
+            Request::Row { .. } => 11,
         }
     }
 }
@@ -166,6 +184,8 @@ pub enum Response {
     Band { epoch: u64, briefs: Vec<ColumnBrief> },
     /// The complete value of one cell.
     Cell { epoch: u64, row: u64, column: String, value: Option<String> },
+    /// One row with the columns of the request `Row`, as text.
+    Row { epoch: u64, row: u64, cells: Vec<Option<String>> },
     /// One complete row as JSON.
     RowJson { epoch: u64, row: u64, json: Option<String> },
     /// The values that DuckDB uses after a change to its settings.
@@ -364,7 +384,7 @@ fn handle(engine: &mut Engine, req: Request, tx: &Sender<Response>) -> Result<()
     match req {
         Request::Shutdown => Err(()),
 
-        Request::SetView { epoch, view, limit } => {
+        Request::SetView { epoch, view, limit, cols } => {
             // The guard runs two times. The user interface checks the text
             // while the user types it. This check makes sure that no view
             // reaches the engine without a check, whatever the caller does.
@@ -388,7 +408,7 @@ fn handle(engine: &mut Engine, req: Request, tx: &Sender<Response>) -> Result<()
             };
             tx.send(Response::Schema { epoch, schema: schema.clone() }).map_err(|_| ())?;
 
-            match engine.page(&view, &schema, limit, 0) {
+            match engine.page_columns(&view, &schema, cols, limit, 0) {
                 Ok(page) => tx.send(Response::Page { epoch, page }).map_err(|_| ())?,
                 Err(e) => return fail(tx, epoch, "rows", e),
             }
@@ -401,12 +421,20 @@ fn handle(engine: &mut Engine, req: Request, tx: &Sender<Response>) -> Result<()
             Ok(())
         }
 
-        Request::Page { epoch, view, schema, offset, limit } => {
-            match engine.page(&view, &schema, limit, offset) {
+        Request::Page { epoch, view, schema, offset, limit, cols } => {
+            match engine.page_columns(&view, &schema, cols, limit, offset) {
                 Ok(page) => tx.send(Response::Page { epoch, page }).map_err(|_| ()),
                 Err(e) => fail(tx, epoch, "rows", e),
             }
         }
+
+        Request::Row { epoch, view, schema, row } => match engine.page(&view, &schema, 1, row) {
+            Ok(page) => {
+                let cells = (0..page.ncols).map(|c| page.cell(0, c).map(str::to_string)).collect();
+                tx.send(Response::Row { epoch, row, cells }).map_err(|_| ())
+            }
+            Err(e) => fail(tx, epoch, "row", e),
+        },
 
         Request::Stats { epoch, view, column, top_k } => {
             match engine.column_stats(&view, &column, top_k) {
@@ -485,6 +513,7 @@ mod tests {
             schema: Schema::default(),
             offset,
             limit: 50,
+            cols: None,
         }
     }
 
@@ -501,6 +530,7 @@ mod tests {
                 epoch: 2,
                 view: View::default(),
                 limit: 50,
+                cols: None,
             },
         ]);
         assert!(
@@ -619,6 +649,7 @@ mod tests {
                 ..View::default()
             },
             limit: 50,
+            cols: None,
         });
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);

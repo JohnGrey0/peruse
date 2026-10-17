@@ -2975,3 +2975,66 @@ fn the_mouse_does_not_stop_the_program_on_a_small_terminal() {
         }
     }
 }
+
+/// Writes a CSV file with `cols` columns and `rows` rows. Each value names its
+/// row and its column, such as `r3c150`.
+fn wide_csv(cols: usize, rows: usize) -> String {
+    let mut body: Vec<String> = vec![(0..cols).map(|c| format!("c{c}")).collect::<Vec<_>>().join(",")];
+    for r in 0..rows {
+        body.push((0..cols).map(|c| format!("r{r}c{c}")).collect::<Vec<_>>().join(","));
+    }
+    body.join("\n") + "\n"
+}
+
+#[test]
+fn a_page_of_a_wide_file_holds_the_columns_near_the_screen() {
+    let p = write_sample("wide-window", &wide_csv(200, 40), "csv");
+    let (mut app, mut term) = open(&p);
+    settle(&mut app, &mut term);
+    assert!(screen(&term).contains("r0c0"), "{}", screen(&term));
+    assert!(
+        app.page.ncols < 200,
+        "a page of a wide file read each of its {} columns",
+        app.page.ncols
+    );
+
+    // A move to the far side asks for the columns there, and the grid then
+    // draws their values and not a row of points.
+    for _ in 0..199 {
+        app.run(Cmd::ColRight);
+    }
+    settle(&mut app, &mut term);
+    let s = screen(&term);
+    assert_eq!(app.cursor_col, 199);
+    assert!(s.contains("r0c199"), "the last column has no values\n{s}");
+    assert!(s.contains("r0c190"), "a column beside the cursor has no values\n{s}");
+    assert!(app.page.holds_col(199) && !app.page.holds_col(0));
+
+    // The width of a column comes from its values when a page first holds
+    // it. The values of the last column are six characters wide, and each
+    // name keeps its room after it.
+    assert_eq!(app.widths[199], 9, "the last column got no fitted width");
+}
+
+#[test]
+fn a_row_of_a_wide_file_copies_each_column_that_the_grid_shows() {
+    let p = write_sample("wide-copy", &wide_csv(200, 40), "csv");
+    let (mut app, mut term) = open(&p);
+    settle(&mut app, &mut term);
+    app.run(Cmd::CopyRow);
+    settle(&mut app, &mut term);
+    // The page holds some of the columns only, so the engine reads the row.
+    // The clipboard text holds each of the 200 columns.
+    let want: usize = (0..200).map(|c| format!("r0c{c}").len()).sum::<usize>() + 199;
+    let status = app.status.as_ref().map(|s| s.text.clone()).unwrap_or_default();
+    assert_eq!(status, format!("copied row ({want} chars)"));
+}
+
+#[test]
+fn a_page_of_a_narrow_file_holds_each_column() {
+    let p = write_sample("narrow-window", &wide_csv(64, 10), "csv");
+    let (mut app, mut term) = open(&p);
+    settle(&mut app, &mut term);
+    assert_eq!(app.page.ncols, 64);
+    assert_eq!(app.page.first_col, 0);
+}

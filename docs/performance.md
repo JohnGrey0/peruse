@@ -54,6 +54,16 @@ grid shows the new rows with no wait.
 The grid draws one character for each screen position. The cost of one frame
 follows the number of cells on the screen, and not the size of the file.
 
+A wide file follows the same rule for its columns. Each column of a statement
+costs time in DuckDB whatever the number of rows is, so a page of a file with
+more than 64 columns holds the columns near the screen only: the columns that
+the grid draws, and 32 columns at each side of them. On a Parquet file of 1000
+columns, one window of 550 rows of every column cost 392 ms, and the same window
+of 64 columns costs 41 ms. On a CSV file of 1000 columns the two cost 251 ms and
+60 ms. A move to the side past those columns asks for a new page, and each
+column gets its width when a page first holds it. The key that copies a row
+asks the engine for the complete row, because the page does not hold it.
+
 The detail band under the column names follows the same rule. One request
 covers each column that the grid draws, and the width of the terminal bounds
 that number. See [Decision 7](#decision-7-the-detail-band-reads-the-footer-first).

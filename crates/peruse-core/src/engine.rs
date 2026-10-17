@@ -818,6 +818,48 @@ impl Engine {
         Ok(RowPage::new(offset, ncols, cells))
     }
 
+    /// Reads one page of rows, with the columns `cols` of the schema only.
+    ///
+    /// `cols` is a range of positions in the schema, from `cols.0` up to, and
+    /// not including, `cols.1`. The value `None` reads every column, in the
+    /// same way as [`Engine::page`]. The page then knows the position of its
+    /// first column. Refer to [`RowPage::first_col`].
+    ///
+    /// A wide file needs this. Each column of a statement costs time in
+    /// DuckDB whatever the number of rows is: on a Parquet file of 1000
+    /// columns, one page of 50 rows of each column cost 330 ms, and the same
+    /// page of 20 columns cost 20 ms. The grid shows some tens of columns.
+    ///
+    /// The range always holds one column at the minimum. A page of no columns
+    /// would hold no rows, and the grid would read that as the end of the view.
+    pub fn page_columns(
+        &self,
+        view: &View,
+        schema: &Schema,
+        cols: Option<(usize, usize)>,
+        limit: u32,
+        offset: u64,
+    ) -> Result<RowPage> {
+        let n = schema.len();
+        let Some((lo, hi)) = cols else {
+            return self.page(view, schema, limit, offset);
+        };
+        if n == 0 {
+            return self.page(view, schema, limit, offset);
+        }
+        let lo = lo.min(n - 1);
+        let hi = hi.min(n).max(lo + 1);
+        if lo == 0 && hi == n {
+            return self.page(view, schema, limit, offset);
+        }
+        let part = Schema {
+            columns: schema.columns[lo..hi].to_vec(),
+        };
+        let mut page = self.page(view, &part, limit, offset)?;
+        page.first_col = lo;
+        Ok(page)
+    }
+
     /// Counts the rows in the view.
     pub fn count(&self, view: &View) -> Result<u64> {
         // DuckDB reads count(*) of a Parquet file directly from the footer. A

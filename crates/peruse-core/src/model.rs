@@ -275,10 +275,19 @@ impl Schema {
 /// The page holds each cell in one flat list. The grid reads the cells in the
 /// order of the rows, and one list needs one allocation. A list of lists needs
 /// one allocation for each row.
+///
+/// A page can hold a part of the columns only: the columns from `first_col`,
+/// `ncols` of them. A file of 1000 columns shows some tens of them on the
+/// screen, and a page of every column costs 15 times as much as a page of the
+/// columns near the screen. Refer to [`crate::Engine::page_columns`]. A column
+/// outside that part is not NULL. It is not in the page, and
+/// [`RowPage::holds_col`] tells the two apart.
 #[derive(Clone, Debug, Default)]
 pub struct RowPage {
     /// The offset of the first row of the page, in the view.
     pub offset: u64,
+    /// The position in the schema of the first column of the page.
+    pub first_col: usize,
     /// The number of columns.
     pub ncols: usize,
     /// The number of rows in the page.
@@ -292,21 +301,31 @@ impl RowPage {
         let nrows = cells.len().checked_div(ncols).unwrap_or(0);
         RowPage {
             offset,
+            first_col: 0,
             ncols,
             nrows,
             cells,
         }
     }
 
-    /// Gives the value of one cell of the page.
+    /// Gives `true` when the page holds the column at the position `col` of the
+    /// schema.
+    pub fn holds_col(&self, col: usize) -> bool {
+        col >= self.first_col && col - self.first_col < self.ncols
+    }
+
+    /// Gives the value of one cell of the page. `col` is the position of the
+    /// column in the schema.
     ///
     /// `None` is the SQL value NULL. The user interface gives NULL a different
-    /// color from an empty text, because the two are not the same.
+    /// color from an empty text, because the two are not the same. A cell
+    /// outside the page also gives `None`, so a caller that can meet such a
+    /// cell asks [`RowPage::holds_col`] first.
     pub fn cell(&self, row: usize, col: usize) -> Option<&str> {
-        if row >= self.nrows || col >= self.ncols {
+        if row >= self.nrows || !self.holds_col(col) {
             return None;
         }
-        self.cells[row * self.ncols + col].as_deref()
+        self.cells[row * self.ncols + col - self.first_col].as_deref()
     }
 
     /// Gives `true` when the text in the page is at the limit. The true value
@@ -477,6 +496,19 @@ mod tests {
         assert_eq!(page.abs_row(1), 101);
         assert!(page.contains(101));
         assert!(!page.contains(102));
+    }
+
+    #[test]
+    fn a_page_of_some_columns_reads_each_cell_by_its_position_in_the_schema() {
+        let mut page = RowPage::new(0, 2, vec![Some("c".into()), None, Some("e".into()), Some("f".into())]);
+        page.first_col = 2;
+        assert!(!page.holds_col(1));
+        assert!(page.holds_col(2) && page.holds_col(3));
+        assert!(!page.holds_col(4));
+        assert_eq!(page.cell(0, 2), Some("c"));
+        assert_eq!(page.cell(0, 3), None, "SQL NULL");
+        assert_eq!(page.cell(1, 3), Some("f"));
+        assert_eq!(page.cell(0, 0), None, "a column in front of the page");
     }
 
     #[test]

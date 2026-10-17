@@ -95,6 +95,26 @@ pub fn layout(app: &mut App, area: Rect) -> Layout {
         app.left_col += 1;
     }
 
+    // Move the first column back to the left while each column from there to
+    // the last one fits. The screen then has no empty room at the right side
+    // when it shows the last column. A column of a wide file gets its width
+    // when a page first holds it, so the widths can become smaller after the
+    // loop above moved the first column.
+    let width_of = |ci: usize| app.widths[ci].min(avail.saturating_sub(1).max(1));
+    let mut rest: u32 = vis
+        .iter()
+        .skip(app.left_col)
+        .map(|&ci| u32::from(width_of(ci)) + u32::from(GAP))
+        .sum();
+    while app.left_col > 0 {
+        let more = rest + u32::from(width_of(vis[app.left_col - 1])) + u32::from(GAP);
+        if more - u32::from(GAP) > u32::from(avail) {
+            break;
+        }
+        rest = more;
+        app.left_col -= 1;
+    }
+
     let mut drawn = Vec::new();
     let mut x = gutter;
     for &ci in vis.iter().skip(app.left_col) {
@@ -241,10 +261,11 @@ pub fn draw(buf: &mut Buffer, area: Rect, app: &mut App, p: &Paint) {
                 t.bg
             };
 
-            if !in_page {
+            if !in_page || !app.page.holds_col(ci) {
                 // The row is not in the current page. A row of points
                 // keeps the grid steady. Without it, the grid becomes
-                // empty and full again during a fast scroll.
+                // empty and full again during a fast scroll. A page of a
+                // wide file can also lack a column after a move to the side.
                 let dots = waiting(w as usize);
                 buf.set_stringn(area.x + x, y, &dots, w as usize, p.on(t.dim, bg));
                 continue;

@@ -34,6 +34,26 @@ use crate::tree::{Family, Line, Tree};
 /// and after the last row. A usual scroll therefore does not wait for the
 /// engine.
 const PREFETCH: u64 = 250;
+
+/// One page request: the offset, the limit and the columns. Refer to
+/// [`App::column_window`] for the columns.
+type PageAsk = (u64, u32, Option<(usize, usize)>);
+
+/// The largest number of columns that a page reads in full.
+///
+/// A page of a file with more columns holds the columns near the screen only.
+/// Each column of a statement costs time in DuckDB whatever the number of rows
+/// is: on a Parquet file of 1000 columns, one page of every column cost 330 ms,
+/// and the same page of 20 columns cost 20 ms. A file with this number of
+/// columns or fewer reads each column, so a move to the side never waits.
+const WIDE_COLUMNS: usize = 64;
+
+/// The number of columns that a page of a wide file reads at each side of the
+/// columns on the screen.
+///
+/// A usual move to the side therefore needs no request, in the same way as
+/// [`PREFETCH`] does for the rows.
+const COLUMN_PREFETCH: usize = 32;
 /// The number of rows that the worker examines in the first search request.
 ///
 /// The number is small, so a match near the cursor comes back immediately,
@@ -811,8 +831,9 @@ pub struct App {
     /// A page with fewer rows than this number is the last page. Peruse can
     /// therefore tell the end of the data from a page that is still to come.
     page_limit: u32,
-    /// The offset and the limit of the page request that has no answer yet.
-    requested: Option<(u64, u32)>,
+    /// The offset, the limit and the columns of the page request that has no
+    /// answer yet.
+    requested: Option<PageAsk>,
     /// The number of rows in the view.
     pub total: RowCount,
 
@@ -839,8 +860,12 @@ pub struct App {
     pub widths: Vec<u16>,
     /// `true` for each column that the grid does not draw.
     pub hidden: Vec<bool>,
-    /// `true` after Peruse fits the widths to the values on the screen.
-    widths_fitted: bool,
+    /// `true` for each column whose width Peruse fitted to the values, or that
+    /// the user made wider or narrower.
+    ///
+    /// A page of a wide file holds some of the columns only, so each column
+    /// gets its width when a page first holds it. Refer to [`WIDE_COLUMNS`].
+    fitted: Vec<bool>,
 
     /// The theme that Peruse paints with.
     pub theme: Theme,
@@ -1058,7 +1083,7 @@ impl App {
 
             widths: vec![12; ncols],
             hidden: vec![false; ncols],
-            widths_fitted: false,
+            fitted: vec![false; ncols],
 
             theme,
             themes,
@@ -1230,12 +1255,43 @@ impl App {
             epoch: self.epoch,
             view: self.view.clone(),
             limit,
+            cols: self.column_window(),
         });
     }
 
     /// Applies a view that the command line gives, after the start.
     pub fn run_startup_view(&mut self) {
         self.reload(true);
+    }
+
+    /// Gives the columns that a page request reads, as positions in the schema
+    /// from the first one up to, and not including, the second one.
+    ///
+    /// The value is `None` for a file of [`WIDE_COLUMNS`] columns or fewer:
+    /// the page then reads each column. A wider file reads the columns that the
+    /// last frame drew and the column of the cursor, and [`COLUMN_PREFETCH`]
+    /// columns at each side of them.
+    fn column_window(&self) -> Option<(usize, usize)> {
+        let n = self.schema.len();
+        if n <= WIDE_COLUMNS {
+            return None;
+        }
+        let drawn = self.hit.cols.iter().map(|(ci, _, _)| *ci);
+        let lo = drawn.clone().min().unwrap_or(self.cursor_col).min(self.cursor_col);
+        let hi = drawn.max().unwrap_or(self.cursor_col).max(self.cursor_col);
+        // The window holds WIDE_COLUMNS columns at the minimum. Before the first
+        // frame no column is on the screen yet, and a narrow terminal shows
+        // fewer columns than a wide one.
+        let lo = lo.saturating_sub(COLUMN_PREFETCH);
+        let hi = (hi + 1 + COLUMN_PREFETCH).max(lo + WIDE_COLUMNS).min(n);
+        Some((lo, hi))
+    }
+
+    /// Gives `true` when the page holds each column that the grid draws and
+    /// the column of the cursor.
+    fn page_holds_columns(&self) -> bool {
+        self.page.holds_col(self.cursor_col)
+            && self.hit.cols.iter().all(|(ci, _, _)| self.page.holds_col(*ci))
     }
 
     /// Gives the number of rows to ask for in one page request.
@@ -1260,17 +1316,20 @@ impl App {
         let covered = self.page.ncols > 0
             && self.top_row >= self.page.offset
             && (self.top_row + visible <= self.page.offset + self.page.nrows as u64
-                || self.page_is_last());
-        if covered || self.requested == Some((start, limit)) {
+                || self.page_is_last())
+            && self.page_holds_columns();
+        let cols = self.column_window();
+        if covered || self.requested == Some((start, limit, cols)) {
             return;
         }
-        self.requested = Some((start, limit));
+        self.requested = Some((start, limit, cols));
         self.worker.send(Request::Page {
             epoch: self.epoch,
             view: self.view.clone(),
             schema: self.schema.clone(),
             offset: start,
             limit,
+            cols,
         });
     }
 
@@ -1540,8 +1599,21 @@ impl App {
     /// The width covers the name of the column, the type character, and the
     /// widest value in the page. Refer to [`fitted_width`] for the room after
     /// the name and for the limit.
+    ///
+    /// A column that the page does not hold keeps its width, and it gets a new
+    /// width when a page holds it. Refer to [`App::fit_new_columns`].
     pub fn fit_widths(&mut self) {
+        self.fitted.iter_mut().for_each(|f| *f = false);
+        self.fit_new_columns();
+    }
+
+    /// Fits the width of each column that the page holds and that has no
+    /// fitted width yet.
+    fn fit_new_columns(&mut self) {
         for (i, col) in self.schema.columns.iter().enumerate() {
+            if self.fitted[i] || !self.page.holds_col(i) {
+                continue;
+            }
             let name = crate::text::width(&col.name);
             // Start at zero. The floor of the name belongs to `fitted_width`, and
             // a second floor here would only hide which rule set the width.
@@ -1556,8 +1628,8 @@ impl App {
                 }
             }
             self.widths[i] = fitted_width(name, w);
+            self.fitted[i] = true;
         }
-        self.widths_fitted = true;
     }
 
     // -------------------------------------------------------------- responses
@@ -1609,6 +1681,7 @@ impl App {
             | Response::Band { epoch, .. }
             | Response::Cell { epoch, .. }
             | Response::RowJson { epoch, .. }
+            | Response::Row { epoch, .. }
             | Response::Configured { epoch, .. }
             | Response::Search { epoch, .. }
             | Response::Meta { epoch, .. }
@@ -1635,17 +1708,18 @@ impl App {
                 if changed {
                     self.widths = vec![12; self.schema.len()];
                     self.hidden = vec![false; self.schema.len()];
-                    self.widths_fitted = false;
+                    self.fitted = vec![false; self.schema.len()];
                     self.cursor_col = 0;
                     self.left_col = 0;
                 }
             }
             Response::Page { page, .. } => {
-                self.page_limit = self.requested.map(|(_, l)| l).unwrap_or(page.nrows as u32);
+                self.page_limit = self.requested.map(|(_, l, _)| l).unwrap_or(page.nrows as u32);
                 self.page = page;
                 self.requested = None;
-                if !self.widths_fitted && self.page.nrows > 0 {
-                    self.fit_widths();
+                // A page with no rows says nothing about the widths.
+                if self.page.nrows > 0 {
+                    self.fit_new_columns();
                 }
                 // The number of rows can become known here. A cursor after
                 // the last row must then move back to the last row.
@@ -1692,6 +1766,12 @@ impl App {
                 }
                 let n = self.record_lines().len();
                 self.record_sel = self.record_sel.min(n.saturating_sub(1));
+            }
+            Response::Row { cells, .. } => {
+                // A missing value copies as the word NULL, as in the code that
+                // copies a row from the page.
+                let line: Vec<&str> = cells.iter().map(|c| c.as_deref().unwrap_or("NULL")).collect();
+                self.copy(&line.join("\t"), "row");
             }
             Response::Cell { value, .. } => {
                 self.cell_value = Some(value.unwrap_or_else(|| "NULL".into()));
@@ -2845,6 +2925,11 @@ impl App {
     /// Gives the text in the cell under the cursor, from the current page.
     fn current_cell_text(&self) -> Option<String> {
         let r = self.cursor_row.checked_sub(self.page.offset)? as usize;
+        // A page of a wide file can lack the column, and a missing cell is not
+        // a NULL.
+        if r >= self.page.nrows || !self.page.holds_col(self.cursor_col) {
+            return None;
+        }
         Some(self.page.cell(r, self.cursor_col).unwrap_or("NULL").to_string())
     }
 
@@ -4004,6 +4089,12 @@ impl App {
             self.error("no row here yet");
             return;
         };
+        // A page of a wide file can lack the column while the next page is on
+        // its way. A missing cell is not a NULL, so the filter must wait.
+        if !self.page.holds_col(self.cursor_col) {
+            self.error("no cell here yet");
+            return;
+        }
         // The grid shows the size of a BLOB value, and not its bytes. A
         // filter on that text would find no row.
         if col.kind == peruse_core::CellKind::Binary {
@@ -4245,11 +4336,14 @@ impl App {
             Cmd::Widen => {
                 if let Some(w) = self.widths.get_mut(self.cursor_col) {
                     *w = (*w + 4).min(MAX_COL_WIDTH * 4);
+                    // A page that arrives later must not fit this width again.
+                    self.fitted[self.cursor_col] = true;
                 }
             }
             Cmd::Narrow => {
                 if let Some(w) = self.widths.get_mut(self.cursor_col) {
                     *w = w.saturating_sub(4).max(MIN_COL_WIDTH);
+                    self.fitted[self.cursor_col] = true;
                 }
             }
             Cmd::FitWidths => {
@@ -4296,8 +4390,24 @@ impl App {
                 // empty text. Peruse shows the two as different values
                 // everywhere else, and the clipboard must not lose that
                 // difference.
-                let line: Vec<String> = self
-                    .visible_columns()
+                let vis = self.visible_columns();
+                if !vis.iter().all(|c| self.page.holds_col(*c)) {
+                    // A page of a wide file holds the columns near the screen
+                    // only. The engine reads the row with each column that the
+                    // grid does not hide, and the answer goes to the clipboard.
+                    let schema = Schema {
+                        columns: vis.iter().map(|c| self.schema.columns[*c].clone()).collect(),
+                    };
+                    self.worker.send(Request::Row {
+                        epoch: self.epoch,
+                        view: self.view.clone(),
+                        schema,
+                        row: self.cursor_row,
+                    });
+                    self.info("copying the row…");
+                    return;
+                }
+                let line: Vec<String> = vis
                     .iter()
                     .map(|c| self.page.cell(r, *c).unwrap_or("NULL").to_string())
                     .collect();
