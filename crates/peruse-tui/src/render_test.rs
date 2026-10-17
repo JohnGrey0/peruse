@@ -2975,3 +2975,58 @@ fn the_mouse_does_not_stop_the_program_on_a_small_terminal() {
         }
     }
 }
+
+/// Gives the first cell of the screen that holds a control character.
+///
+/// The backend writes the symbol of each cell to the terminal as it is. A
+/// cell that holds an escape character would therefore send a sequence that
+/// the terminal obeys.
+fn control_cell(term: &Terminal<TestBackend>) -> Option<(u16, u16, String)> {
+    let buf = term.backend().buffer();
+    let a = buf.area;
+    for y in a.top()..a.bottom() {
+        for x in a.left()..a.right() {
+            let s = buf[(x, y)].symbol();
+            if s.chars().any(char::is_control) {
+                return Some((x, y, s.to_string()));
+            }
+        }
+    }
+    None
+}
+
+#[test]
+fn an_escape_sequence_in_the_data_never_reaches_the_terminal() {
+    // A file can hold an escape character in a name, in a value and in a
+    // nested value. Each part of the screen that shows the data must draw it
+    // as a visible character, and an error message that quotes the data too.
+    let body = r#"[{"k\u001b[31m": "v\u001b]0;PWNED\u0007", "n": {"x\u001b[2J": "\u009b31m"}}]"#;
+    let p = write_sample("escape", body, "json");
+    let (mut app, mut term) = open(&p);
+    settle(&mut app, &mut term);
+    assert!(screen(&term).contains("PWNED"), "the value is not on the screen\n{}", screen(&term));
+    assert_eq!(control_cell(&term), None, "grid");
+
+    use ratatui::crossterm::event::KeyCode;
+    for (name, cmd) in [
+        ("metadata", Cmd::ToggleMeta),
+        ("statistics", Cmd::ToggleStats),
+        ("cell", Cmd::InspectCell),
+        ("record", Cmd::Record),
+        ("help", Cmd::Help),
+    ] {
+        app.run(cmd);
+        settle(&mut app, &mut term);
+        assert_eq!(control_cell(&term), None, "{name}\n{}", screen(&term));
+        press(&mut app, KeyCode::Esc);
+        settle(&mut app, &mut term);
+    }
+
+    // DuckDB names the column that it cannot find, and the status line shows
+    // that message.
+    app.run(Cmd::ColRight);
+    app.set_raw_filter("\"q\u{1b}[2J\" = 1");
+    app.run_startup_view();
+    settle(&mut app, &mut term);
+    assert_eq!(control_cell(&term), None, "error\n{}", screen(&term));
+}
