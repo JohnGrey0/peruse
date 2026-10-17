@@ -143,6 +143,16 @@ A set whose files differ keeps the call with `auto_detect` and `union_by_name`,
 because one column list cannot serve files with different columns. A set of
 JSON files also keeps that call.
 
+A set of 100 Parquet files or more gets a plain `read_parquet` call with no
+`union_by_name`, when each file holds the same columns in the same order with
+the same types. With `union_by_name`, DuckDB reads the footer of each file again
+for every statement. The open operation compares the schema of each file one
+time, with one call of `parquet_schema`. Over 500 small Parquet files, each
+statement then costs about 12 ms less: a window of 550 rows fell from 66 ms to
+54 ms, and the open operation from 100 ms to 86 ms. A smaller set keeps
+`union_by_name`, because there the comparison costs more at the open operation
+than it saves.
+
 ## Decision 5: keep the user interface thread free
 
 The engine runs on its own thread. The user interface thread sends a request
