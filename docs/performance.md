@@ -206,6 +206,14 @@ window over the full table would number each row before the database could
 report the first match. On ten million rows, the user would wait some seconds
 and see nothing.
 
+The search reads only the columns whose text can hold the needle. The text of
+a number, of a truth value and of a date or a time uses few characters, such as
+`-12.5`, `1e+20`, `inf`, `true` and `0044-03-15 (BC)`. A needle with an ASCII
+character that such text never holds, as in a search for a name, skips those
+columns. On a Parquet file of 1000 columns, a search that finds nothing fell
+from 1398 ms to 125 ms. Over 250,000 rows of `sample.parquet` it fell from 51
+ms to 7 ms. The function `text_can_hold` in `query.rs` holds the rule.
+
 ## Decision 7: the detail band reads the footer first
 
 The key `d` puts a band of facts under the column names. The compact band shows
