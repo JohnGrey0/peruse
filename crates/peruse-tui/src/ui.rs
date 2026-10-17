@@ -31,6 +31,17 @@ pub fn draw(f: &mut Frame, app: &mut App, depth: Depth) {
     let area = f.area();
     let t = app.theme.clone();
 
+    // A terminal with no row or no column has no cell for a character, and a
+    // write outside the buffer stops the program. The rows along the bottom
+    // edge of an overlay wrote to the row 0 of a terminal with no row at all.
+    // No click can land on anything either, so the positions of an older
+    // frame must go.
+    if area.width == 0 || area.height == 0 {
+        app.hit = crate::app::Hit::default();
+        app.overlay = None;
+        return;
+    }
+
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([

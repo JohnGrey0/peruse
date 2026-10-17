@@ -2975,3 +2975,190 @@ fn the_mouse_does_not_stop_the_program_on_a_small_terminal() {
         }
     }
 }
+
+// ------------------------------------------------ the sizes of the terminal
+
+/// A file whose text is awkward for a screen: characters of two screen
+/// columns, characters of no width, characters that join, control characters,
+/// an escape sequence and a line end inside a value, and a long value.
+fn awkward_sample() -> String {
+    let long = "x".repeat(500);
+    let mut s = String::new();
+    s.push_str("id,日本語の列,emoji🎉,\"tab\tname\",ctrl,long\n");
+    s.push_str(&format!(
+        "1,こんにちは世界,👨‍👩‍👧 family,\"a\tb\",\"esc\x1b[31mred\",{long}\n"
+    ));
+    s.push_str(
+        "2,e\u{301}\u{301}\u{301},🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉,\"line1\nline2\",\
+         \u{202E}reversed,\u{200B}\u{200B}zero\n",
+    );
+    s.push_str("3,,,,,\n");
+    s.push_str("4,مرحبا بالعالم,🇯🇵🇫🇷,\"\r\n\",\x07bell,a\n");
+    s
+}
+
+/// The sizes of the terminal that the sweep draws at: no cell at all, one
+/// cell, one row, a few rows, the usual sizes, and a very wide one.
+const SIZES: &[(u16, u16)] = &[
+    (0, 0),
+    (1, 1),
+    (0, 24),
+    (80, 0),
+    (80, 1),
+    (80, 2),
+    (3, 3),
+    (10, 3),
+    (20, 5),
+    (5, 10),
+    (40, 8),
+    (60, 12),
+    (110, 24),
+    (300, 100),
+    (1000, 40),
+    (65535, 3),
+];
+
+/// Tests that no cell of the screen holds a control character.
+///
+/// A control character in a cell goes to the terminal as it is. An escape
+/// sequence inside a value could then change the colors of the terminal, move
+/// its cursor, or write its title.
+fn screen_is_sane(term: &Terminal<TestBackend>, what: &str) {
+    let buf = term.backend().buffer();
+    for (i, cell) in buf.content.iter().enumerate() {
+        let s = cell.symbol();
+        assert!(
+            !s.chars().any(char::is_control),
+            "{what}: the cell {i} holds a control character {s:?}"
+        );
+    }
+}
+
+#[test]
+fn every_mode_draws_at_every_size_over_awkward_text() {
+    use ratatui::crossterm::event::KeyCode;
+    let p = write_sample("sizes", &awkward_sample(), "csv");
+    let (worker, opened) = Worker::spawn(p.to_str().unwrap(), OpenOptions::default()).unwrap();
+    let mut app = App::new(
+        worker,
+        opened,
+        peruse_core::theme::builtin("peruse-dark").unwrap(),
+        false,
+    );
+    app.config_path = p.parent().map(|d| d.join("config.toml"));
+
+    // The usual size first, to prove that the file read as intended. A file
+    // that the sniffer read as one column would make the sweep prove nothing.
+    let mut term = Terminal::new(TestBackend::new(110, 24)).unwrap();
+    settle(&mut app, &mut term);
+    assert_eq!(app.schema.len(), 6, "the file did not read as six columns");
+    assert!(screen(&term).contains("family"), "{}", screen(&term));
+    assert!(screen(&term).contains("4 × 6"), "{}", screen(&term));
+    let long_line = "amount > 100 AND name LIKE '%zebra%' AND ".repeat(4);
+
+    for &(w, h) in SIZES {
+        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+        let at = |what: &str| format!("{w}x{h} {what}");
+        app.needle = "family".into();
+        settle(&mut app, &mut term);
+        screen_is_sane(&term, &at("grid"));
+
+        for band in ["compact", "detailed"] {
+            app.config.band = Some(band.into());
+            settle(&mut app, &mut term);
+            screen_is_sane(&term, &at(band));
+        }
+        app.config.band = None;
+
+        for panel in [Panel::Meta, Panel::Stats, Panel::Both] {
+            app.panel = panel;
+            settle(&mut app, &mut term);
+            screen_is_sane(&term, &at("panel"));
+        }
+        app.panel = Panel::None;
+
+        // The cursor at each end of the grid.
+        for cmd in [Cmd::ColLast, Cmd::Bottom, Cmd::ColRight, Cmd::Origin] {
+            app.run(cmd);
+            frame(&mut app, &mut term);
+            screen_is_sane(&term, &at("move"));
+        }
+
+        // Each prompt, with a line that is longer than the screen.
+        for cmd in [Cmd::Filter, Cmd::Sql, Cmd::Search, Cmd::GotoRow] {
+            app.run(cmd);
+            type_text(&mut app, &long_line);
+            frame(&mut app, &mut term);
+            screen_is_sane(&term, &at("prompt"));
+            press(&mut app, KeyCode::Home);
+            frame(&mut app, &mut term);
+            press(&mut app, KeyCode::Esc);
+        }
+        assert_eq!(app.mode, Mode::Normal);
+
+        app.run(Cmd::Help);
+        app.help_scroll = 5;
+        frame(&mut app, &mut term);
+        screen_is_sane(&term, &at("help"));
+        press(&mut app, KeyCode::Esc);
+
+        app.run(Cmd::Palette);
+        type_text(&mut app, "the");
+        frame(&mut app, &mut term);
+        screen_is_sane(&term, &at("palette"));
+        press(&mut app, KeyCode::Esc);
+
+        app.run(Cmd::ThemePicker);
+        frame(&mut app, &mut term);
+        screen_is_sane(&term, &at("themes"));
+        press(&mut app, KeyCode::Esc);
+
+        // The inspector on the long value, and on the value with the escape
+        // sequence.
+        app.run(Cmd::ColLast);
+        app.run(Cmd::InspectCell);
+        settle(&mut app, &mut term);
+        app.cell_scroll = 3;
+        frame(&mut app, &mut term);
+        screen_is_sane(&term, &at("inspector"));
+        press(&mut app, KeyCode::Esc);
+        app.run(Cmd::ColLeft);
+        app.run(Cmd::InspectCell);
+        settle(&mut app, &mut term);
+        screen_is_sane(&term, &at("inspector of an escape sequence"));
+        press(&mut app, KeyCode::Esc);
+        app.run(Cmd::Origin);
+
+        app.run(Cmd::Record);
+        settle(&mut app, &mut term);
+        screen_is_sane(&term, &at("record"));
+        press_char(&mut app, '/');
+        type_text(&mut app, "本");
+        frame(&mut app, &mut term);
+        screen_is_sane(&term, &at("record find"));
+        press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.mode, Mode::Normal, "{}", at("the record view stayed open"));
+
+        app.run(Cmd::FilterBuild);
+        for step in [Build::List, Build::Column, Build::Op, Build::Value, Build::Value2, Build::Raw] {
+            app.build = step;
+            frame(&mut app, &mut term);
+            screen_is_sane(&term, &at("filter builder"));
+        }
+        app.run(Cmd::Cancel);
+        app.mode = Mode::Normal;
+
+        app.run(Cmd::Settings);
+        frame(&mut app, &mut term);
+        press(&mut app, KeyCode::Enter);
+        type_text(&mut app, "abc");
+        frame(&mut app, &mut term);
+        screen_is_sane(&term, &at("settings"));
+        press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Esc);
+        app.mode = Mode::Normal;
+        app.settings_editing = false;
+    }
+}
+
