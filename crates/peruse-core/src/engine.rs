@@ -3984,5 +3984,64 @@ mod tests {
         assert_eq!(page.cell(0, 0), Some("[1, 2, 3]"));
         assert_eq!(page.cell(0, 1), Some("{'k': v}"));
     }
-}
 
+    // ---------------------------------------------- faults that a review found
+
+    /// Gives the cell `(row, col)` of a page as an owned text.
+    fn text_at(page: &RowPage, row: usize, col: usize) -> Option<String> {
+        page.cell(row, col).map(str::to_string)
+    }
+
+    #[test]
+    fn a_sorted_view_gives_each_row_on_one_page_only() {
+        // The sort of DuckDB is not stable. On a column with repeated values,
+        // each page statement put the rows of one value in its own order, so
+        // a row came on two pages and another row on none. The same page also
+        // changed from one read to the next.
+        let d = tmpdir("sort-ties");
+        let p = d.join("t.parquet");
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(&format!(
+            "COPY (SELECT i AS id, i % 3 AS k FROM range(100000) t(i)) TO '{}' \
+             (FORMAT parquet, ROW_GROUP_SIZE 5000);",
+            db_path(&p)
+        ))
+        .unwrap();
+        let opts = OpenOptions {
+            threads: Some(4),
+            ..Default::default()
+        };
+        let e = Engine::open(p.to_str().unwrap(), &opts).unwrap();
+        let view = View {
+            sort: vec![crate::query::SortKey {
+                column: "k".into(),
+                dir: crate::query::SortDir::Asc,
+            }],
+            ..Default::default()
+        };
+        let schema = e.describe(&view).unwrap();
+        let mut seen = std::collections::HashSet::new();
+        for n in 0..60u64 {
+            let page = e.page(&view, &schema, 50, 20_000 + n * 50).unwrap();
+            assert_eq!(page.nrows, 50);
+            for r in 0..page.nrows {
+                let id = text_at(&page, r, 0).unwrap();
+                assert!(seen.insert(id.clone()), "row {id} came on two pages");
+            }
+        }
+        // The rows of one value come in the order of the other values, which
+        // is the order of the file here.
+        let page = e.page(&view, &schema, 3, 0).unwrap();
+        assert_eq!(text_at(&page, 0, 0).as_deref(), Some("0"));
+        assert_eq!(text_at(&page, 2, 0).as_deref(), Some("6"));
+
+        // The cell inspector, the record view and the search read the same
+        // order.
+        assert_eq!(e.cell(&view, "id", 2).unwrap().as_deref(), Some("6"));
+        let json = e.row_json(&view, &schema, 2).unwrap().unwrap();
+        assert!(json.contains("\"id\":6"), "{json}");
+        let hits = e.search(&view, &schema, "99999", 0, 100_000, 10).unwrap();
+        let page = e.page(&view, &schema, 1, hits[0]).unwrap();
+        assert_eq!(text_at(&page, 0, 0).as_deref(), Some("99999"));
+    }
+}

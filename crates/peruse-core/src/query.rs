@@ -206,6 +206,17 @@ impl View {
 
     /// Gives `ORDER BY ...` with no space in front, or an empty text when the
     /// view has no sort.
+    ///
+    /// The sort of DuckDB is not stable, and it uses each thread. Two rows with
+    /// the same sort value can therefore come in a different order in each
+    /// statement. Each page is one statement, so a sort on a column with
+    /// repeated values showed some rows on two pages and other rows on none,
+    /// and the same page changed when the user scrolled back to it.
+    ///
+    /// The part `COLUMNS(*)` at the end sorts such rows by each of their
+    /// values. Two rows that it cannot put in order hold the same values, so
+    /// the user cannot see which of the two comes first. The cost is about two
+    /// to three times the cost of the sort alone.
     fn order_by(&self) -> String {
         if self.sort.is_empty() {
             return String::new();
@@ -215,7 +226,7 @@ impl View {
             .iter()
             .map(|k| format!("{} {}", quote_ident(&k.column), k.dir.sql()))
             .collect();
-        format!("ORDER BY {}", keys.join(", "))
+        format!("ORDER BY {}, COLUMNS(*)", keys.join(", "))
     }
 
     /// Gives the same text as [`View::order_by`], with a space in front.
@@ -657,7 +668,7 @@ mod tests {
         };
         assert_eq!(
             v.select("*"),
-            "SELECT * FROM src AS q WHERE (amount > 100) ORDER BY \"amount\" DESC, \"id\" ASC"
+            "SELECT * FROM src AS q WHERE (amount > 100) ORDER BY \"amount\" DESC, \"id\" ASC, COLUMNS(*)"
         );
         assert!(!v.is_unfiltered_source());
     }
@@ -900,7 +911,7 @@ mod tests {
         };
         let sql = v.search_sql(&schema(), "x", 0, 100, 10);
         assert!(
-            sql.contains("ORDER BY \"id\" DESC LIMIT 100 OFFSET 0"),
+            sql.contains("ORDER BY \"id\" DESC, COLUMNS(*) LIMIT 100 OFFSET 0"),
             "slice must be taken from the sorted view: {sql}"
         );
     }
