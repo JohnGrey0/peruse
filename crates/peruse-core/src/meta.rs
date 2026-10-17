@@ -98,6 +98,11 @@ pub struct ColumnFooterStats {
     pub compression: String,
     /// The names of the encodings of the column.
     pub encodings: String,
+    /// The number of rows that the footer describes for this column.
+    ///
+    /// The number is smaller than the number of rows of the view when a file of
+    /// a set does not hold the column. Refer to [`crate::engine::footer_briefs`].
+    pub rows: u64,
 }
 
 impl ColumnFooterStats {

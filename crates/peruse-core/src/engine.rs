@@ -226,6 +226,13 @@ pub fn footer_briefs(meta: &FileMeta, columns: &[Column]) -> Option<Vec<ColumnBr
     let mut out = Vec::with_capacity(columns.len());
     for c in columns {
         let f = meta.columns.iter().find(|f| f.name == c.name)?;
+        // A set of files with `union_by_name` can hold a column in one file and
+        // not in another. The rows of the other file are NULL in the view, and
+        // the footer of that file counts none of them. The NULL count of the
+        // footer is then too small, so the footer cannot answer.
+        if f.rows != n_total {
+            return None;
+        }
         let nulls = f.null_count?;
         out.push(ColumnBrief {
             column: c.name.clone(),
@@ -1314,7 +1321,8 @@ impl Engine {
                     coalesce(sum(total_compressed_size), 0)::BIGINT, \
                     coalesce(sum(total_uncompressed_size), 0)::BIGINT, \
                     string_agg(DISTINCT compression, '/'), \
-                    string_agg(DISTINCT encodings, '/') \
+                    string_agg(DISTINCT encodings, '/'), \
+                    coalesce(sum(row_group_num_rows), 0)::BIGINT \
              FROM parquet_metadata({list}) GROUP BY 1"
         ))?;
         let mut rows = stmt.query([])?;
@@ -1329,6 +1337,7 @@ impl Engine {
                 uncompressed: r.get::<_, i64>(3)?.max(0) as u64,
                 compression: r.get::<_, Option<String>>(4)?.unwrap_or_default(),
                 encodings: r.get::<_, Option<String>>(5)?.unwrap_or_default(),
+                rows: r.get::<_, i64>(6)?.max(0) as u64,
             });
         }
         Ok(out)
@@ -3746,6 +3755,49 @@ mod tests {
     /// Gives the cell `(row, col)` of a page as an owned text.
     fn text_at(page: &RowPage, row: usize, col: usize) -> Option<String> {
         page.cell(row, col).map(str::to_string)
+    }
+
+    #[test]
+    fn the_footer_of_a_set_does_not_answer_for_a_column_that_one_file_lacks() {
+        // `union_by_name` fills the rows of a file that has no column `extra`
+        // with NULL. The footer of that file counts none of those NULL values,
+        // so the footer said that the column held no NULL at all.
+        let d = tmpdir("footer-set");
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(&format!(
+            "COPY (SELECT i AS id, 'x' AS extra FROM range(10) t(i)) TO '{}' (FORMAT parquet);\
+             COPY (SELECT i AS id FROM range(10) t(i)) TO '{}' (FORMAT parquet);",
+            db_path(&d.join("a.parquet")),
+            db_path(&d.join("b.parquet"))
+        ))
+        .unwrap();
+        let pattern = format!("{}/*.parquet", db_path(&d));
+        let e = Engine::open(&pattern, &OpenOptions::default()).unwrap();
+        let schema = e.describe(&View::default()).unwrap();
+        let meta = e.file_meta().unwrap();
+        let scanned = e.column_band(&View::default(), &schema.columns, false).unwrap();
+        let extra = scanned.iter().find(|b| b.column == "extra").unwrap();
+        assert_eq!(extra.null_count(), 10, "the scan is the truth");
+        if let Some(footer) = footer_briefs(&meta, &schema.columns) {
+            for (f, s) in footer.iter().zip(&scanned) {
+                assert_eq!(f.n_present, s.n_present, "column {}", f.column);
+            }
+        }
+
+        // A set of files with the same columns still gets its answer from the
+        // footer.
+        std::fs::remove_file(d.join("a.parquet")).unwrap();
+        conn.execute_batch(&format!(
+            "COPY (SELECT i AS id FROM range(5) t(i)) TO '{}' (FORMAT parquet);",
+            db_path(&d.join("a.parquet"))
+        ))
+        .unwrap();
+        let e = Engine::open(&pattern, &OpenOptions::default()).unwrap();
+        let schema = e.describe(&View::default()).unwrap();
+        let meta = e.file_meta().unwrap();
+        let footer = footer_briefs(&meta, &schema.columns).expect("the footer answers");
+        assert_eq!(footer[0].n_total, 15);
+        assert_eq!(footer[0].null_count(), 0);
     }
 
     #[test]
