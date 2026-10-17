@@ -131,10 +131,18 @@ Two rules stop it:
 - The function `source::json_depth_over` counts the levels with a loop and a
   number, so it can never fill the stack itself. It stops at the first level
   above 128, so a file that is made to be deep costs almost nothing to refuse.
-  It reads 8 MB of the file at the most: a file that nests too deep does so at
-  its start, because each level is one character. It examines each file of a
-  glob, because the reader examines a part of each file of a set to find its
-  columns. One deep file of a set stopped the program before this rule.
+  It examines the records that the reader examines to find the columns: the
+  first 20,480, or the number of `--sample-size`, or each record for the value
+  -1. A record after those goes into a column that is known already, and it
+  does not fill the stack. A test of the first 8 MB alone was not sufficient: a
+  file with one record of 1 KB on each line held a deep record at line 9,000,
+  and the reader examined it. The function examines each file of a glob too,
+  because the reader examines a part of each file of a set. One deep file of a
+  set stopped the program before this rule.
+
+  A compressed file (`.json.gz`, `.json.zst`) is still open to this fault. The
+  function reads the bytes of the file, and Peruse holds no code to decompress
+  them.
 - The read call also holds `maximum_depth = 128`. The reader then stops at that
   level and gives the value below it as text. This limit does not protect the
   part of the reader that finds the columns, so the first rule is necessary.

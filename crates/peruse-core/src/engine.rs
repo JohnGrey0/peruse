@@ -513,11 +513,19 @@ impl Engine {
         // Each file of a set needs the test. The reader examines a part of each
         // file of a set to find its columns, and one deep file of a glob
         // stopped the program as surely as one deep file alone.
+        //
+        // The test examines the records that the reader examines: the number
+        // of `--sample-size`, and each record for the value -1.
+        let sample = match opts.sample_size {
+            None => Some(source::JSON_SAMPLE_RECORDS),
+            Some(n) if n < 0 => None,
+            Some(n) => Some(n.max(1) as u64),
+        };
         if src.format == Format::Json
             && let Some(deep) = src
                 .files
                 .iter()
-                .find(|f| source::json_depth_over(f, MAX_JSON_DEPTH as usize))
+                .find(|f| source::json_depth_over(f, MAX_JSON_DEPTH as usize, sample))
         {
             let name = deep
                 .file_name()
