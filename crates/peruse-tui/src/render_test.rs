@@ -2948,35 +2948,6 @@ fn a_click_under_the_last_row_of_the_file_moves_nothing() {
 }
 
 #[test]
-fn the_mouse_does_not_stop_the_program_on_a_small_terminal() {
-    let p = write_sample("mouse-small", SAMPLE, "csv");
-    let (mut app, _) = open(&p);
-    for (w, h) in [(10u16, 4u16), (20, 6), (40, 10)] {
-        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
-        settle(&mut app, &mut term);
-        for cmd in [
-            Cmd::Record,
-            Cmd::Help,
-            Cmd::Palette,
-            Cmd::Settings,
-            Cmd::ThemePicker,
-            Cmd::FilterBuild,
-        ] {
-            app.run(cmd);
-            settle(&mut app, &mut term);
-            for x in [0, w / 2, w - 1] {
-                for y in [0, h / 2, h - 1] {
-                    click(&mut app, x, y);
-                    settle(&mut app, &mut term);
-                }
-            }
-            app.mode = Mode::Normal;
-            app.settings_editing = false;
-        }
-    }
-}
-
-#[test]
 fn a_local_copy_says_so_in_the_title_and_names_the_source_in_the_panel() {
     use peruse_core::cache::{plan, Plan, Policy, Settings};
     let src = write_sample("local-copy", SAMPLE, "csv");
@@ -3080,4 +3051,33 @@ fn the_local_copies_clear_at_the_second_request_only() {
     app.clear_copies_in(&cache);
     assert_eq!(usage(&cache).0, 1, "a late second request asks again");
     let _ = std::fs::remove_dir_all(&cache);
+}
+
+#[test]
+fn the_mouse_does_not_stop_the_program_on_a_small_terminal() {
+    let p = write_sample("mouse-small", SAMPLE, "csv");
+    let (mut app, _) = open(&p);
+    for (w, h) in [(10u16, 4u16), (20, 6), (40, 10)] {
+        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+        settle(&mut app, &mut term);
+        for cmd in [
+            Cmd::Record,
+            Cmd::Help,
+            Cmd::Palette,
+            Cmd::Settings,
+            Cmd::ThemePicker,
+            Cmd::FilterBuild,
+        ] {
+            app.run(cmd);
+            settle(&mut app, &mut term);
+            for x in [0, w / 2, w - 1] {
+                for y in [0, h / 2, h - 1] {
+                    click(&mut app, x, y);
+                    settle(&mut app, &mut term);
+                }
+            }
+            app.mode = Mode::Normal;
+            app.settings_editing = false;
+        }
+    }
 }
