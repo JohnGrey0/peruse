@@ -188,8 +188,30 @@ impl Config {
         if let Some(dir) = p.parent() {
             std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
         }
-        std::fs::write(p, self.to_toml()).map_err(|e| format!("{}: {e}", p.display()))?;
-        Ok(p.to_path_buf())
+        // Write to a temporary file beside the target, and then rename it over
+        // the target. The rename is one step on the file system, so a crash in
+        // the middle of a write cannot leave a half-written settings file: the
+        // old file stays until the new file is whole. The key `d` and the key
+        // `t` write the file often, so a torn write is a real risk without
+        // this step.
+        //
+        // The temporary file holds the number of the process in its name. Two
+        // instances that write at the same time therefore write to two
+        // different temporary files, and neither one reads a file that the
+        // other is still writing. The last rename wins, which is the same
+        // result as two writes in a row.
+        let text = self.to_toml();
+        let tmp = p.with_extension(format!("toml.{}.tmp", std::process::id()));
+        std::fs::write(&tmp, &text).map_err(|e| format!("{}: {e}", tmp.display()))?;
+        match std::fs::rename(&tmp, p) {
+            Ok(()) => Ok(p.to_path_buf()),
+            Err(e) => {
+                // The rename failed, so the old file is still whole. Remove the
+                // temporary file, so it does not stay behind.
+                let _ = std::fs::remove_file(&tmp);
+                Err(format!("{}: {e}", p.display()))
+            }
+        }
     }
 
     /// Writes the settings as the text of the file.
@@ -284,13 +306,18 @@ where
         Raw::Number(n) => n.max(1) as u32,
         Raw::Text(s) => {
             let t = s.trim().to_ascii_uppercase();
-            let (digits, factor) = if let Some(v) = t.strip_suffix("TB") {
+            // The forms `GiB` and `GB` read the same way here: the number is a
+            // count of gibibytes, and Peruse gives DuckDB `GiB`. A user who
+            // copies the value that the settings page shows, such as `8GiB`,
+            // must not get an error. The function reads the two-letter form and
+            // the three-letter form of each size.
+            let (digits, factor) = if let Some(v) = t.strip_suffix("TIB").or(t.strip_suffix("TB")) {
                 (v, 1024.0)
-            } else if let Some(v) = t.strip_suffix("GB") {
+            } else if let Some(v) = t.strip_suffix("GIB").or(t.strip_suffix("GB")) {
                 (v, 1.0)
-            } else if let Some(v) = t.strip_suffix("MB") {
+            } else if let Some(v) = t.strip_suffix("MIB").or(t.strip_suffix("MB")) {
                 (v, 1.0 / 1024.0)
-            } else if let Some(v) = t.strip_suffix("KB") {
+            } else if let Some(v) = t.strip_suffix("KIB").or(t.strip_suffix("KB")) {
                 (v, 1.0 / (1024.0 * 1024.0))
             } else {
                 (t.as_str(), 1.0)
@@ -592,6 +619,36 @@ mod tests {
     }
 
     #[test]
+    fn save_to_writes_whole_and_leaves_no_temporary_file() {
+        // The write goes to a temporary file and then renames it over the
+        // target, so a crash cannot leave a half-written file. After a clean
+        // write, the file reads back as the same settings and no temporary
+        // file stays behind.
+        let dir = std::env::temp_dir().join("peruse-save-atomic");
+        let _ = std::fs::remove_dir_all(&dir);
+        let p = dir.join("config.toml");
+        let c = Config {
+            theme: Some("nord".into()),
+            step: Some(25),
+            recent: vec!["/data/a.parquet".into()],
+            ..Config::default()
+        };
+        c.save_to(&p).expect("the write must succeed");
+        let (back, err) = Config::load_from(&p);
+        assert_eq!(err, None);
+        assert_eq!(back, c);
+        // The temporary file is renamed away, so the directory holds the
+        // settings file and nothing else.
+        let names: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["config.toml"], "a temporary file stayed behind");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn a_size_from_an_older_file_still_reads() {
         // An older version wrote a text such as "32GB". A user must not lose
         // a setting because a later version changed the form of the file.
@@ -601,6 +658,11 @@ mod tests {
             ("memory_limit = \"2TB\"", 2048),
             ("memory_limit = \"512MB\"", 1),
             ("memory_limit = \"16\"", 16),
+            // The IEC forms that the settings page shows read the same way, so
+            // a user who copies `8GiB` back into the file does not get an error.
+            ("memory_limit = \"8GiB\"", 8),
+            ("memory_limit = \"2TiB\"", 2048),
+            ("memory_limit = \"1024MiB\"", 1),
         ] {
             let c: Config = toml::from_str(text).unwrap_or_else(|e| panic!("{text}: {e}"));
             assert_eq!(c.memory_limit_gb, Some(want), "{text}");
