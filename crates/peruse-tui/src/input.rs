@@ -104,6 +104,40 @@ impl LineInput {
         self.cursor >= self.chars.len()
     }
 
+    /// Gives the part of the line that fits in `avail` screen columns, with
+    /// the cursor inside it.
+    ///
+    /// A statement is frequently longer than the prompt. Without this window,
+    /// the prompt cuts the line at the right edge, and the user types into a
+    /// part of the line that is not on the screen.
+    ///
+    /// The result holds the number of characters that the window skips at the
+    /// left, the text of the window, and the column of the cursor inside that
+    /// text. The window skips nothing while the cursor fits, so a short line
+    /// draws as before. A long line moves to the left until the cursor is on
+    /// the last column, and the caller cuts the text at the right edge.
+    pub fn window(&self, avail: usize) -> (usize, String, usize) {
+        if avail == 0 {
+            return (0, String::new(), 0);
+        }
+        if self.cursor_col() < avail {
+            return (0, self.text(), self.cursor_col());
+        }
+        // Walk back from the cursor, and stop before the character that would
+        // push the cursor past the last column.
+        let mut skip = self.cursor;
+        let mut w = 0usize;
+        while skip > 0 {
+            let cw = text::width(&self.chars[skip - 1].to_string());
+            if w + cw > avail - 1 {
+                break;
+            }
+            w += cw;
+            skip -= 1;
+        }
+        (skip, self.chars[skip..].iter().collect(), w)
+    }
+
     /// Gives the name that the user started to type in front of the cursor.
     ///
     /// A name holds letters, numbers and the character `_`. The completion of
@@ -643,6 +677,54 @@ mod tests {
         }
         i.replace_word_before_cursor("region");
         assert_eq!(i.text(), "region = 'EU'");
+    }
+
+    #[test]
+    fn a_short_line_needs_no_window() {
+        let i = typed("amount > 5");
+        assert_eq!(i.window(40), (0, "amount > 5".into(), 10));
+        // A line that fills the prompt exactly still needs no window: the
+        // cursor sits on the last column.
+        let i = typed("abcdefghi");
+        assert_eq!(i.window(10), (0, "abcdefghi".into(), 9));
+        assert_eq!(i.window(0), (0, String::new(), 0));
+    }
+
+    #[test]
+    fn a_long_line_moves_left_until_the_cursor_is_on_the_screen() {
+        // The cursor is at the end of 26 characters, and the prompt holds 10.
+        let i = typed("abcdefghijklmnopqrstuvwxyz");
+        let (skip, shown, col) = i.window(10);
+        assert_eq!(shown, "rstuvwxyz", "the window holds the end of the line");
+        assert_eq!(skip, 17);
+        assert_eq!(col, 9, "the cursor is on the last column");
+
+        // The cursor moves back into the middle, and the window follows it.
+        let mut i = i;
+        for _ in 0..12 {
+            i.handle(&key(KeyCode::Left));
+        }
+        let (skip, shown, col) = i.window(10);
+        assert_eq!(skip, 5, "{shown}");
+        assert!(shown.starts_with("fghijklmn"), "{shown}");
+        assert_eq!(col, 9);
+
+        // At the start of the line the window skips nothing.
+        i.handle(&key(KeyCode::Home));
+        let (skip, _, col) = i.window(10);
+        assert_eq!((skip, col), (0, 0));
+    }
+
+    #[test]
+    fn the_window_counts_the_width_of_wide_characters() {
+        // Each of these characters takes two screen columns.
+        // Seven columns hold three of them, and the cursor sits on the
+        // seventh column, after the third one.
+        let i = typed("日本語日本語");
+        let (skip, shown, col) = i.window(7);
+        assert_eq!(shown, "日本語", "{shown}");
+        assert_eq!(skip, 3);
+        assert_eq!(col, 6, "three characters of two columns in front of the cursor");
     }
 
     #[test]

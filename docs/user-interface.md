@@ -579,6 +579,13 @@ comes after the last character.
 | The SQL prompt (`e`) over a statement | The statement that the grid shows |
 | The search (`/`) | The value that the last search looked for |
 | The row number (`#`) | An empty line |
+| The column name (`c`) | An empty line |
+
+A line that is longer than the prompt moves to the left until the cursor is on
+the screen, and a mark `…` at the left edge says that the line goes on there.
+The function `LineInput::window` gives the part of the line to draw. Without
+it, a statement that is longer than the terminal went past the right edge, and
+the user typed into a part of the line that was not on the screen.
 
 The constant `query::PROMPT_START` holds the text of the SQL prompt. It lives
 beside the other generated SQL, because it holds the name `src` that the engine
@@ -648,6 +655,7 @@ not have to remember the names or press a key to see them.
 |---|---|
 | The filter and the SQL statement | the columns, and the fields inside them |
 | The text step of the filter builder | the same |
+| The column prompt (`c`) | the columns |
 | The find box of the record view | the fields of the row |
 | The find box of the chooser | the names in the list |
 | The value of a setting | the answers that the setting takes |
@@ -701,5 +709,14 @@ so the most important keys come first.
 
 A file of text with no index has a real limit, and the user must know it. The
 note about the key `I` therefore takes its space first, and the key hints fill
-the space that stays. A Parquet file and a table of a database need no index, so
-they never show that note.
+the space that stays. A terminal of fewer than 120 columns gets the short form
+of the note, so the hints for the filter and the undo stay on the screen. A
+Parquet file and a table of a database need no index, so they never show that
+note.
+
+With no prompt and no message, the search reports its match as `match 3/38+`,
+and the cursor moves to the row and to the first column on the screen that
+holds the value. A match in a column outside the screen would otherwise look
+like no match at all. The page holds the row, so the cursor finds the column
+with no second question to the engine; a page that is still on its way answers
+it when it arrives.

@@ -843,6 +843,7 @@ its name, so no command is behind a key that you must know first.
 | `o`, `Ctrl-Home` | back to the start: first row and first column |
 | `O`, `Ctrl-End` | the far corner: last row and last column |
 | `#` | jump to a row number |
+| `c` | jump to a column by name. The prompt completes the name, and a part of the name is enough |
 
 Many laptops have no `Home`, `End`, `PgUp` or `PgDn` key, so every movement
 also has a letter or a chord. `Home` and `End` reach the two ends of the row,
@@ -862,6 +863,7 @@ is 10 rows or columns, and the setting `step` changes it.
 | `!` | remove the rows with the value in this cell |
 | `F` | clear the filter |
 | `e` | edit the SQL behind the grid |
+| `v` | each value of this column, with the number of rows that hold it. The counts follow the filter, and `u` goes back |
 | `u` | undo the last filter, sort or query |
 | `U` | redo what `u` undid |
 | `R` | reset to the whole file |
@@ -902,7 +904,7 @@ is 10 rows or columns, and the setting `step` changes it.
 | `,` | settings, and what this machine gives |
 | `?`, `F1` | the help |
 | `:`, `p` | run a command by name |
-| `Esc` | stop the query that runs now |
+| `Esc` | stop the query that runs now, or close the side panels |
 | `q`, `Ctrl-C` | quit |
 
 `Ctrl-P` is deliberately not the palette: Visual Studio Code takes that chord

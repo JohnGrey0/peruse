@@ -728,9 +728,9 @@ pub fn draw_cell(buf: &mut Buffer, area: Rect, app: &App, p: &Paint) -> OverlayH
     }
 
     let footer = format!(
-        " {} chars · {} lines{} · y copies · Esc closes ",
-        value.chars().count(),
-        lines.len(),
+        " {} · {}{} · y copies · Esc closes ",
+        plural(value.chars().count(), "char"),
+        plural(lines.len(), "line"),
         if max_scroll > 0 { " · j/k scrolls" } else { "" }
     );
     buf.set_stringn(
@@ -743,6 +743,18 @@ pub fn draw_cell(buf: &mut Buffer, area: Rect, app: &App, p: &Paint) -> OverlayH
     // The inspector holds one value and no list. A click inside it therefore
     // selects nothing.
     OverlayHit::new(app.mode, outer)
+}
+
+/// Writes a count with its noun: `1 line`, `2 lines`.
+///
+/// A count of one with the plural form reads as a mistake, and the user sees
+/// this text on each value that fits on one line.
+fn plural(n: usize, noun: &str) -> String {
+    if n == 1 {
+        format!("1 {noun}")
+    } else {
+        format!("{n} {noun}s")
+    }
 }
 
 /// Writes the keys along the bottom edge of an overlay.
@@ -1708,6 +1720,14 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn a_count_of_one_takes_the_singular_form() {
+        assert_eq!(plural(1, "line"), "1 line");
+        assert_eq!(plural(2, "line"), "2 lines");
+        assert_eq!(plural(0, "char"), "0 chars");
+        assert_eq!(plural(600, "char"), "600 chars");
     }
 
     #[test]

@@ -2975,3 +2975,300 @@ fn the_mouse_does_not_stop_the_program_on_a_small_terminal() {
         }
     }
 }
+
+// ------------------------------------------------ the changes of the ux review
+
+#[test]
+fn a_statement_that_changes_the_columns_leaves_no_error_behind() {
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    // The request for a new view answers with the schema and the first page.
+    // The frame after it asked for the page again, with the schema of the old
+    // view, and that request failed on a column that the new view does not
+    // hold. The grid was correct, and the status line said "Binder Error".
+    let p = write_sample("sql-no-stale-error", SAMPLE, "csv");
+    let (mut app, mut term) = open(&p);
+    settle(&mut app, &mut term);
+
+    press_char(&mut app, 'e');
+    app.on_key(&KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+    type_text(&mut app, "SELECT region, count(*) AS n FROM src GROUP BY 1 ORDER BY 1");
+    press(&mut app, KeyCode::Enter);
+    settle(&mut app, &mut term);
+    let s = screen(&term);
+    assert!(s.contains("3 × 2"), "the statement did not run\n{s}");
+    assert!(!s.contains("Binder"), "an error of the old schema stayed\n{s}");
+    assert!(
+        !matches!(app.status, Some(crate::app::Status { kind: crate::app::StatusKind::Error, .. })),
+        "the status line holds an error: {:?}",
+        app.status
+    );
+
+    // The same from the command line: --query runs before the first frame.
+    let p = write_sample("sql-no-stale-error-cli", SAMPLE, "csv");
+    let (mut app, mut term) = open(&p);
+    app.view.base = Base::Sql("SELECT name FROM src".into());
+    app.run_startup_view();
+    settle(&mut app, &mut term);
+    let s = screen(&term);
+    assert!(s.contains("5 × 1"), "{s}");
+    assert!(!s.contains('✕'), "an error of the old schema stayed\n{s}");
+}
+
+#[test]
+fn a_search_moves_the_cursor_to_the_column_that_holds_the_value() {
+    // A match is a row. The column that holds the value can be far outside
+    // the screen, and a match that the user cannot see looks like no match.
+    let p = write_sample("search-column", &wide_sample(), "csv");
+    let (mut app, mut term) = open(&p);
+    settle(&mut app, &mut term);
+    assert_eq!(app.cursor_col, 0);
+
+    type_search(&mut app, &mut term, "v57");
+    assert_eq!(app.cursor_col, 57, "the cursor did not move to the column");
+    let s = screen(&term);
+    assert!(s.contains("col_57"), "the column is not on the screen\n{s}");
+    assert!(s.contains("match 1/"), "{s}");
+
+    // The keys n and N move to the next row and find the column there too.
+    let p = write_sample("search-column-next", SAMPLE, "csv");
+    let (mut app, mut term) = open(&p);
+    settle(&mut app, &mut term);
+    type_search(&mut app, &mut term, "EU");
+    assert_eq!((app.cursor_row, app.cursor_col), (0, 3), "the first match is region on the first row");
+    app.run(Cmd::ColFirst);
+    app.run(Cmd::SearchNext);
+    settle(&mut app, &mut term);
+    assert_eq!((app.cursor_row, app.cursor_col), (2, 3));
+
+    // A value that no cell of the row holds in full leaves the column alone.
+    app.run(Cmd::ColFirst);
+    app.needle = "carol".into();
+    app.hits.clear();
+    app.run(Cmd::SearchNext);
+    settle(&mut app, &mut term);
+    assert_eq!((app.cursor_row, app.cursor_col), (2, 1), "carol is in the column name");
+}
+
+#[test]
+fn a_long_statement_moves_left_so_that_the_cursor_stays_on_the_screen() {
+    use ratatui::crossterm::event::KeyCode;
+    // The prompt is one row. A statement that is longer than the row went
+    // past the right edge, and the user typed into a part of the line that
+    // was not on the screen.
+    let p = write_sample("prompt-scroll", SAMPLE, "csv");
+    let (mut app, mut term) = open(&p);
+    settle(&mut app, &mut term);
+
+    press_char(&mut app, 'e');
+    let tail = "amount > 100 AND region = 'EU' AND ";
+    for _ in 0..6 {
+        type_text(&mut app, tail);
+    }
+    type_text(&mut app, "name = 'zoe'");
+    settle(&mut app, &mut term);
+    let rows = lines(&term);
+    let prompt = &rows[rows.len() - 2];
+    assert!(prompt.starts_with("sql › …"), "no mark for the part at the left: {prompt:?}");
+    assert!(prompt.contains("name = 'zoe'"), "the end of the line is not on the screen: {prompt:?}");
+    assert!(!prompt.contains("SELECT"), "the start of the line is still there: {prompt:?}");
+
+    // The cursor is inside the row, after the last character.
+    let cursor = term.get_cursor_position().unwrap();
+    assert_eq!(cursor.y, (rows.len() - 2) as u16);
+    assert!(cursor.x < 110, "the cursor is outside the screen");
+    // The row holds characters of more than one byte, so count the columns
+    // and not the bytes.
+    let at = prompt.find("name = 'zoe'").unwrap();
+    let col = prompt[..at].chars().count() + "name = 'zoe'".len();
+    assert_eq!(cursor.x as usize, col, "the cursor is not after the last character");
+
+    // Home moves the cursor to the start, and the line follows it back.
+    press(&mut app, KeyCode::Home);
+    settle(&mut app, &mut term);
+    let prompt = lines(&term)[rows.len() - 2].clone();
+    assert!(prompt.starts_with("sql › SELECT"), "{prompt:?}");
+
+    // A short line draws as before, with no mark.
+    app.input.set("SELECT 1");
+    settle(&mut app, &mut term);
+    let prompt = lines(&term)[rows.len() - 2].clone();
+    assert!(prompt.starts_with("sql › SELECT 1"), "{prompt:?}");
+}
+
+#[test]
+fn the_cell_inspector_counts_one_line_in_the_singular() {
+    let p = write_sample("inspector-plural", SAMPLE, "csv");
+    let (mut app, mut term) = open(&p);
+    settle(&mut app, &mut term);
+    app.run(Cmd::ColRight);
+    app.run(Cmd::InspectCell);
+    settle(&mut app, &mut term);
+    let s = screen(&term);
+    assert!(s.contains("5 chars · 1 line ·"), "{s}");
+}
+
+#[test]
+fn a_narrow_terminal_keeps_the_filter_key_in_the_footer() {
+    // The note about the index took the room of four key hints on a terminal
+    // of 80 columns. The short form keeps the key and gives the hints back.
+    let p = write_sample("footer-narrow", SAMPLE, "csv");
+    let (mut app, _) = open(&p);
+    let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    settle(&mut app, &mut term);
+    assert!(!app.seekable);
+    let last = lines(&term).pop().unwrap();
+    assert!(last.contains("press I to index"), "the key I is gone: {last:?}");
+    assert!(last.contains("f filter"), "the filter hint is gone: {last:?}");
+    assert!(last.contains("u undo"), "the undo hint is gone: {last:?}");
+
+    // A wide terminal keeps the long form.
+    let mut term = Terminal::new(TestBackend::new(160, 24)).unwrap();
+    settle(&mut app, &mut term);
+    let last = lines(&term).pop().unwrap();
+    assert!(last.contains("for instant jumps"), "{last:?}");
+}
+
+#[test]
+fn the_settings_page_names_the_true_limits_of_the_index() {
+    // The page said "below 256 MB", and the program indexes below 64 MB.
+    let p = write_sample("settings-index-limit", SAMPLE, "csv");
+    let (mut app, mut term) = open(&p);
+    settle(&mut app, &mut term);
+    app.run(Cmd::Settings);
+    settle(&mut app, &mut term);
+    let s = screen(&term);
+    assert!(s.contains("yes, below 64 MB"), "{s}");
+    assert!(!s.contains("256 MB"), "{s}");
+}
+
+#[test]
+fn a_view_with_no_row_says_so_and_not_yet() {
+    // "no row here yet" sends the user to wait for a row that never comes.
+    let p = write_sample("no-rows-message", "a,b\n", "csv");
+    let (mut app, mut term) = open(&p);
+    settle(&mut app, &mut term);
+    assert!(app.is_empty());
+    for cmd in [Cmd::Record, Cmd::CopyCell, Cmd::CopyRow, Cmd::FilterThisValue, Cmd::InspectCell] {
+        app.run(cmd);
+        assert_eq!(app.mode, Mode::Normal, "{cmd:?} opened a box over no row");
+        assert_eq!(
+            app.status.as_ref().map(|s| s.text.as_str()),
+            Some("the view holds no row"),
+            "{cmd:?}"
+        );
+    }
+    // A row that is still on its way keeps the old message.
+    let p = write_sample("no-rows-message-yet", SAMPLE, "csv");
+    let (mut app, _) = open(&p);
+    app.run(Cmd::Record);
+    assert_eq!(app.status.as_ref().map(|s| s.text.as_str()), Some("no row here yet"));
+}
+
+#[test]
+fn the_key_v_counts_the_rows_of_each_value_of_the_column() {
+    let p = write_sample("value-counts", SAMPLE, "csv");
+    let (mut app, mut term) = open(&p);
+    settle(&mut app, &mut term);
+
+    app.run(Cmd::ColLast); // region
+    app.run(Cmd::ValueCounts);
+    settle(&mut app, &mut term);
+    let s = screen(&term);
+    assert!(s.contains("3 × 2"), "three values, two columns\n{s}");
+    assert!(s.contains("count"), "no count column\n{s}");
+    assert!(s.contains("query"), "the title does not say that a statement runs\n{s}");
+    let eu = lines(&term).into_iter().find(|l| l.contains("EU")).expect("no row for EU");
+    assert!(eu.contains('3'), "EU occurs three times: {eu:?}");
+    assert!(!s.contains('✕'), "an error\n{s}");
+
+    // The key u gives the file back.
+    app.run(Cmd::Undo);
+    settle(&mut app, &mut term);
+    assert!(screen(&term).contains("5 × 4"), "{}", screen(&term));
+
+    // The counts follow the filter of the moment.
+    app.run(Cmd::ColLast);
+    app.run(Cmd::FilterThisValue); // region = EU
+    settle(&mut app, &mut term);
+    app.run(Cmd::ColFirst);
+    app.run(Cmd::ColRight); // name
+    app.run(Cmd::ValueCounts);
+    settle(&mut app, &mut term);
+    let s = screen(&term);
+    assert!(s.contains("3 × 2"), "alice, carol and erin are in the EU\n{s}");
+    assert!(!s.contains("dave"), "a row outside the filter\n{s}");
+}
+
+#[test]
+fn the_key_c_moves_to_a_column_by_its_name() {
+    use ratatui::crossterm::event::KeyCode;
+    let p = write_sample("goto-column", SAMPLE, "csv");
+    let (mut app, mut term) = open(&p);
+    settle(&mut app, &mut term);
+
+    press_char(&mut app, 'c');
+    assert_eq!(app.mode, Mode::Prompt(PromptKind::Column));
+    type_text(&mut app, "reg");
+    settle(&mut app, &mut term);
+    assert!(screen(&term).contains("column › region"), "{}", screen(&term));
+    press(&mut app, KeyCode::Enter);
+    assert_eq!(app.mode, Mode::Normal);
+    assert_eq!(app.cursor_col, 3, "a part of the name finds the column");
+
+    // The ghost completion and the key Tab work as in the other prompts.
+    press_char(&mut app, 'c');
+    type_text(&mut app, "am");
+    assert_eq!(app.ghost().as_deref(), Some("ount"));
+    press(&mut app, KeyCode::Tab);
+    assert_eq!(app.input.text(), "amount");
+    press(&mut app, KeyCode::Enter);
+    assert_eq!(app.cursor_col, 2);
+
+    // A hidden column comes back, because the user asked for it by name.
+    app.run(Cmd::ColFirst);
+    app.run(Cmd::ColRight);
+    app.run(Cmd::HideColumn);
+    assert!(app.hidden[1]);
+    press_char(&mut app, 'c');
+    type_text(&mut app, "NAME");
+    press(&mut app, KeyCode::Enter);
+    assert_eq!(app.cursor_col, 1);
+    assert!(!app.hidden[1], "the column stays hidden");
+
+    // A name that no column holds gives a message and moves nothing.
+    press_char(&mut app, 'c');
+    type_text(&mut app, "zzz");
+    press(&mut app, KeyCode::Enter);
+    assert_eq!(app.cursor_col, 1);
+    assert!(app.status.as_ref().is_some_and(|s| s.text.contains("no column named")));
+}
+
+#[test]
+fn a_count_that_stopped_does_not_say_still_counting_for_ever() {
+    // Esc stops the count of a large file, and the worker answers with an
+    // error for it. The count then stayed "counting", and G said "still
+    // counting" until the user changed the view.
+    let p = write_sample("count-cancelled", &wide_sample(), "csv");
+    let (mut app, mut term) = open(&p);
+    // The first frame goes out before the count arrives.
+    term.draw(|f| ui::draw(f, &mut app, Depth::True)).unwrap();
+    assert!(matches!(app.total, peruse_core::model::RowCount::Counting));
+
+    let changed = app.on_response(peruse_core::Response::Error {
+        epoch: app.epoch(),
+        context: "count".into(),
+        message: "INTERRUPT Error: Interrupted!".into(),
+    });
+    assert!(changed);
+    assert!(matches!(app.total, peruse_core::model::RowCount::Unknown));
+
+    app.run(Cmd::Bottom);
+    let msg = app.status.as_ref().map(|s| s.text.clone()).unwrap_or_default();
+    assert!(msg.contains("did not finish"), "{msg:?}");
+    assert!(!msg.contains("still counting"), "{msg:?}");
+
+    // The view still works, and R counts again.
+    app.run(Cmd::ResetView);
+    settle(&mut app, &mut term);
+    assert!(screen(&term).contains("2 × 60"), "{}", screen(&term));
+}

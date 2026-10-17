@@ -315,9 +315,18 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App, p: &Paint) -> Option<Positi
         let lw = text::width(&label);
         buf.set_stringn(area.x, area.y, &label, lw, p.bold(p.on(t.accent, t.bg)));
 
-        let value = app.input.text();
-        let vx = area.x + lw as u16;
-        let avail = (area.width as usize).saturating_sub(lw);
+        let mut vx = area.x + lw as u16;
+        let mut avail = (area.width as usize).saturating_sub(lw);
+        // A statement is frequently longer than the prompt. The line moves to
+        // the left until the cursor is on the screen, and a mark at the left
+        // edge says that the line goes on there.
+        let (skip, mut value, mut ccol) = app.input.window(avail);
+        if skip > 0 && avail > 1 {
+            buf.set_stringn(vx, area.y, "…", 1, p.on(t.dim, t.bg));
+            vx += 1;
+            avail -= 1;
+            (_, value, ccol) = app.input.window(avail);
+        }
 
         match kind {
             PromptKind::Filter | PromptKind::Sql => {
@@ -347,7 +356,7 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App, p: &Paint) -> Option<Positi
         // The name of a column that the user did not type yet, in a dim
         // color, after the cursor. The key Tab and the key -> take it.
         if let Some(rest) = app.ghost() {
-            let gx = vx + app.input.cursor_col() as u16;
+            let gx = vx + ccol as u16;
             if gx < area.right() {
                 let w = (area.right() - gx) as usize;
                 buf.set_stringn(
@@ -372,7 +381,7 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App, p: &Paint) -> Option<Positi
         }
 
         return Some(Position::new(
-            (vx + app.input.cursor_col() as u16).min(area.right() - 1),
+            (vx + ccol as u16).min(area.right() - 1),
             area.y,
         ));
     }
@@ -492,10 +501,15 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App, p: &Paint) {
     // loss of the note costs the user the reason for a slow jump.
     let note = (!app.seekable && !app.indexing && app.mode == Mode::Normal)
         .then(|| {
-            format!(
-                "{}: press I to index for instant jumps",
-                app.source.format.to_string().to_uppercase()
-            )
+            let fmt = app.source.format.to_string().to_uppercase();
+            // The long form costs the hints for the filter, the undo and the
+            // record on a terminal of 80 columns. A narrow terminal therefore
+            // gets the short form, and the key is still in it.
+            if area.width >= 120 {
+                format!("{fmt}: press I to index for instant jumps")
+            } else {
+                format!("{fmt}: press I to index")
+            }
         })
         .filter(|n| text::width(n) + 12 < area.width as usize);
     let hint_budget = area.right() as usize

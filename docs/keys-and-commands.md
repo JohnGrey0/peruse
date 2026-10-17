@@ -46,6 +46,7 @@ The five groups come in this order: `Move`, `Query`, `Inspect`, `Columns` and
 | `o`, `Ctrl-Home` | `Origin` | back to the start: first row and first column |
 | `O`, `Ctrl-End` | `LastCell` | the far corner: last row and last column |
 | `#` | `GotoRow` | jump to row number |
+| `c` | `GotoColumn` | jump to a column by name |
 
 Many laptop keyboards have no Home key, no End key, no PgUp key and no PgDn
 key. Peruse must stay complete on such a keyboard, so each command that moves
@@ -70,6 +71,11 @@ Four rules give the letters:
   [settings.md](settings.md).
 - **A chord moves by a page.** `Ctrl-F` and `Ctrl-B` move a full page, and
   `Ctrl-D` and `Ctrl-U` move half a page.
+- **A name finds a column.** The key `c` opens a prompt for the name of a
+  column, with the same ghost completion as the filter prompt. The exact name
+  wins, then a name that starts with the text, then a name that holds it. A
+  column that the grid hides comes back, because the user asked for it by
+  name.
 
 ### The group Query
 
@@ -83,6 +89,7 @@ Four rules give the letters:
 | `!` | `FilterExcludeValue` | remove the rows with the value in this cell |
 | `F` | `FilterClear` | clear the filter |
 | `e` | `Sql` | edit the SQL query behind the grid |
+| `v` | `ValueCounts` | count the rows of each value in this column (u goes back) |
 | `u` | `Undo` | undo the last filter, sort or query |
 | `U` | `Redo` | redo the change that u undid |
 | `R` | `ResetView` | reset to the whole file |
@@ -95,6 +102,15 @@ first thing that a new user finds, and it needs no knowledge of SQL. The prompt
 that takes a `WHERE` expression is on the key `E`. The three commands all build
 the same list of conditions. The document [filter.md](filter.md) describes that
 list.
+
+The key `v` runs one statement over the view of the moment: each value of the
+column under the cursor, with the number of rows that hold it, the largest
+count first. The statistics panel shows the eight most frequent values; this
+grid shows each of them, and the user can sort it and search it. The statement
+holds the filter of the moment, so the counts describe the rows that the user
+looks at. The statement replaces the grid in the same way as the key `e`, so
+the title says `query`, the key `e` shows the statement, and the key `u` gives
+the view back.
 
 ### The group Inspect
 
@@ -136,7 +152,7 @@ moves the cursor, and the plain letter changes the band.
 | `,` | `Settings` | settings, and what this machine gives |
 | `?`, `F1` | `Help` | this help |
 | `:`, `p` | `Palette` | run a command by name |
-| `Esc` | `Cancel` | cancel the running query |
+| `Esc` | `Cancel` | cancel the running query, or close the side panels |
 | `q`, `Ctrl-C` | `Quit` | quit |
 
 The palette has no chord. Visual Studio Code takes `Ctrl-P` for its own file
