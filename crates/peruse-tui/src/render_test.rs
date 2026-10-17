@@ -2948,6 +2948,112 @@ fn a_click_under_the_last_row_of_the_file_moves_nothing() {
 }
 
 #[test]
+fn a_local_copy_says_so_in_the_title_and_names_the_source_in_the_panel() {
+    use peruse_core::cache::{plan, Plan, Policy, Settings};
+    let src = write_sample("local-copy", SAMPLE, "csv");
+    let cache = src.parent().unwrap().join("cache");
+    // The policy `always` copies a file from any disk, so the test needs no
+    // network drive.
+    let settings = Settings {
+        policy: Policy::Always,
+        min_bytes: 0,
+        max_bytes: 1 << 30,
+        dir: Some(cache.clone()),
+    };
+    let probe = peruse_core::remote::System;
+    let Plan::Copy(job) = plan(src.to_str().unwrap(), &settings, &probe) else {
+        panic!("the policy always makes a copy");
+    };
+    let cancel = std::sync::atomic::AtomicBool::new(false);
+    let copy = job.run(&mut |_| {}, &cancel, &probe).unwrap();
+    let (worker, opened) = Worker::spawn_local(&copy, OpenOptions::default()).unwrap();
+    let mut app = App::new(
+        worker,
+        opened,
+        peruse_core::theme::builtin("peruse-dark").unwrap(),
+        false,
+    );
+    app.config_path = src.parent().map(|d| d.join("config.toml"));
+    let mut term = Terminal::new(TestBackend::new(200, 40)).unwrap();
+    settle(&mut app, &mut term);
+    let s = screen(&term);
+    assert!(lines(&term)[0].contains("local copy"), "{s}");
+    assert!(s.contains("alice"), "the rows come from the copy\n{s}");
+
+    app.run(Cmd::ToggleMeta);
+    settle(&mut app, &mut term);
+    let s = screen(&term);
+    let src_text = src.to_string_lossy().to_string();
+    let cache_fwd = cache.to_string_lossy().replace('\\', "/");
+    assert!(s.contains("source"), "{s}");
+    assert!(s.contains("local copy"), "{s}");
+    // The panel is narrow, and it cuts a long path at the start, so that the
+    // end still names the file.
+    let row = lines(&term).into_iter().find(|l| l.contains("source ")).unwrap();
+    assert!(row.contains(r"local-copy\data.csv") || row.contains("local-copy/data.csv"), "{row}");
+    // The read expression names the source, and not the copy. The panel
+    // shows the copy on its own row only.
+    assert!(app.read_expr.contains(&src_text.replace('\\', "/")), "{}", app.read_expr);
+    assert!(!app.read_expr.contains(&cache_fwd), "{}", app.read_expr);
+    let meta = app.meta.as_ref().expect("the panel asked for the metadata");
+    assert_eq!(meta.files[0].path, src_text.replace('\\', "/"));
+    drop(app);
+    drop(copy);
+}
+
+#[test]
+fn the_local_copies_clear_at_the_second_request_only() {
+    use peruse_core::cache::{plan, usage, Plan, Policy, Settings};
+    let src = write_sample("clear-copies", SAMPLE, "csv");
+    let cache = src.parent().unwrap().join("cache");
+    let _ = std::fs::remove_dir_all(&cache);
+    let (mut app, _term) = open(&src);
+
+    // With no copy, the command says so, and it asks nothing.
+    app.clear_copies_in(&cache);
+    let text = app.status.as_ref().map(|s| s.text.clone()).unwrap_or_default();
+    assert!(text.contains("no local copies"), "{text}");
+    assert!(app.clear_asked.is_none());
+
+    let settings = Settings {
+        policy: Policy::Always,
+        min_bytes: 0,
+        max_bytes: 1 << 30,
+        dir: Some(cache.clone()),
+    };
+    let probe = peruse_core::remote::System;
+    let Plan::Copy(job) = plan(src.to_str().unwrap(), &settings, &probe) else {
+        panic!("the policy always makes a copy");
+    };
+    let cancel = std::sync::atomic::AtomicBool::new(false);
+    drop(job.run(&mut |_| {}, &cancel, &probe).unwrap());
+    assert_eq!(usage(&cache).0, 1);
+
+    // The first request says what goes, and removes nothing.
+    app.clear_copies_in(&cache);
+    let text = app.status.as_ref().map(|s| s.text.clone()).unwrap_or_default();
+    assert!(text.contains("1 local copy") && text.contains("again"), "{text}");
+    assert_eq!(usage(&cache).0, 1, "one request removes nothing");
+
+    // The second request removes the copy.
+    app.clear_copies_in(&cache);
+    let text = app.status.as_ref().map(|s| s.text.clone()).unwrap_or_default();
+    assert!(text.starts_with("removed 1 local copy"), "{text}");
+    assert_eq!(usage(&cache), (0, 0));
+    assert_eq!(app.copies_usage, Some((0, 0)), "the settings page sees the change");
+
+    // A second request after the time for it starts again from the question.
+    let Plan::Copy(job) = plan(src.to_str().unwrap(), &settings, &probe) else {
+        panic!("the copy went, so a new copy is due");
+    };
+    drop(job.run(&mut |_| {}, &cancel, &probe).unwrap());
+    app.clear_asked = Some(std::time::Instant::now() - std::time::Duration::from_secs(60));
+    app.clear_copies_in(&cache);
+    assert_eq!(usage(&cache).0, 1, "a late second request asks again");
+    let _ = std::fs::remove_dir_all(&cache);
+}
+
+#[test]
 fn the_mouse_does_not_stop_the_program_on_a_small_terminal() {
     let p = write_sample("mouse-small", SAMPLE, "csv");
     let (mut app, _) = open(&p);

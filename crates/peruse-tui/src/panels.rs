@@ -57,6 +57,26 @@ fn kv(buf: &mut Buffer, area: Rect, y: u16, label: &str, value: &str, p: &Paint,
     );
 }
 
+/// Gives the end of a text that fits in `w` columns, with an ellipsis in
+/// front when the text is too long.
+fn keep_end(s: &str, w: usize) -> String {
+    if text::width(s) <= w || w == 0 {
+        return s.to_string();
+    }
+    let mut out: Vec<char> = Vec::new();
+    let mut used = 1;
+    for c in s.chars().rev() {
+        let cw = text::width(c.encode_utf8(&mut [0; 4]));
+        if used + cw > w {
+            break;
+        }
+        used += cw;
+        out.push(c);
+    }
+    out.push('…');
+    out.into_iter().rev().collect()
+}
+
 /// Draws the title of a section of a panel.
 fn section(buf: &mut Buffer, area: Rect, y: u16, title: &str, p: &Paint, app: &App) {
     if y >= area.bottom() {
@@ -251,7 +271,17 @@ pub fn draw_meta(buf: &mut Buffer, area: Rect, app: &App, p: &Paint) {
         return;
     };
 
-    let summary = meta.summary_rows();
+    let mut summary = meta.summary_rows();
+    // A file from a network drive opens from a copy on the local disk. The
+    // panel names both, so that the user knows where the rows come from.
+    //
+    // A path that is too long loses its start and keeps its end, because the
+    // end names the file.
+    if let Some(copy) = &app.source.local_copy {
+        let w = (inner.width as usize).saturating_sub(15usize.min(inner.width as usize / 2) + 1);
+        summary.insert(0, ("source".into(), keep_end(&app.source.input, w)));
+        summary.insert(1, ("local copy".into(), keep_end(copy, w)));
+    }
     let (rows, at) = column_rows(app);
     let read_lines = text::wrap(&app.read_expr, inner.width as usize);
     let plan = plan_meta(

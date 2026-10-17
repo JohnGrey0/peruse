@@ -336,6 +336,39 @@ impl Worker {
         ))
     }
 
+    /// Starts the worker on a local copy of a file from a network drive.
+    ///
+    /// The engine reads the copy, and each text that the user sees names the
+    /// source: the title bar, the read expression of the metadata panel, the
+    /// list of files and each error message. The field
+    /// [`Source::local_copy`] holds the path of the copy for the panel.
+    /// Refer to [`crate::cache`].
+    pub fn spawn_local(copy: &crate::cache::LocalCopy, opts: OpenOptions) -> Result<(Worker, Opened)> {
+        let rw = copy.rewrite();
+        let (mut worker, mut opened) =
+            Worker::spawn(&copy.input, opts).map_err(|e| rw.apply_error(&e))?;
+        opened.source.input = rw.origin.clone();
+        opened.source.local_copy = Some(rw.local.clone());
+        opened.read_expr = rw.apply(&opened.read_expr);
+
+        // The responses go through a second thread that changes each path of
+        // the copy back to the path of the source. The worker and its loop
+        // therefore stay the same for a copy and for a file in place. The
+        // thread stops when the worker thread stops and closes its channel.
+        let (tx, rx) = unbounded::<Response>();
+        let inner = std::mem::replace(&mut worker.rx, rx);
+        thread::Builder::new()
+            .name("peruse-names".into())
+            .spawn(move || {
+                for r in inner {
+                    if tx.send(name_source(&rw, r)).is_err() {
+                        return;
+                    }
+                }
+            })?;
+        Ok((worker, opened))
+    }
+
     /// Sends one request to the worker thread.
     pub fn send(&self, req: Request) {
         // A closed channel shows that the worker thread stopped. The user
@@ -400,6 +433,31 @@ impl Drop for Worker {
             thread::sleep(Duration::from_millis(5));
         }
         let _ = h.join();
+    }
+}
+
+/// Changes each path of a local copy in a response to the path of the source.
+///
+/// Two responses can hold a path: the metadata, which lists the files and
+/// the read call of the CSV sniffer, and an error, which DuckDB writes with
+/// the path that it read.
+fn name_source(rw: &crate::cache::Rewrite, r: Response) -> Response {
+    match r {
+        Response::Meta { epoch, mut meta } => {
+            for f in &mut meta.files {
+                f.path = rw.apply(&f.path);
+            }
+            if let Some(c) = &mut meta.csv {
+                c.prompt = rw.apply(&c.prompt);
+            }
+            Response::Meta { epoch, meta }
+        }
+        Response::Error { epoch, context, message } => Response::Error {
+            epoch,
+            context: rw.apply(&context),
+            message: rw.apply(&message),
+        },
+        other => other,
     }
 }
 
@@ -1002,5 +1060,107 @@ mod tests {
             done_rx.recv_timeout(std::time::Duration::from_secs(20)).is_ok(),
             "the end of the worker waited for the slow requests in the queue"
         );
+    }
+
+    /// A probe that treats one local directory as a network drive.
+    struct ShareProbe(std::path::PathBuf);
+
+    impl crate::remote::Probe for ShareProbe {
+        fn is_remote(&self, path: &std::path::Path) -> bool {
+            let full = |p: &std::path::Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+            full(path).starts_with(full(&self.0))
+        }
+        fn free_bytes(&self, _dir: &std::path::Path) -> Option<u64> {
+            Some(u64::MAX / 4)
+        }
+    }
+
+    /// Waits for the first response that the test wants, and gives it.
+    fn wait_for(w: &Worker, want: impl Fn(&Response) -> bool) -> Response {
+        let deadline = std::time::Duration::from_secs(30);
+        loop {
+            let r = w.responses().recv_timeout(deadline).expect("no response from the worker");
+            if let Response::Error { context, message, .. } = &r {
+                panic!("{context}: {message}");
+            }
+            if want(&r) {
+                return r;
+            }
+        }
+    }
+
+    #[test]
+    fn a_file_on_a_share_opens_from_its_local_copy_and_names_the_share() {
+        use crate::cache::{plan, Plan, Policy, Settings};
+        let base = std::env::temp_dir().join(format!("peruse-worker-share-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let share = base.join("share");
+        let cache = base.join("cache");
+        std::fs::create_dir_all(&share).unwrap();
+        let file = share.join("sales.csv");
+        let mut text = String::from("id,region\n");
+        for i in 0..500 {
+            text.push_str(&format!("{i},{}\n", ["EU", "US"][i % 2]));
+        }
+        std::fs::write(&file, &text).unwrap();
+        let input = file.to_str().unwrap().to_string();
+        let settings = Settings {
+            policy: Policy::Auto,
+            min_bytes: 0,
+            max_bytes: 1 << 30,
+            dir: Some(cache.clone()),
+        };
+        let probe = ShareProbe(share.clone());
+
+        let Plan::Copy(job) = plan(&input, &settings, &probe) else {
+            panic!("a file on the share must get a copy");
+        };
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let copy = job.run(&mut |_| {}, &cancel, &probe).unwrap();
+        // The copy is the file that the engine reads, and the source stays as
+        // it was.
+        assert!(copy.input.starts_with(&*cache.to_string_lossy()), "{}", copy.input);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), text);
+
+        let (w, opened) = Worker::spawn_local(&copy, OpenOptions::default()).unwrap();
+        assert_eq!(opened.source.input, input, "the title names the share");
+        assert_eq!(opened.source.local_copy.as_deref(), Some(copy.input.as_str()));
+        let share_fwd = input.replace('\\', "/");
+        let cache_fwd = cache.to_string_lossy().replace('\\', "/");
+        assert!(opened.read_expr.contains(&share_fwd), "{}", opened.read_expr);
+        assert!(!opened.read_expr.contains(&cache_fwd), "{}", opened.read_expr);
+        assert_eq!(opened.schema.len(), 2);
+
+        // The rows come from the copy.
+        w.send(Request::SetView { epoch: 1, view: View::default(), limit: 50 });
+        match wait_for(&w, |r| matches!(r, Response::Count { .. })) {
+            Response::Count { total, .. } => assert_eq!(total, 500),
+            _ => unreachable!(),
+        }
+        // The metadata names the share, and not the cache.
+        w.send(Request::Meta { epoch: 1 });
+        match wait_for(&w, |r| matches!(r, Response::Meta { .. })) {
+            Response::Meta { meta, .. } => {
+                assert_eq!(meta.files.len(), 1);
+                assert_eq!(meta.files[0].path, share_fwd);
+                if let Some(c) = &meta.csv {
+                    assert!(!c.prompt.contains(&cache_fwd), "{}", c.prompt);
+                }
+            }
+            _ => unreachable!(),
+        }
+        // An error that names the copy names the share instead.
+        let rw = copy.rewrite();
+        let e = anyhow::anyhow!("IO Error: cannot read {}", copy.input.replace('\\', "/"))
+            .context(format!("opening {}", copy.input));
+        let back = format!("{:#}", rw.apply_error(&e));
+        assert!(!back.contains(&cache_fwd) && !back.contains(&*cache.to_string_lossy()), "{back}");
+        assert!(back.contains(&input) && back.contains(&share_fwd), "{back}");
+        drop(w);
+        drop(copy);
+
+        // The next session reads the same copy, with no copy at all.
+        assert!(matches!(plan(&input, &settings, &probe), Plan::Ready(_)));
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

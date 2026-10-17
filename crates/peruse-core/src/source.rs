@@ -62,6 +62,10 @@ pub struct Source {
     /// A file holds one table, and that table has no name of its own, so the
     /// value is `None` for a file.
     pub table: Option<String>,
+    /// The path of the local copy that the engine reads, when the source is
+    /// on a network drive. The field `input` then still holds the path that
+    /// the user gave. Refer to [`crate::cache`].
+    pub local_copy: Option<String>,
 }
 
 impl Source {

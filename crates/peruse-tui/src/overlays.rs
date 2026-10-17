@@ -1530,6 +1530,17 @@ pub fn draw_settings(buf: &mut Buffer, area: Rect, app: &App, p: &Paint) -> Draw
         ),
     ));
     facts.push(("spill to".into(), r.temp_dir.display().to_string()));
+    // The copies of files from a network drive take space on this disk, so
+    // the page says how much, and where. The command "clear the local copies"
+    // gives it back. The page reads the directory one time when it opens,
+    // because a walk of the directory at each frame would read the disk ten
+    // times each second.
+    if let (Some(dir), Some((n, bytes))) = (peruse_core::cache::copies_dir(), app.copies_usage) {
+        facts.push((
+            "local copies".into(),
+            format!("{n}  ·  {}  ·  {}", human_bytes(bytes), dir.display()),
+        ));
+    }
     facts.push((
         "file".into(),
         match peruse_core::config::Config::path() {

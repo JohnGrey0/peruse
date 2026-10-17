@@ -73,6 +73,25 @@ pub struct Config {
     /// the mouse in the usual way. A user who copies text out of the grid with
     /// the mouse each day can turn the mouse off here.
     pub mouse: Option<bool>,
+    /// When Peruse copies a file from a network drive to the local disk
+    /// before it opens it: `auto`, `always` or `never`.
+    ///
+    /// The value `auto` copies a file from a network drive when it is at
+    /// least [`Config::local_copy_min_mb`] large. The value `always` copies
+    /// each file, also from a local disk. Refer to [`crate::cache`].
+    ///
+    /// The file also accepts the name `remote_cache`, and the same for the
+    /// two limits below. Peruse writes the names `local_copy`.
+    #[serde(alias = "remote_cache")]
+    pub local_copy: Option<String>,
+    /// The size in whole megabytes below which `auto` reads a file from a
+    /// network drive in place.
+    #[serde(alias = "remote_cache_min_mb")]
+    pub local_copy_min_mb: Option<u64>,
+    /// The space in whole gigabytes that the local copies can take together.
+    /// The copies that were used the least recently go first.
+    #[serde(alias = "remote_cache_max_gb")]
+    pub local_copy_max_gb: Option<u64>,
     /// The files that the user opened, the newest first.
     ///
     /// The chooser of files puts these at the top of its list. A user opens
@@ -160,6 +179,16 @@ impl Config {
         }
         on_disk.remember_file(file);
         on_disk.save_to(p).map(|_| ())
+    }
+
+    /// Gives the policy of the local copies. A value that Peruse does not
+    /// know gives `auto`, because a word in the file must not stop the
+    /// program.
+    pub fn local_copy_policy(&self) -> crate::cache::Policy {
+        self.local_copy
+            .as_deref()
+            .and_then(crate::cache::Policy::parse)
+            .unwrap_or_default()
     }
 
     /// Gives the memory limit in the form that DuckDB takes.
@@ -285,6 +314,19 @@ impl Config {
         s.push_str("# With the mouse on, the terminal gives each click and each turn of\n");
         s.push_str("# the wheel to peruse, and it does not select text in the usual way.\n");
         push_opt(&mut s, "mouse", self.mouse.map(|v| v.to_string()));
+
+        s.push_str("\n# Copy a file from a network drive to the local disk before peruse opens it:\n");
+        s.push_str("# auto, always or never. With auto, peruse copies a file of local_copy_min_mb\n");
+        s.push_str("# or more from a network drive, and it uses the copy again until the file\n");
+        s.push_str("# changes. With always, it copies each file, also from a local disk.\n");
+        push_opt(&mut s, "local_copy", self.local_copy.as_deref().map(quote));
+
+        s.push_str("\n# The size in megabytes below which auto reads a file in place.\n");
+        push_opt(&mut s, "local_copy_min_mb", self.local_copy_min_mb.map(|v| v.to_string()));
+
+        s.push_str("\n# The space in gigabytes that the local copies can take together.\n");
+        s.push_str("# The copy that was used the least recently goes first.\n");
+        push_opt(&mut s, "local_copy_max_gb", self.local_copy_max_gb.map(|v| v.to_string()));
 
         s.push_str("\n# The files that you opened, the newest first.\n");
         s.push_str("# The chooser of files puts these at the top of its list.\n");
@@ -499,6 +541,9 @@ mod tests {
             band: Some("detailed".into()),
             step: Some(25),
             mouse: Some(false),
+            local_copy: Some("always".into()),
+            local_copy_min_mb: Some(64),
+            local_copy_max_gb: Some(50),
             recent: vec!["/data/a.parquet".into(), "C:/data/b.csv".into()],
         };
         let back: Config = toml::from_str(&c.to_toml()).unwrap();
@@ -724,6 +769,25 @@ mod tests {
         }
         // A value that is not a size says so.
         assert!(toml::from_str::<Config>("memory_limit = \"lots\"").is_err());
+    }
+
+    #[test]
+    fn a_word_for_the_local_copies_that_peruse_does_not_know_gives_auto() {
+        use crate::cache::Policy;
+        let c: Config = toml::from_str("local_copy = \"never\"").unwrap();
+        assert_eq!(c.local_copy_policy(), Policy::Never);
+        let c: Config = toml::from_str("local_copy = \"sometimes\"").unwrap();
+        assert_eq!(c.local_copy_policy(), Policy::Auto);
+        assert_eq!(Config::default().local_copy_policy(), Policy::Auto);
+        // The second name of each setting reads the same.
+        let c: Config = toml::from_str(
+            "remote_cache = \"always\"
+remote_cache_min_mb = 8
+remote_cache_max_gb = 2",
+        )
+        .unwrap();
+        assert_eq!(c.local_copy_policy(), Policy::Always);
+        assert_eq!((c.local_copy_min_mb, c.local_copy_max_gb), (Some(8), Some(2)));
     }
 
     #[test]

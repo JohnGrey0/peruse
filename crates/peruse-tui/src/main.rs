@@ -9,6 +9,7 @@ mod browser;
 mod clip;
 mod colors;
 mod commands;
+mod copying;
 mod grid;
 mod input;
 mod overlays;
@@ -127,6 +128,14 @@ struct Cli {
     /// Ignore the mouse, so the terminal selects text with it as usual
     #[arg(long)]
     no_mouse: bool,
+
+    /// Copy the file to the local disk first, from any drive and of any size
+    #[arg(long, conflicts_with = "no_local")]
+    local: bool,
+
+    /// Read the file in place, also from a network drive
+    #[arg(long)]
+    no_local: bool,
 }
 
 /// Reads the argument of the option `--delimiter`.
@@ -265,9 +274,34 @@ fn run_main() -> Result<()> {
         table: cli.table.clone(),
     };
 
+    // A large file on a network drive opens from a copy on the local disk.
+    // The options of the command line win over the setting, as for each
+    // other setting.
+    let policy = if cli.local {
+        Some(peruse_core::cache::Policy::Always)
+    } else if cli.no_local {
+        Some(peruse_core::cache::Policy::Never)
+    } else {
+        None
+    };
+    let copy_settings = peruse_core::cache::Settings::from_config(&config, policy);
+
     // The option --ddl writes to the standard output and stops. The terminal
     // never starts, so the result goes into a file or into another program.
+    //
+    // A copy from an earlier session makes the measurement fast. The option
+    // makes no new copy: the measurement reads the whole file one time, and a
+    // copy would read it one time more.
     if let Some(name) = &cli.ddl {
+        let probe = peruse_core::remote::System;
+        if let peruse_core::cache::Plan::Ready(copy) =
+            peruse_core::cache::plan(&file, &copy_settings, &probe)
+        {
+            let rw = copy.rewrite();
+            let (table, query, filter) = (cli.table.clone(), cli.query.clone(), cli.filter.clone());
+            return print_ddl(&copy.input, &opts, name, table, query, filter)
+                .map_err(|e| rw.apply_error(&e));
+        }
         return print_ddl(&file, &opts, name, cli.table.clone(), cli.query.clone(), cli.filter.clone());
     }
 
@@ -282,17 +316,52 @@ fn run_main() -> Result<()> {
         );
     }
 
+    // A large file on a network drive gets a copy on the local disk first,
+    // with a screen that shows the progress. The copy stays for the next
+    // session, and it holds a lease until this session ends. Refer to
+    // `peruse_core::cache`.
+    let mut note = None;
+    let local = match copying::prepare(&file, &copy_settings, &theme)? {
+        copying::Outcome::Local(c) => Some(c),
+        copying::Outcome::InPlace(why) => {
+            note = why;
+            None
+        }
+        copying::Outcome::Quit => return Ok(()),
+    };
+    let read = local.as_ref().map_or(file.as_str(), |c| c.input.as_str());
+
     // A database holds many tables, and the grid shows one of them. The user
     // chooses it here, in front of the grid, in the same way as the chooser
     // chooses a file.
-    match pick_table(&file, cli.query.is_some(), &opts, &theme)? {
+    // The picker reads the tables of the copy. A message about it names the
+    // source, as each other message does.
+    let picked = pick_table(read, cli.query.is_some(), &opts, &theme)
+        .map_err(|e| match &local {
+            Some(c) => c.rewrite().apply_error(&e),
+            None => e,
+        });
+    match picked? {
         Picked::Table(name) => opts.table = Some(name),
         Picked::NoChoice => {}
         // The user left the picker without a table.
         Picked::Left => return Ok(()),
     }
 
-    let (worker, opened) = Worker::spawn(&file, opts)?;
+    let (worker, opened) = match &local {
+        // A copy that does not open goes back to the source. The source then
+        // gives its own message, or it opens.
+        Some(c) => match Worker::spawn_local(c, opts.clone()) {
+            Ok(w) => w,
+            Err(e) => {
+                note = Some(format!(
+                    "the local copy did not open ({e:#}). Peruse reads the file in place"
+                ));
+                Worker::spawn(&file, opts)?
+            }
+        },
+        None => Worker::spawn(&file, opts)?,
+    };
 
     // Remember the file, so that the chooser can offer it at the next start.
     // The list holds the full path: a name by itself does not say which file
@@ -321,6 +390,20 @@ fn run_main() -> Result<()> {
     // screen, and ask for what they need.
     if let Some(name) = application.config.panels.clone() {
         application.set_panel_from_setting(&name);
+    }
+    if application.source.local_copy.is_some()
+        && let Some(c) = &local
+    {
+        application.info(match c.copied {
+            Some(t) => format!(
+                "reading a local copy: {} copied in {}",
+                peruse_core::source::human_bytes(c.bytes),
+                copying::human_time(t.as_secs_f64())
+            ),
+            None => "reading the local copy from an earlier session".to_string(),
+        });
+    } else if let Some(n) = note {
+        application.info(n);
     }
     if let Some(e) = config_error {
         application.error(format!("settings: {e}"));

@@ -77,6 +77,9 @@ const AUTO_INDEX_BYTES: u64 = 64 * 1024 * 1024;
 /// so the number of columns needs its own limit.
 const AUTO_INDEX_COLUMNS: usize = 256;
 
+/// The time in which a second request to clear the local copies clears them.
+const CLEAR_CONFIRM: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// The number of rows or columns that one step moves, when the settings file
 /// names no other number.
 ///
@@ -344,6 +347,8 @@ pub enum Setting {
     Band,
     /// The number of rows or columns that one step moves.
     Step,
+    /// When Peruse copies a file from a network drive to the local disk.
+    LocalCopy,
 }
 
 impl Setting {
@@ -357,6 +362,7 @@ impl Setting {
         Setting::Panels,
         Setting::Band,
         Setting::Step,
+        Setting::LocalCopy,
     ];
 
     /// The name that the page shows.
@@ -370,6 +376,7 @@ impl Setting {
             Setting::Panels => "panels",
             Setting::Band => "column details",
             Setting::Step => "step",
+            Setting::LocalCopy => "local copy",
         }
     }
 
@@ -384,6 +391,7 @@ impl Setting {
             Setting::Panels => "keep at the side: none, meta, stats or both",
             Setting::Band => "rows under the headers: off, compact or detailed. d cycles",
             Setting::Step => "rows or columns that J, K, H and L move",
+            Setting::LocalCopy => "copy a file from a network drive first: auto, always, never",
         }
     }
 
@@ -393,7 +401,7 @@ impl Setting {
     /// and the index do their work when a file opens, so a change to them
     /// cannot reach the file that is open already.
     pub fn at_next_file(self) -> bool {
-        matches!(self, Setting::SampleSize | Setting::NoIndex)
+        matches!(self, Setting::SampleSize | Setting::NoIndex | Setting::LocalCopy)
     }
 }
 
@@ -1037,6 +1045,13 @@ pub struct App {
     pub settings_sel: usize,
     /// `true` while the user types the value of a setting.
     pub settings_editing: bool,
+    /// The number of local copies and the bytes that they take, for the
+    /// settings page. The page reads the directory one time when it opens,
+    /// and not at each frame.
+    pub copies_usage: Option<(usize, u64)>,
+    /// The time of the first request to clear the local copies. A second
+    /// request soon after it clears them.
+    pub clear_asked: Option<std::time::Instant>,
     /// The values that DuckDB uses now, for the settings page.
     pub duck_threads: Option<String>,
     /// The memory limit that DuckDB uses now.
@@ -1203,6 +1218,8 @@ impl App {
             resources: Resources::read(),
             settings_sel: 0,
             settings_editing: false,
+            copies_usage: None,
+            clear_asked: None,
             duck_threads: None,
             duck_memory: None,
 
@@ -2915,6 +2932,10 @@ impl App {
                 .map(|s| s.to_string())
                 .collect(),
             Setting::NoIndex => vec!["yes".into(), "no".into()],
+            Setting::LocalCopy => ["auto", "always", "never"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
             Setting::Threads | Setting::MemoryLimit | Setting::SampleSize | Setting::Step => {
                 Vec::new()
             }
@@ -3665,6 +3686,7 @@ impl App {
             Setting::Panels => self.config.panels.clone().unwrap_or_default(),
             Setting::Band => self.config.band.clone().unwrap_or_default(),
             Setting::Step => self.config.step.map(|v| v.to_string()).unwrap_or_default(),
+            Setting::LocalCopy => self.config.local_copy.clone().unwrap_or_default(),
         }
     }
 
@@ -3685,6 +3707,12 @@ impl App {
             Setting::Panels => "none".into(),
             Setting::Band => "off".into(),
             Setting::Step => format!("{DEFAULT_STEP} rows or columns"),
+            Setting::LocalCopy => format!(
+                "auto, from {} MB",
+                self.config
+                    .local_copy_min_mb
+                    .unwrap_or(peruse_core::cache::DEFAULT_MIN_MB)
+            ),
         }
     }
 
@@ -3771,11 +3799,68 @@ impl App {
         self.config.save_to(p).map(|_| ())
     }
 
+    /// Removes the local copies of files from network drives.
+    ///
+    /// The first request says what the command removes, and a second request
+    /// within some seconds removes it. A copy of a large file took a long
+    /// time over the network, and one key that the user pressed by mistake
+    /// must not throw it away.
+    ///
+    /// A copy that a Peruse reads now stays, and that includes the copy of
+    /// this session. The next open of a file from a network drive copies it
+    /// again.
+    fn clear_copies(&mut self) {
+        let Some(dir) = peruse_core::cache::copies_dir() else {
+            self.info("this system gives no directory for local copies");
+            return;
+        };
+        self.clear_copies_in(&dir);
+    }
+
+    /// Does the work of [`App::clear_copies`] on one directory.
+    pub(crate) fn clear_copies_in(&mut self, dir: &std::path::Path) {
+        use peruse_core::source::human_bytes;
+        let now = std::time::Instant::now();
+        let confirmed = self
+            .clear_asked
+            .take()
+            .is_some_and(|t| now.duration_since(t) <= CLEAR_CONFIRM);
+        if !confirmed {
+            let (n, bytes) = peruse_core::cache::usage(dir);
+            if n == 0 {
+                self.info("there are no local copies to clear");
+                return;
+            }
+            self.clear_asked = Some(now);
+            let key = commands::binding(Cmd::ClearCopies).map_or("C", |b| b.label);
+            self.info(format!(
+                "{n} local {}, {}. Press {key} again to clear them",
+                if n == 1 { "copy" } else { "copies" },
+                human_bytes(bytes)
+            ));
+            return;
+        }
+        let c = peruse_core::cache::clear(dir);
+        let mut msg = format!(
+            "removed {} local {}, {}",
+            c.removed,
+            if c.removed == 1 { "copy" } else { "copies" },
+            human_bytes(c.bytes)
+        );
+        if c.kept > 0 {
+            let verb = if c.kept == 1 { "stays" } else { "stay" };
+            msg.push_str(&format!(". {} in use now {verb}", c.kept));
+        }
+        self.copies_usage = Some(peruse_core::cache::usage(dir));
+        self.ok(msg);
+    }
+
     /// Opens the settings page.
     fn open_settings(&mut self) {
         self.settings_sel = 0;
         self.settings_editing = false;
         self.mode = Mode::Settings;
+        self.copies_usage = peruse_core::cache::copies_dir().map(|d| peruse_core::cache::usage(&d));
         // Ask DuckDB what it uses now. The page then shows the truth, and
         // not the wish of the user.
         self.worker.send(Request::Configure {
@@ -3910,6 +3995,21 @@ impl App {
                         _ => {
                             self.error(format!(
                                 "step: write a number from 1 to {MAX_STEP} (got {t:?})"
+                            ));
+                            return;
+                        }
+                    }
+                }
+            }
+            Setting::LocalCopy => {
+                if empty {
+                    self.config.local_copy = None;
+                } else {
+                    match peruse_core::cache::Policy::parse(t) {
+                        Some(pol) => self.config.local_copy = Some(pol.name().to_string()),
+                        None => {
+                            self.error(format!(
+                                "local copy: write auto, always or never (got {t:?})"
                             ));
                             return;
                         }
@@ -4832,6 +4932,7 @@ impl App {
                 self.mode = Mode::ThemePicker;
             }
             Cmd::Settings => self.open_settings(),
+            Cmd::ClearCopies => self.clear_copies(),
         }
     }
 }

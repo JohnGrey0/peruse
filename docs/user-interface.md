@@ -41,7 +41,9 @@ The title bar shows these items from the left side:
    main.sales`.
 3. The size of the view, as the number of rows and the number of columns
 4. The size of the file on the disk, and the format
-5. A word for each part of the view that removes rows or columns: `filtered`,
+5. The words `local copy`, when the file is on a network drive and the grid
+   reads a copy of it on the local disk. See [local-copies.md](local-copies.md).
+6. A word for each part of the view that removes rows or columns: `filtered`,
    `query`, the sort column with an arrow, and the number of hidden columns
 
 At the right side, the title bar shows the work of the worker or the name of

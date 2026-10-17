@@ -37,6 +37,7 @@ refuses a write.
   - [SQL](#sql)
   - [Search](#search)
   - [DuckDB databases](#duckdb-databases)
+  - [Files on a network drive](#files-on-a-network-drive)
   - [The mouse](#the-mouse)
   - [Themes](#themes)
 - [Completion](#completion)
@@ -573,6 +574,62 @@ A SQLite file is not a DuckDB database. Peruse knows one from its first bytes
 and says how to write a table out with `sqlite3` instead of failing on binary
 data.
 
+### Files on a network drive
+
+```sh
+peruse \\server\team\sales.parquet
+peruse S:\sales.parquet
+```
+
+A Parquet file on a share is slow to browse: DuckDB reads it in many small
+pieces, and every piece waits for the network. One long read is much faster. So
+when a file of 32 MB or more is on a network drive, Peruse copies it to your
+local disk once, with a progress screen, and then reads the copy:
+
+```
+ peruse  a local copy of a file from a network drive
+
+   sales.parquet
+   Peruse copies it to this computer one time. Each step after that is fast.
+
+   from  \\server\team\sales.parquet
+   to    C:\Users\you\AppData\Local\peruse\cache\copies\3f9a…\data
+
+   ████████████████████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░  27%
+   278 MB of 1.0 GB  ·  940 MB/s  ·  1 s left
+
+   Esc  read it on the network instead      Ctrl+C  quit
+```
+
+The copy stays. The next time you open the same file, the grid opens at once,
+and Peruse copies it again only when the file on the share changes (its size or
+its modification time). On a file of 1 GB, a sort took 1.1 s in place and 0.2 s
+from the copy, and a whole session of browsing was 3.7 times faster. The
+measurements are in [docs/local-copies.md](docs/local-copies.md).
+
+You always know which one you are reading. The title bar says `local copy`,
+the metadata panel shows the source and the copy on two rows, and every message,
+the `reads as` line and the list of files name the file on the share, not the
+copy. Peruse never writes to the share.
+
+- `Esc` on the progress screen stops the copy and reads the file in place.
+- A glob copies each file it matches and keeps the subdirectories, so a Hive
+  layout such as `year=2024/` still works. A DuckDB database brings its `.wal`
+  file along.
+- Peruse checks the free space first and keeps 1 GB free. The copies take 20 GB
+  at most; the copy that you used the longest ago goes first, and a copy that
+  another Peruse has open is never removed.
+- `C` clears the copies. It asks first, and a second `C` within 5 seconds
+  clears them. The settings page shows how many there are and how much space
+  they take.
+- `--local` copies the file whatever its size or disk, and `--no-local` reads
+  it in place. The setting `local_copy` (`auto`, `always` or `never`) does the
+  same every time.
+
+Peruse finds a network drive with `GetDriveTypeW` and UNC paths on Windows,
+with `/proc/self/mountinfo` on Linux (NFS, SMB/CIFS, 9p, sshfs, rclone and
+others), and with `statfs` on macOS.
+
 ### The mouse
 
 The wheel scrolls the rows. `Ctrl` or `Shift` with the wheel moves across the
@@ -668,6 +725,7 @@ one once.
 | panels | `panels` | `none`, `meta`, `stats` or `both` | `none` |
 | column details | `band` | the band under the names: `off`, `compact` or `detailed` | `off` |
 | step | `step` | rows or columns that `J`, `K`, `H` and `L` move, 1 to 1000 | 10 |
+| local copy | `local_copy` | copy a file from a network drive first: `auto`, `always` or `never`. See [Files on a network drive](#files-on-a-network-drive) | `auto` |
 
 The row `index at open` takes `yes` or `no`, and the file holds `no_index` the
 other way round: the page asks the question that you have, and the file carries
@@ -678,6 +736,8 @@ Two more settings live in the file and not on the page:
 | In `config.toml` | What it does | With no value |
 |---|---|---|
 | `mouse = false` | make Peruse ignore the mouse | the mouse is on |
+| `local_copy_min_mb` | below this size, `auto` reads a file on a network drive in place | 32 |
+| `local_copy_max_gb` | the space that all the local copies may take | 20 |
 | `recent` | the files you opened, for the chooser. Peruse writes it | empty |
 
 The page also shows what your machine gives: the cores, the processor, the free
@@ -688,8 +748,8 @@ Inside the page: `j` `k` move, `Enter` or `e` edits, `d` goes back to the
 built-in value, `m` takes the value of your machine for the threads and the
 memory, `T` opens the theme picker, and `Esc` closes.
 
-Six settings take effect immediately. The sample size and the index apply to
-the next file you open, and the page says so.
+Six settings take effect immediately. The sample size, the index and the local
+copy apply to the next file you open, and the page says so.
 
 Command-line options always win over the file, so you can try something once
 without changing anything permanently.
@@ -902,6 +962,7 @@ is 10 rows or columns, and the setting `step` changes it.
 | `t` | next theme |
 | `T` | choose a theme |
 | `,` | settings, and what this machine gives |
+| `C` | clear the local copies of files from network drives (press it twice) |
 | `?`, `F1` | the help |
 | `:`, `p` | run a command by name |
 | `Esc` | stop the query that runs now, or close the side panels |
@@ -976,6 +1037,8 @@ does not expand it first. With no `FILE`, Peruse opens the
 | `--memory-limit` | `SIZE` | The memory ceiling before DuckDB writes to the disk, for example `4GB`. |
 | `--no-index` | | Never index a file of text when Peruse opens it. See [File formats](#file-formats). |
 | `--no-mouse` | | Ignore the mouse, so the terminal selects text with it as usual. |
+| `--local` | | Copy the file to the local disk first, from any drive and of any size. See [Files on a network drive](#files-on-a-network-drive). |
+| `--no-local` | | Read the file in place, also from a network drive. |
 | `-h`, `--help` | | Print the help. |
 | `-V`, `--version` | | Print the version. |
 
@@ -1142,7 +1205,9 @@ reaches your data files only through the table functions `read_parquet`,
 `read_csv`, `read_json` and `read_json_auto`. These functions read, and they
 cannot write.
 Peruse never opens a data file for write access, and it never installs or loads
-an extension, so it cannot reach the network.
+an extension, so it cannot reach the network. A file on a network drive gets a
+[local copy](#files-on-a-network-drive): Peruse opens the source for reading
+only, and it writes the copy into its own cache directory.
 
 A DuckDB database is the one file that DuckDB itself opens, and Peruse attaches
 it with `ATTACH … (READ_ONLY)`. The promise is stronger there than anywhere

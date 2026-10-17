@@ -15,6 +15,7 @@
 //! # Ok::<(), anyhow::Error>(())
 //! ```
 
+pub mod cache;
 pub mod config;
 pub mod ddl;
 pub mod dirs;
@@ -23,6 +24,7 @@ pub mod filter;
 pub mod meta;
 pub mod model;
 pub mod query;
+pub mod remote;
 pub mod source;
 pub mod sql_guard;
 pub mod stats;

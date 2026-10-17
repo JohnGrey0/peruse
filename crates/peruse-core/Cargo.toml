@@ -27,3 +27,9 @@ serde.workspace = true
 sysinfo.workspace = true
 toml.workspace = true
 unicode-width.workspace = true
+
+# The local copies of files from a network drive ask the system for the free
+# space of a disk and for the kind of a file system. The crate is in the build
+# already, through `sysinfo`, so this line adds nothing to the program.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
