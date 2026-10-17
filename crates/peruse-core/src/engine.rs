@@ -86,6 +86,14 @@ const SEARCH_WINDOW: u64 = 8192;
 /// thousand rows.
 const LATE_MATERIALIZATION_ROWS: u64 = 4096;
 
+/// The largest number of threads that examine the files of a set of CSV files
+/// at the open operation.
+///
+/// One call of the sniffer of DuckDB costs about 8 ms on a small file, and most
+/// of that time is not work of the processor. A set of 500 files therefore
+/// costs four seconds on one thread. Refer to [`Engine::pin_csv`].
+const SNIFF_THREADS: usize = 8;
+
 /// The options that control how the engine opens a file.
 #[derive(Clone, Debug, Default)]
 pub struct OpenOptions {
@@ -286,7 +294,7 @@ pub struct Engine {
     /// The metadata panel shows these values. With this copy, the panel needs
     /// no second sniffer call, and that call costs 50 milliseconds on a file of
     /// 258 MB. The value is `None` for a format that has no dialect, and for a
-    /// set of CSV files.
+    /// set of CSV files whose files differ. Refer to [`Engine::pin_csv`].
     csv_dialect: Option<CsvMeta>,
     /// The table that the view `src` reads, for a database source.
     ///
@@ -305,6 +313,28 @@ struct CsvSniff {
     comment: String,
     /// The name and the SQL type of each column, in the order of the file.
     columns: Vec<(String, String)>,
+}
+
+impl CsvSniff {
+    /// Gives `true` when two files have the same dialect and the same columns,
+    /// in the same order and with the same types.
+    ///
+    /// The field `prompt` holds the name of the file, so the test leaves it
+    /// out. One read call with these values then reads each of the two files in
+    /// the same way as the sniffer of each file would.
+    fn same_as(&self, other: &CsvSniff) -> bool {
+        let (a, b) = (&self.meta, &other.meta);
+        a.delimiter == b.delimiter
+            && a.quote == b.quote
+            && a.escape == b.escape
+            && a.new_line == b.new_line
+            && a.skip_rows == b.skip_rows
+            && a.has_header == b.has_header
+            && a.date_format == b.date_format
+            && a.timestamp_format == b.timestamp_format
+            && self.comment == other.comment
+            && self.columns == other.columns
+    }
 }
 
 /// Changes each backslash in a path to a forward slash.
@@ -548,7 +578,7 @@ impl Engine {
         // A set of files needs `union_by_name`, and two files of one set can
         // hold different columns. One column list cannot serve them all, so a
         // set keeps the call that finds the columns for each file.
-        let pinned = if engine.source.format == Format::Csv && !engine.source.is_multi() {
+        let pinned = if engine.source.format == Format::Csv {
             engine.pin_csv(opts)
         } else {
             None
@@ -646,8 +676,23 @@ impl Engine {
     /// new call fails, or when the new call gives columns that are not the
     /// columns of the sniffer. The caller then uses the call with `auto_detect`,
     /// which is the call that Peruse used before this step existed.
+    ///
+    /// A set of files gets the same call when the sniffer finds the same dialect
+    /// and the same columns, in the same order, in each file of the set. The
+    /// sniffer then examines each file one time at the open operation. Without
+    /// that, the call with `union_by_name` examines each file of the set again
+    /// for every statement: over 500 small CSV files, one page cost 640 ms, and
+    /// it costs 60 ms with the pinned call. A set whose files differ keeps the
+    /// call with `union_by_name`, which reads each file with its own columns.
+    ///
+    /// One call of the sniffer costs some milliseconds also on a small file, so
+    /// the sniffer examines the other files of a set on some threads at the
+    /// same time. Refer to [`SNIFF_THREADS`].
     fn pin_csv(&mut self, opts: &OpenOptions) -> Option<Schema> {
-        let sniff = self.sniff_csv(opts).ok()?;
+        let sniff = self.sniff_csv(&self.source.files[0], opts).ok()?;
+        if !self.set_agrees(&sniff, opts) {
+            return None;
+        }
         let expr = pinned_csv_expr(&self.source, opts, &sniff)?;
         let schema = self.use_scan_expr(expr).ok()?;
         // The sniffer and the read call share one piece of code inside DuckDB,
@@ -671,62 +716,51 @@ impl Engine {
     ///
     /// The sniffer gets the same options as the read call. The two therefore
     /// agree about the file.
-    fn sniff_csv(&self, opts: &OpenOptions) -> Result<CsvSniff> {
-        let mut args = vec![quote_str(&db_path(&self.source.files[0]))];
-        if let Some(d) = self.source.delimiter {
-            args.push(format!("delim = {}", delim_literal(d)));
-        }
-        if let Some(h) = opts.header {
-            args.push(format!("header = {h}"));
-        }
-        if opts.all_varchar {
-            args.push("all_varchar = true".into());
-        }
-        if opts.ignore_errors {
-            args.push("ignore_errors = true".into());
-        }
-        if let Some(n) = opts.sample_size {
-            args.push(format!("sample_size = {n}"));
-        }
-        let call = format!("sniff_csv({})", args.join(", "));
+    fn sniff_csv(&self, file: &Path, opts: &OpenOptions) -> Result<CsvSniff> {
+        sniff_csv_on(&self.conn, file, self.source.delimiter, opts)
+    }
 
-        // The field `Columns` holds one structure for each column. The call to
-        // unnest makes one row for each of them, and the dialect repeats on
-        // every row. One statement therefore runs the sniffer one time.
-        let mut stmt = self.conn.prepare(&format!(
-            "SELECT coalesce(Delimiter, ''), coalesce(Quote, ''), coalesce(Escape, ''), \
-                    coalesce(NewLineDelimiter, ''), coalesce(SkipRows, 0)::BIGINT, \
-                    coalesce(HasHeader, false), coalesce(DateFormat, ''), \
-                    coalesce(TimestampFormat, ''), coalesce(Prompt, ''), \
-                    coalesce(Comment, ''), col.name, col.type \
-             FROM (SELECT Delimiter, Quote, Escape, NewLineDelimiter, SkipRows, HasHeader, \
-                          DateFormat, TimestampFormat, Prompt, Comment, unnest(Columns) AS col \
-                   FROM {call})"
-        ))?;
-        let mut rows = stmt.query([])?;
-        let mut out: Option<CsvSniff> = None;
-        while let Some(r) = rows.next()? {
-            let sniff = match &mut out {
-                Some(s) => s,
-                None => out.insert(CsvSniff {
-                    meta: CsvMeta {
-                        delimiter: r.get(0)?,
-                        quote: r.get(1)?,
-                        escape: r.get(2)?,
-                        new_line: r.get(3)?,
-                        skip_rows: r.get(4)?,
-                        has_header: r.get(5)?,
-                        date_format: r.get(6)?,
-                        timestamp_format: r.get(7)?,
-                        prompt: r.get(8)?,
-                    },
-                    comment: r.get(9)?,
-                    columns: Vec::new(),
-                }),
-            };
-            sniff.columns.push((r.get(10)?, r.get(11)?));
+    /// Gives `true` when the sniffer finds the dialect and the columns of
+    /// `first` in each other file of the set.
+    ///
+    /// Each thread uses a connection of its own to the same database, and it
+    /// examines one part of the files. The first difference stops each thread.
+    fn set_agrees(&self, first: &CsvSniff, opts: &OpenOptions) -> bool {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let rest = &self.source.files[1..];
+        if rest.is_empty() {
+            return true;
         }
-        out.ok_or_else(|| anyhow::anyhow!("the CSV sniffer found no column"))
+        let cap = opts.threads.unwrap_or(SNIFF_THREADS).clamp(1, SNIFF_THREADS);
+        let chunk = rest.len().div_ceil(cap.min(rest.len()));
+        let delimiter = self.source.delimiter;
+        let differ = AtomicBool::new(false);
+        let mut conns = Vec::new();
+        for _ in rest.chunks(chunk) {
+            match self.conn.try_clone() {
+                Ok(c) => conns.push(c),
+                Err(_) => return false,
+            }
+        }
+        std::thread::scope(|scope| {
+            for (part, conn) in rest.chunks(chunk).zip(conns) {
+                let differ = &differ;
+                scope.spawn(move || {
+                    for f in part {
+                        if differ.load(Ordering::Relaxed) {
+                            return;
+                        }
+                        let same = sniff_csv_on(&conn, f, delimiter, opts)
+                            .is_ok_and(|other| first.same_as(&other));
+                        if !same {
+                            differ.store(true, Ordering::Relaxed);
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        !differ.load(Ordering::Relaxed)
     }
 
     /// Writes the columns that Peruse read into the `read_json` call.
@@ -1389,8 +1423,9 @@ impl Engine {
     /// Asks the DuckDB sniffer for the dialect of a CSV file.
     ///
     /// The open operation asks the sniffer already, and it keeps the answer. The
-    /// panel therefore waits for nothing. A set of CSV files has no such answer,
-    /// and this function then asks the sniffer about the first file of the set.
+    /// panel therefore waits for nothing. A set of CSV files whose files differ
+    /// has no such answer, and this function then asks the sniffer about the
+    /// first file of the set.
     fn csv_meta(&self) -> Result<CsvMeta> {
         if let Some(m) = &self.csv_dialect {
             return Ok(m.clone());
@@ -2048,6 +2083,74 @@ fn sniffed_char(v: &str) -> &str {
     if v == "(empty)" { "" } else { v }
 }
 
+/// Asks the DuckDB sniffer for the dialect and the columns of one CSV file.
+///
+/// The sniffer gets the same options as the read call. The two therefore agree
+/// about the file. The function takes the connection, because
+/// [`Engine::set_agrees`] calls it on more than one connection at a time.
+fn sniff_csv_on(
+    conn: &Connection,
+    file: &Path,
+    delimiter: Option<char>,
+    opts: &OpenOptions,
+) -> Result<CsvSniff> {
+    let mut args = vec![quote_str(&db_path(file))];
+    if let Some(d) = delimiter {
+        args.push(format!("delim = {}", delim_literal(d)));
+    }
+    if let Some(h) = opts.header {
+        args.push(format!("header = {h}"));
+    }
+    if opts.all_varchar {
+        args.push("all_varchar = true".into());
+    }
+    if opts.ignore_errors {
+        args.push("ignore_errors = true".into());
+    }
+    if let Some(n) = opts.sample_size {
+        args.push(format!("sample_size = {n}"));
+    }
+    let call = format!("sniff_csv({})", args.join(", "));
+
+    // The field `Columns` holds one structure for each column. The call to
+    // unnest makes one row for each of them, and the dialect repeats on
+    // every row. One statement therefore runs the sniffer one time.
+    let mut stmt = conn.prepare(&format!(
+        "SELECT coalesce(Delimiter, ''), coalesce(Quote, ''), coalesce(Escape, ''), \
+                coalesce(NewLineDelimiter, ''), coalesce(SkipRows, 0)::BIGINT, \
+                coalesce(HasHeader, false), coalesce(DateFormat, ''), \
+                coalesce(TimestampFormat, ''), coalesce(Prompt, ''), \
+                coalesce(Comment, ''), col.name, col.type \
+         FROM (SELECT Delimiter, Quote, Escape, NewLineDelimiter, SkipRows, HasHeader, \
+                      DateFormat, TimestampFormat, Prompt, Comment, unnest(Columns) AS col \
+               FROM {call})"
+    ))?;
+    let mut rows = stmt.query([])?;
+    let mut out: Option<CsvSniff> = None;
+    while let Some(r) = rows.next()? {
+        let sniff = match &mut out {
+            Some(s) => s,
+            None => out.insert(CsvSniff {
+                meta: CsvMeta {
+                    delimiter: r.get(0)?,
+                    quote: r.get(1)?,
+                    escape: r.get(2)?,
+                    new_line: r.get(3)?,
+                    skip_rows: r.get(4)?,
+                    has_header: r.get(5)?,
+                    date_format: r.get(6)?,
+                    timestamp_format: r.get(7)?,
+                    prompt: r.get(8)?,
+                },
+                comment: r.get(9)?,
+                columns: Vec::new(),
+            }),
+        };
+        sniff.columns.push((r.get(10)?, r.get(11)?));
+    }
+    out.ok_or_else(|| anyhow::anyhow!("the CSV sniffer found no column"))
+}
+
 /// Writes the `read_csv` call that reads the file with the dialect and the
 /// columns that the sniffer found.
 ///
@@ -2571,17 +2674,44 @@ mod tests {
     }
 
     #[test]
-    fn a_set_of_csv_files_keeps_the_read_call_that_finds_the_columns() {
-        // Two files of one set can hold different columns, and `union_by_name`
-        // reads each file with its own columns. One column list cannot serve
-        // them all.
+    fn a_set_of_csv_files_with_the_same_columns_gets_a_read_call_with_no_sniffer() {
+        // Each file of the set has the same dialect and the same columns, so one
+        // pinned call reads them all, and no statement examines the files again.
         let d = tmpdir("pin-csv-multi");
-        write_csv(&d, "a.csv", "id\n1\n2\n");
-        write_csv(&d, "b.csv", "id\n3\n");
+        write_csv(&d, "a.csv", "id,name\n1,x\n2,y\n");
+        write_csv(&d, "b.csv", "id,name\n3,z\n");
         let pattern = format!("{}/*.csv", d.to_string_lossy());
         let e = Engine::open(&pattern, &OpenOptions::default()).unwrap();
-        assert!(!e.scan_expr.contains("auto_detect = false"), "{}", e.scan_expr);
+        assert!(e.scan_expr.contains("auto_detect = false"), "{}", e.scan_expr);
+        assert!(!e.scan_expr.contains("union_by_name"), "{}", e.scan_expr);
         assert_eq!(e.count(&View::default()).unwrap(), 3);
+        let schema = e.base_schema().clone();
+        let page = e.page(&View::default(), &schema, 10, 0).unwrap();
+        let ids: Vec<&str> = (0..page.nrows).map(|r| page.cell(r, 0).unwrap()).collect();
+        assert_eq!(ids, ["1", "2", "3"]);
+        assert_eq!(page.cell(2, 1), Some("z"));
+        assert_eq!(e.file_meta().unwrap().csv.unwrap().delimiter, ",");
+    }
+
+    #[test]
+    fn a_set_of_csv_files_that_differ_keeps_the_read_call_that_finds_the_columns() {
+        // Two files of one set can hold different columns, a different order of
+        // the columns or a different type, and `union_by_name` reads each file
+        // with its own columns. One column list cannot serve them all.
+        for (tag, b) in [
+            ("names", "id,other\n3,z\n"),
+            ("order", "name,id\nz,3\n"),
+            ("types", "id,name\n3.5,z\n"),
+        ] {
+            let d = tmpdir(&format!("pin-csv-differ-{tag}"));
+            write_csv(&d, "a.csv", "id,name\n1,x\n2,y\n");
+            write_csv(&d, "b.csv", b);
+            let pattern = format!("{}/*.csv", d.to_string_lossy());
+            let e = Engine::open(&pattern, &OpenOptions::default()).unwrap();
+            assert!(!e.scan_expr.contains("auto_detect = false"), "{tag}: {}", e.scan_expr);
+            assert!(e.scan_expr.contains("union_by_name"), "{tag}: {}", e.scan_expr);
+            assert_eq!(e.count(&View::default()).unwrap(), 3, "{tag}");
+        }
     }
 
     #[test]

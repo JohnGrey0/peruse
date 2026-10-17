@@ -65,9 +65,9 @@ The function `Engine::open` does these steps:
 8. It runs `CREATE OR REPLACE VIEW src AS SELECT * FROM <read expression>`.
 9. It reads the schema, and it keeps that schema. An error therefore comes
    here, and not at the first scroll.
-10. For a CSV file or a JSON file of one file, it writes the columns into the
-    read call. See [One examination of a file of
-    text](#one-examination-of-a-file-of-text).
+10. For a CSV file, for a set of CSV files that agree, and for a JSON file of one
+    file, it writes the columns into the read call. See [One examination of a
+    file of text](#one-examination-of-a-file-of-text).
 
 The engine changes each backslash in a path to a forward slash. DuckDB accepts
 a forward slash on each platform. In a glob pattern, DuckDB reads a backslash
@@ -174,9 +174,18 @@ the columns of the sniffer. `pin_json` points the view back at the call that
 worked in the same cases. The engine then uses the call with `auto_detect`,
 which is the call that Peruse used before this step existed.
 
-A set of files keeps the call with `auto_detect`. A set needs `union_by_name`,
-and two files of one set can hold different columns, so one column list cannot
-serve them all.
+A set of CSV files gets the pinned call too, when the sniffer finds the same
+dialect and the same columns, in the same order and with the same types, in each
+file of the set. The open operation asks the sniffer about each file one time,
+on up to 8 threads at the same time. Without the pinned call, `union_by_name`
+examines each file of the set again for every statement: over 500 small CSV
+files, one window of 550 rows cost 494 ms, and it costs 42 ms with the pinned
+call. The count fell from 636 ms to 152 ms, and the open operation from 838 ms
+to 618 ms.
+
+A set whose files differ keeps the call with `auto_detect` and `union_by_name`,
+because one column list cannot serve files with different columns. A set of
+JSON files also keeps that call.
 
 ### The two read expressions
 

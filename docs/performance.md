@@ -130,9 +130,18 @@ Two more gains come from that one call:
   cost four seconds, and the engine made that call for each request. The open
   operation reads the schema one time and keeps it in `base_schema`.
 
-A set of files keeps the call with `auto_detect`. A set needs `union_by_name`,
-and two files of one set can hold different columns, so one column list cannot
-serve them all.
+A set of CSV files gets the pinned call too, when the sniffer finds the same
+dialect and the same columns, in the same order and with the same types, in each
+file of the set. The open operation asks the sniffer about each file one time,
+on up to 8 threads at the same time. Without the pinned call, `union_by_name`
+examines each file of the set again for every statement: over 500 small CSV
+files, one window of 550 rows cost 494 ms, and it costs 42 ms with the pinned
+call. The count fell from 636 ms to 152 ms, and the open operation from 838 ms
+to 618 ms.
+
+A set whose files differ keeps the call with `auto_detect` and `union_by_name`,
+because one column list cannot serve files with different columns. A set of
+JSON files also keeps that call.
 
 ## Decision 5: keep the user interface thread free
 
