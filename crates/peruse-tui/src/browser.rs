@@ -530,11 +530,40 @@ fn entry_of(path: &Path, is_recent: bool) -> Entry {
 
 /// Writes a path in a short form, with the home directory as `~`.
 fn short_path(p: &Path) -> String {
-    let full = p.to_string_lossy().replace('\\', "/");
-    if let Some(home) = peruse_core::dirs::home_dir() {
-        let h = home.to_string_lossy().replace('\\', "/");
-        if let Some(rest) = full.strip_prefix(&h) {
-            return format!("~{rest}");
+    short_path_in(p, peruse_core::dirs::home_dir().as_deref())
+}
+
+/// Writes a path in a short form, with the directory `home` as `~`.
+///
+/// On Windows, `std::fs::canonicalize` gives a verbatim path, which starts with
+/// `\\?\`. The title must show the plain form, and `tidy_path` gives it. Each
+/// move into a directory goes through `canonicalize`, so without this rule the
+/// title showed `//?/C:/...` after the first move.
+///
+/// The home directory becomes `~` only at a separator. A directory whose name
+/// starts with the name of the home directory is not inside it: `/home/john`
+/// is not inside `/home/jo`.
+fn short_path_in(p: &Path, home: Option<&Path>) -> String {
+    let full = peruse_core::source::tidy_path(p);
+    if let Some(home) = home {
+        let h = peruse_core::source::tidy_path(home);
+        let h = h.trim_end_matches('/');
+        // Windows does not care about the case of the letters in a path, and
+        // the shell can give the current directory in another case than the
+        // environment gives the home directory.
+        let same = |a: &str, b: &str| {
+            if cfg!(windows) {
+                a.eq_ignore_ascii_case(b)
+            } else {
+                a == b
+            }
+        };
+        if !h.is_empty()
+            && full.is_char_boundary(h.len())
+            && same(&full[..h.len()], h)
+            && (full.len() == h.len() || full[h.len()..].starts_with('/'))
+        {
+            return format!("~{}", &full[h.len()..]);
         }
     }
     full
@@ -1155,6 +1184,50 @@ mod tests {
         assert!(b.find.is_empty());
         b.on_key(&key(KeyCode::Char('q')));
         assert!(b.quit);
+    }
+
+    #[test]
+    fn a_short_path_puts_a_tilde_for_the_home_directory_at_a_separator_only() {
+        let home = Path::new("/home/jo");
+        assert_eq!(short_path_in(Path::new("/home/jo"), Some(home)), "~");
+        assert_eq!(short_path_in(Path::new("/home/jo/data"), Some(home)), "~/data");
+        // A directory whose name starts with the name of the home directory
+        // is not inside the home directory. The title showed `~hn/data`.
+        assert_eq!(
+            short_path_in(Path::new("/home/john/data"), Some(home)),
+            "/home/john/data"
+        );
+        assert_eq!(short_path_in(Path::new("/tmp"), None), "/tmp");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_short_path_drops_the_verbatim_start_that_canonicalize_gives() {
+        // On Windows, `std::fs::canonicalize` gives `\\?\C:\...`. The title
+        // bar showed `//?/C:/...` after each move into a directory, and the
+        // home directory never became `~` there.
+        let home = Path::new(r"C:\Users\jo");
+        assert_eq!(
+            short_path_in(Path::new(r"\\?\C:\Users\jo\data"), Some(home)),
+            "~/data"
+        );
+        assert_eq!(short_path_in(Path::new(r"\\?\D:\data"), Some(home)), "D:/data");
+        assert_eq!(short_path_in(Path::new(r"C:\Users\jo\data"), Some(home)), "~/data");
+        assert_eq!(
+            short_path_in(Path::new(r"\\?\UNC\host\share\data"), Some(home)),
+            "//host/share/data"
+        );
+    }
+
+    #[test]
+    fn the_title_never_shows_a_verbatim_path_after_a_move() {
+        // A move into a directory canonicalizes the path, and on Windows that
+        // gives a verbatim path. The title must show the plain form.
+        let d = sample_dir("verbatim");
+        let mut b = Browser::new(d, &Config::default());
+        b.on_key(&key(KeyCode::Char('h')));
+        let shown = b.where_text();
+        assert!(!shown.contains("?/"), "the title shows {shown}");
     }
 
     #[test]
