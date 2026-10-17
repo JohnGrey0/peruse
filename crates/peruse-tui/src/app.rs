@@ -1051,6 +1051,10 @@ pub struct App {
     pub help_scroll: u16,
     /// The position of the selected theme in the theme picker.
     pub theme_sel: usize,
+    /// `true` when the settings page opened the theme picker. The picker then
+    /// goes back to the settings page when it closes, and not to the grid, as
+    /// the cell inspector goes back to the record view.
+    picker_from_settings: bool,
 
     /// `true` when the engine can go directly to any row.
     pub seekable: bool,
@@ -1183,6 +1187,7 @@ impl App {
             palette_sel: 0,
             help_scroll: 0,
             theme_sel: 0,
+            picker_from_settings: false,
 
             seekable: opened.seekable,
             indexing: false,
@@ -2234,7 +2239,7 @@ impl App {
             // or a click outside would keep a theme that the user only looked at.
             Mode::ThemePicker => {
                 self.theme = self.themes[self.theme_idx.min(self.themes.len() - 1)].clone();
-                self.mode = Mode::Normal;
+                self.mode = self.after_picker();
             }
             // The cell inspector can come from the record view. Leaving it gives
             // the record back, and not the grid.
@@ -2440,13 +2445,18 @@ impl App {
 
     /// Moves the grid for a turn of the wheel. Gives `true` when the event was
     /// a turn of the wheel.
+    ///
+    /// A turn at an end of the view moves nothing, and it gives `false`. The
+    /// caller then draws no frame: a user who turns the wheel at the top of the
+    /// file would otherwise draw the same screen again and again.
     fn wheel_grid(&mut self, ev: &MouseEvent) -> bool {
+        let before = (self.cursor_row, self.top_row, self.cursor_col);
         match wheel_of(ev) {
             Wheel::Rows(n) => self.move_rows(n),
             Wheel::Cols(n) => self.move_cols(n),
             Wheel::None => return false,
         }
-        true
+        (self.cursor_row, self.top_row, self.cursor_col) != before
     }
 
     /// Gives one mouse event to the grid.
@@ -2592,7 +2602,7 @@ impl App {
                 // Go back to the theme from the time before the user opened
                 // the picker.
                 self.theme = self.themes[self.theme_idx].clone();
-                self.mode = Mode::Normal;
+                self.mode = self.after_picker();
             }
             KeyCode::Up | KeyCode::Char('k') => {
                 self.theme_preview(self.theme_sel.saturating_sub(1));
@@ -2603,10 +2613,19 @@ impl App {
             KeyCode::Enter => {
                 self.theme_idx = self.theme_sel;
                 self.theme = self.themes[self.theme_idx].clone();
-                self.mode = Mode::Normal;
+                self.mode = self.after_picker();
                 self.remember_theme();
             }
             _ => {}
+        }
+    }
+
+    /// Gives the mode that the theme picker goes back to when it closes.
+    fn after_picker(&mut self) -> Mode {
+        if std::mem::take(&mut self.picker_from_settings) {
+            Mode::Settings
+        } else {
+            Mode::Normal
         }
     }
 
@@ -3814,6 +3833,7 @@ impl App {
             }
             KeyCode::Char('T') => {
                 self.theme_sel = self.theme_idx;
+                self.picker_from_settings = true;
                 self.mode = Mode::ThemePicker;
             }
             _ => {}
@@ -4304,8 +4324,20 @@ impl App {
                 self.mode = Mode::Palette;
             }
             Cmd::Cancel => {
+                // A search asks for its next part as soon as one part
+                // arrives, so the worker can be idle for a moment while the
+                // search still runs. The key must stop the search then too.
+                //
+                // An idle worker gets no interrupt: that would stop the next
+                // request, whatever it is. The part on its way then finishes,
+                // and the test of `App::scan` discards its answer.
+                let searching = self.scan.take().is_some();
                 if self.busy {
                     self.worker.cancel();
+                }
+                if searching {
+                    self.info("search stopped");
+                } else if self.busy {
                     self.info("cancelled");
                 } else if self.panel != Panel::None {
                     self.panel = Panel::None;
@@ -4582,6 +4614,7 @@ impl App {
             }
             Cmd::ThemePicker => {
                 self.theme_sel = self.theme_idx;
+                self.picker_from_settings = false;
                 self.mode = Mode::ThemePicker;
             }
             Cmd::Settings => self.open_settings(),

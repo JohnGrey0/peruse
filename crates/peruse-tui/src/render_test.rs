@@ -3334,3 +3334,59 @@ fn a_key_that_scrolls_back_moves_the_help_at_once_after_the_end() {
         "the wheel at the end of the help asked for a frame"
     );
 }
+
+#[test]
+fn the_theme_picker_of_the_settings_page_goes_back_to_the_settings_page() {
+    use ratatui::crossterm::event::KeyCode;
+    let p = write_sample("picker-from-settings", SAMPLE, "csv");
+    let (mut app, mut term) = open(&p);
+    settle(&mut app, &mut term);
+    app.run(Cmd::Settings);
+    press_char(&mut app, 'T');
+    assert_eq!(app.mode, Mode::ThemePicker);
+    press(&mut app, KeyCode::Esc);
+    assert_eq!(app.mode, Mode::Settings, "Esc left the settings page too");
+    press_char(&mut app, 'T');
+    press(&mut app, KeyCode::Enter);
+    assert_eq!(app.mode, Mode::Settings, "Enter left the settings page too");
+    // The picker from the grid still goes back to the grid.
+    press(&mut app, KeyCode::Esc);
+    app.run(Cmd::ThemePicker);
+    press(&mut app, KeyCode::Esc);
+    assert_eq!(app.mode, Mode::Normal);
+}
+
+#[test]
+fn the_wheel_at_the_top_of_the_file_draws_no_frame() {
+    use ratatui::crossterm::event::{KeyModifiers, MouseEventKind};
+    let p = write_sample("wheel-at-top", SAMPLE, "csv");
+    let (mut app, mut term) = open(&p);
+    settle(&mut app, &mut term);
+    assert!(!wheel(&mut app, MouseEventKind::ScrollUp, KeyModifiers::NONE, 20, 5));
+    assert!(!wheel(&mut app, MouseEventKind::ScrollUp, KeyModifiers::SHIFT, 20, 5));
+    assert!(wheel(&mut app, MouseEventKind::ScrollDown, KeyModifiers::NONE, 20, 5));
+}
+
+#[test]
+fn esc_stops_a_search_between_two_parts() {
+    use peruse_core::Response;
+    let p = write_sample("search-esc-idle", SAMPLE, "csv");
+    let (mut app, mut term) = open(&p);
+    settle(&mut app, &mut term);
+    app.run(Cmd::Search);
+    type_text(&mut app, "erin");
+    press(&mut app, ratatui::crossterm::event::KeyCode::Enter);
+    drop_responses(&app);
+    // The worker has a moment with no work between two parts of a search.
+    app.busy = false;
+    press(&mut app, ratatui::crossterm::event::KeyCode::Esc);
+    assert!(app.status.as_ref().is_some_and(|s| s.text.contains("search stopped")));
+    // The part that was on its way arrives, and it changes nothing.
+    app.on_response(Response::Search {
+        epoch: app.epoch(),
+        hits: vec![4],
+        from: 0,
+        scan: 5,
+    });
+    assert_eq!(app.cursor_row, 0, "a search that Esc stopped moved the cursor");
+}
