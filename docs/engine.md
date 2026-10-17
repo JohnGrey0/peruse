@@ -127,8 +127,10 @@ Two rules stop it:
 - The function `source::json_depth_over` counts the levels with a loop and a
   number, so it can never fill the stack itself. It stops at the first level
   above 128, so a file that is made to be deep costs almost nothing to refuse.
-  It reads 8 MB of the file at the most: a file that nests too deep does so at
-  its start, because each level is one character.
+  It reads twice the number of records that the reader examines, which is
+  `sample_size`, and 20480 when the user gives none. A limit in bytes is not
+  safe: a deep record can come after some megabytes of shallow records. The
+  check reads each file of a set, because the reader examines each of them.
 - The read call also holds `maximum_depth = 128`. The reader then stops at that
   level and gives the value below it as text.
 

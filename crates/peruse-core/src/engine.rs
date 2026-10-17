@@ -502,14 +502,30 @@ impl Engine {
         // level, and a stack that is full is not a fault that Rust can
         // catch. Peruse therefore counts the levels with a loop of its own
         // before it gives the file to that reader.
-        if src.format == Format::Json
-            && source::json_depth_over(&src.files[0], MAX_JSON_DEPTH as usize)
-        {
-            bail!(
-                "{}: this file nests deeper than {MAX_JSON_DEPTH} levels.\n\
-                 A file that deep stops the reader of DuckDB, so Peruse does not open it.",
-                src.label
-            );
+        //
+        // The reader examines each file of a set, so each file needs the
+        // check, and not the first file only. It examines `sample_size`
+        // records of each file, and the value -1 means the whole file.
+        if src.format == Format::Json {
+            let records = match opts.sample_size {
+                None => Some(source::JSON_SAMPLE_RECORDS),
+                Some(n) if n < 0 => None,
+                Some(n) => Some(n as u64),
+            };
+            if let Some(deep) = src
+                .files
+                .iter()
+                .find(|f| source::json_depth_over(f, MAX_JSON_DEPTH as usize, records))
+            {
+                let name = deep
+                    .file_name()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| src.label.clone());
+                bail!(
+                    "{name}: this file nests deeper than {MAX_JSON_DEPTH} levels.\n\
+                     A file that deep stops the reader of DuckDB, so Peruse does not open it."
+                );
+            }
         }
 
         let plain = build_read_expr(&src, opts);
@@ -3141,6 +3157,21 @@ mod tests {
         // A second call makes no change.
         e.materialize().unwrap();
         assert_eq!(e.count(&view).unwrap(), 3);
+    }
+
+    #[test]
+    fn a_deep_file_in_a_set_of_json_files_is_refused_and_does_not_crash() {
+        // The reader of DuckDB examines each file of a set. Before this test,
+        // the open checked the first file only, and a deep second file filled
+        // the stack and stopped the whole program with no message.
+        let d = tmpdir("deep-set");
+        write_csv(&d, "a.json", "[{\"a\": 1}]");
+        let deep = format!("[{}1{}]", "{\"a\":".repeat(100_000), "}".repeat(100_000));
+        write_csv(&d, "b.json", &deep);
+        let glob = format!("{}/*.json", d.to_string_lossy());
+        let err = Engine::open(&glob, &OpenOptions::default()).err().expect("the deep set opened");
+        let msg = err.to_string();
+        assert!(msg.contains("b.json") && msg.contains("nests deeper"), "{msg}");
     }
 
     #[test]
