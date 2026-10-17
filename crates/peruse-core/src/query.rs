@@ -379,8 +379,19 @@ impl View {
             CellKind::Number => {
                 parts.push(format!("CAST(min({c}) AS VARCHAR) AS v_min"));
                 parts.push(format!("CAST(max({c}) AS VARCHAR) AS v_max"));
-                parts.push(format!("CAST(avg({c}) AS VARCHAR) AS v_avg"));
-                parts.push(format!("CAST(stddev_samp({c}) AS VARCHAR) AS v_std"));
+                // The mean is a DOUBLE for each type of number. The sum behind
+                // it is not: over a HUGEINT it is a HUGEINT, and three large
+                // values made the whole statement fail with an overflow.
+                parts.push(format!("CAST(avg({c}::DOUBLE) AS VARCHAR) AS v_avg"));
+                // One NaN or one infinite value makes `stddev_samp` fail with
+                // "out of range", and the panel then showed no statistics at
+                // all for the column. A writer such as pandas stores a missing
+                // value of a floating-point column as NaN, so the deviation
+                // leaves those values out. The mean keeps them, so the panel
+                // still shows that such values exist.
+                parts.push(format!(
+                    "CAST(stddev_samp({c}::DOUBLE) FILTER (WHERE isfinite({c}::DOUBLE)) AS VARCHAR) AS v_std"
+                ));
                 parts.push(format!("min({c})::DOUBLE AS lo"));
                 parts.push(format!("max({c})::DOUBLE AS hi"));
             }
@@ -742,7 +753,7 @@ mod tests {
     fn stats_do_not_average_strings() {
         let v = View::default();
         let numeric = v.stats_sql("id", CellKind::Number);
-        assert!(numeric.contains("avg(\"id\")"));
+        assert!(numeric.contains("avg(\"id\"::DOUBLE)"));
         let text = v.stats_sql("name", CellKind::Text);
         assert!(text.contains("NULL AS v_avg"), "no avg() over VARCHAR");
         assert!(text.contains("min(\"name\")"), "but min/max still apply");

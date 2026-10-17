@@ -3837,4 +3837,37 @@ mod tests {
             assert!(e.search(&view, &schema, "zz", 0, 10, 10).is_ok(), "{sql}");
         }
     }
+
+    #[test]
+    fn the_statistics_of_a_column_with_nan_or_a_huge_integer_arrive() {
+        // A writer such as pandas stores a missing floating-point value as
+        // NaN. One NaN made `stddev_samp` fail with "out of range", and the
+        // column inspector showed no statistics at all. A HUGEINT column with
+        // large values made `avg` fail with an overflow in the same way.
+        let d = tmpdir("stats-nan");
+        let p = write_csv(&d, "t.csv", "a\n1\n");
+        let e = Engine::open(p.to_str().unwrap(), &OpenOptions::default()).unwrap();
+        let view = View {
+            base: crate::query::Base::Sql(
+                "SELECT * FROM (VALUES \
+                 (1.0::DOUBLE, 170141183460469231731687303715884105727::HUGEINT), \
+                 ('nan'::DOUBLE, 170141183460469231731687303715884105727::HUGEINT), \
+                 (3.0::DOUBLE, 170141183460469231731687303715884105727::HUGEINT)) v(x, h)"
+                    .into(),
+            ),
+            ..Default::default()
+        };
+        let schema = e.describe(&view).unwrap();
+        let x = e.column_stats(&view, &schema.columns[0], 5).unwrap();
+        assert_eq!(x.n_present, 3);
+        assert_eq!(x.min.as_deref(), Some("1.0"));
+        // The deviation leaves the NaN out, and the mean keeps it.
+        let std: f64 = x.std.as_deref().unwrap().parse().unwrap();
+        assert!((std - 2f64.sqrt()).abs() < 1e-9, "{std}");
+        assert_eq!(x.avg.as_deref(), Some("nan"));
+
+        let h = e.column_stats(&view, &schema.columns[1], 5).unwrap();
+        assert_eq!(h.n_present, 3);
+        assert!(h.avg.is_some());
+    }
 }
