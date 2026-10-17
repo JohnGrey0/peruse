@@ -19,7 +19,7 @@ file on the disk. The function `configure` then sends these settings:
 | `threads` | The option `--threads`, or one thread for each core | It controls the parallel work. |
 | `enable_progress_bar` | `false` | A progress bar would write to the terminal and break the frame. |
 | `preserve_insertion_order` | `true` | The rows must always come back in the order of the file. |
-| `temp_directory` | The temporary directory of the system, plus `peruse` | DuckDB writes here when the data does not fit in memory. |
+| `temp_directory` | The temporary directory of the system, plus `peruse`, plus a name for each engine | DuckDB writes here when the data does not fit in memory. Two engines must never share it, because DuckDB gives the same names to the files of each engine. A process that stops before the engine closes leaves its directory, so the first engine of each process removes the directory of each process that is not alive. |
 | `memory_limit` | The option `--memory-limit`, or the setting `memory_limit`, or one half of the memory of the machine, and three tenths of a machine of 8 GB or less | It limits the memory before DuckDB writes to the disk. |
 | `parquet_metadata_cache` | `true` | DuckDB then reads the footer of a Parquet file one time and keeps the result. |
 
@@ -131,18 +131,16 @@ Two rules stop it:
 - The function `source::json_depth_over` counts the levels with a loop and a
   number, so it can never fill the stack itself. It stops at the first level
   above 128, so a file that is made to be deep costs almost nothing to refuse.
-  It examines the records that the reader examines to find the columns: the
-  first 20,480, or the number of `--sample-size`, or each record for the value
-  -1. A record after those goes into a column that is known already, and it
-  does not fill the stack. A test of the first 8 MB alone was not sufficient: a
-  file with one record of 1 KB on each line held a deep record at line 9,000,
-  and the reader examined it. The function examines each file of a glob too,
-  because the reader examines a part of each file of a set. One deep file of a
-  set stopped the program before this rule.
-
-  A compressed file (`.json.gz`, `.json.zst`) is still open to this fault. The
-  function reads the bytes of the file, and Peruse holds no code to decompress
-  them.
+  It reads twice the number of records that the reader examines, which is
+  `sample_size`, and 20480 when the user gives none. A limit in bytes is not
+  safe: a deep record can come after some megabytes of shallow records. The
+  check reads each file of a set, because the reader examines each of them.
+- The bytes of a compressed file (`.json.gz`, `.json.zst`) are not JSON, and a
+  file of 80 bytes can hold 3000 levels. Peruse holds no decompressor, but
+  DuckDB does. For such a file, `compressed_json_too_deep` reads the same
+  records with `read_json_objects`, which gives each record as text and finds
+  no columns. Then `source::json_text_depth_over` counts the levels of each
+  text with a loop.
 - The read call also holds `maximum_depth = 128`. The reader then stops at that
   level and gives the value below it as text. This limit does not protect the
   part of the reader that finds the columns, so the first rule is necessary.

@@ -139,6 +139,29 @@ impl Config {
         self.recent.truncate(MAX_RECENT);
     }
 
+    /// Puts a file at the top of the list in the settings file at `p`.
+    ///
+    /// The function reads the file again, changes the list, and writes the
+    /// file. It does not write the settings of this session, so a setting that
+    /// another window of Peruse wrote since the start stays in the file.
+    ///
+    /// A file that Peruse cannot read stays as it is, and the function gives
+    /// the reason. The load of such a file gives the built-in settings, and a
+    /// write of those would replace each setting that the user wrote in the
+    /// file. One character wrong in the file would then cost the user the rest
+    /// of it, at the next start, with no request.
+    pub fn remember_file_at(p: &std::path::Path, file: &str) -> Result<(), String> {
+        let (mut on_disk, why) = Config::load_from(p);
+        if let Some(why) = why {
+            return Err(format!("the file has a fault, so nothing was written: {why}"));
+        }
+        if on_disk.recent.first().map(String::as_str) == Some(file) {
+            return Ok(());
+        }
+        on_disk.remember_file(file);
+        on_disk.save_to(p).map(|_| ())
+    }
+
     /// Gives the memory limit in the form that DuckDB takes.
     ///
     /// The text says `GiB`, and the screen says `GB`. The two are the same
@@ -500,6 +523,38 @@ mod tests {
         }
         assert_eq!(c.recent.len(), MAX_RECENT);
         assert_eq!(c.recent[0], format!("file{}.csv", MAX_RECENT + 4));
+    }
+
+    #[test]
+    fn a_settings_file_with_a_fault_is_not_replaced_when_a_file_opens() {
+        // Before this test, the start of the program loaded the built-in
+        // settings for a file with one wrong name, and then wrote them back
+        // with the new file in the list. Every other line of the file of the
+        // user was gone.
+        let dir = std::env::temp_dir().join("peruse-config-fault");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("config.toml");
+        let text = "theme = \"nord\"\nthread = 4\nmemory_limit = 8\n";
+        std::fs::write(&p, text).unwrap();
+        let err = Config::remember_file_at(&p, "C:/data/a.csv").unwrap_err();
+        assert!(err.contains("nothing was written"), "{err}");
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), text, "the file changed");
+
+        // A correct file keeps each setting, and the list grows.
+        let text = "theme = \"nord\"\nthreads = 4\n";
+        std::fs::write(&p, text).unwrap();
+        Config::remember_file_at(&p, "C:/data/a.csv").unwrap();
+        let (back, why) = Config::load_from(&p);
+        assert_eq!(why, None);
+        assert_eq!(back.theme.as_deref(), Some("nord"));
+        assert_eq!(back.threads, Some(4));
+        assert_eq!(back.recent, ["C:/data/a.csv"]);
+
+        // A file that is not there becomes a new file.
+        let p = dir.join("new").join("config.toml");
+        Config::remember_file_at(&p, "/data/b.csv").unwrap();
+        assert_eq!(Config::load_from(&p).0.recent, ["/data/b.csv"]);
     }
 
     #[test]

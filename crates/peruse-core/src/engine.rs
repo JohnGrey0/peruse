@@ -312,6 +312,52 @@ fn db_path(p: &Path) -> String {
     p.to_string_lossy().replace('\\', "/")
 }
 
+/// Gives `true` when a compressed JSON file nests deeper than
+/// [`MAX_JSON_DEPTH`] in a record that the reader examines.
+///
+/// The test of [`source::json_depth_over`] reads the bytes of the file, and
+/// the bytes of a compressed file are not JSON. A file of 80 bytes can then
+/// hold 3000 levels, and it stops the program. Peruse holds no decompressor,
+/// but DuckDB does. The function `read_json_objects` gives each record as
+/// text, and it finds no columns, so it does not call itself for each level.
+/// Peruse then counts the levels of each text with a loop.
+///
+/// The function reads twice the records that the reader examines, as
+/// [`source::json_depth_over`] does. A record that DuckDB cannot read gives an
+/// error here. The reader then gives the same error, so the function gives
+/// `false` and lets the reader report it.
+fn compressed_json_too_deep(
+    conn: &Connection,
+    path: &Path,
+    records: Option<u64>,
+    ignore_errors: bool,
+) -> bool {
+    let mut sql = format!("SELECT json FROM read_json_objects({}", quote_str(&db_path(path)));
+    if ignore_errors {
+        // The reader then skips a bad record and examines the records after
+        // it. This read must examine the same records.
+        sql.push_str(", ignore_errors = true");
+    }
+    sql.push(')');
+    if let Some(n) = records {
+        sql.push_str(&format!(" LIMIT {}", n.saturating_mul(2).max(1)));
+    }
+    let Ok(mut stmt) = conn.prepare(&sql) else {
+        return false;
+    };
+    let Ok(mut rows) = stmt.query([]) else {
+        return false;
+    };
+    while let Ok(Some(row)) = rows.next() {
+        if let Ok(Some(text)) = row.get::<_, Option<String>>(0)
+            && source::json_text_depth_over(text.as_bytes(), MAX_JSON_DEPTH as usize)
+        {
+            return true;
+        }
+    }
+    false
+}
+
 /// Turns the message of a failed open into a message that names the options of
 /// Peruse.
 ///
@@ -510,31 +556,31 @@ impl Engine {
         // catch. Peruse therefore counts the levels with a loop of its own
         // before it gives the file to that reader.
         //
-        // Each file of a set needs the test. The reader examines a part of each
-        // file of a set to find its columns, and one deep file of a glob
-        // stopped the program as surely as one deep file alone.
-        //
-        // The test examines the records that the reader examines: the number
-        // of `--sample-size`, and each record for the value -1.
-        let sample = match opts.sample_size {
-            None => Some(source::JSON_SAMPLE_RECORDS),
-            Some(n) if n < 0 => None,
-            Some(n) => Some(n.max(1) as u64),
-        };
-        if src.format == Format::Json
-            && let Some(deep) = src
-                .files
-                .iter()
-                .find(|f| source::json_depth_over(f, MAX_JSON_DEPTH as usize, sample))
-        {
-            let name = deep
-                .file_name()
-                .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_else(|| src.label.clone());
-            bail!(
-                "{name}: this file nests deeper than {MAX_JSON_DEPTH} levels.\n\
-                 A file that deep stops the reader of DuckDB, so Peruse does not open it."
-            );
+        // The reader examines each file of a set, so each file needs the
+        // check, and not the first file only. It examines `sample_size`
+        // records of each file, and the value -1 means the whole file.
+        if src.format == Format::Json {
+            let records = match opts.sample_size {
+                None => Some(source::JSON_SAMPLE_RECORDS),
+                Some(n) if n < 0 => None,
+                Some(n) => Some(n as u64),
+            };
+            if let Some(deep) = src.files.iter().find(|f| {
+                if source::is_compressed(f) {
+                    compressed_json_too_deep(&conn, f, records, opts.ignore_errors)
+                } else {
+                    source::json_depth_over(f, MAX_JSON_DEPTH as usize, records)
+                }
+            }) {
+                let name = deep
+                    .file_name()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| src.label.clone());
+                bail!(
+                    "{name}: this file nests deeper than {MAX_JSON_DEPTH} levels.\n\
+                     A file that deep stops the reader of DuckDB, so Peruse does not open it."
+                );
+            }
         }
 
         let plain = build_read_expr(&src, opts);
@@ -1667,7 +1713,7 @@ fn configure(conn: &Connection, opts: &OpenOptions) -> Result<()> {
             .map(|n| n.get())
             .unwrap_or(4)
     });
-    let tmp = std::env::temp_dir().join("peruse");
+    let tmp = temp_dir_for_engine();
     // The two extension options are necessary for the read-only promise.
     //
     // The bundled DuckDB build sets `autoinstall` and `autoload` to true. A
@@ -1706,6 +1752,76 @@ fn configure(conn: &Connection, opts: &OpenOptions) -> Result<()> {
     // failure here is not an error.
     let _ = conn.execute_batch("SET parquet_metadata_cache = true;");
     Ok(())
+}
+
+/// Gives a temporary directory that belongs to one engine only.
+///
+/// DuckDB names its temporary files with a counter that starts at zero in each
+/// database, such as `duckdb_temp_storage_S256K-0.tmp`. Two engines that share
+/// one directory therefore write their blocks into the same files, and each one
+/// reads the data of the other: the result is wrong rows, or a crash. When an
+/// engine closes, DuckDB also deletes each `duckdb_temp_` file in the
+/// directory, and the files of the other engine go with them. Two Peruse
+/// windows on two large files are enough to cause this.
+///
+/// Each engine therefore gets a directory of its own below the directory
+/// `peruse` in the temporary directory of the system. DuckDB makes that
+/// directory only when a query writes to the disk, and it deletes it when the
+/// engine closes. Peruse makes the parent, because DuckDB makes one level only.
+///
+/// A process that stops before the engine closes leaves its directory, with
+/// each block in it. A kill during a large sort can leave some gigabytes. The
+/// first engine of each process therefore removes each directory of a process
+/// that is not alive. Refer to [`remove_dirs_of_ended_engines`].
+fn temp_dir_for_engine() -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    static CLEAN: std::sync::Once = std::sync::Once::new();
+    let parent = std::env::temp_dir().join("peruse");
+    // A parent that Peruse cannot make is not a reason to stop. DuckDB then
+    // gives its own message when a query needs the disk.
+    let _ = std::fs::create_dir_all(&parent);
+    CLEAN.call_once(|| remove_dirs_of_ended_engines(&parent, std::process::id(), process_alive));
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    parent.join(format!("{}-{n}", std::process::id()))
+}
+
+/// Removes each directory `<pid>-<n>` below `parent` that no live engine uses.
+///
+/// The function runs before the first engine of this process gets its
+/// directory, so a directory with the number `me` is from an earlier process
+/// that had the same number. A directory of a live process stays: its engine
+/// can need each block in it. A name of another form is not a directory of
+/// Peruse, and it stays.
+fn remove_dirs_of_ended_engines(parent: &Path, me: u32, alive: impl Fn(u32) -> bool) {
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some((pid, n)) = name.to_str().and_then(|s| s.split_once('-')) else {
+            continue;
+        };
+        let (Ok(pid), Ok(_)) = (pid.parse::<u32>(), n.parse::<u64>()) else {
+            continue;
+        };
+        if (pid == me || !alive(pid)) && entry.path().is_dir() {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
+/// Gives `true` when a process with the number `pid` runs now.
+fn process_alive(pid: u32) -> bool {
+    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
+    let pid = Pid::from_u32(pid);
+    let mut sys = System::new();
+    sys.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&[pid]),
+        true,
+        ProcessRefreshKind::nothing(),
+    );
+    sys.process(pid).is_some()
 }
 
 /// Expands a glob pattern, or accepts a path to one file.
@@ -3184,6 +3300,129 @@ mod tests {
         // A second call makes no change.
         e.materialize().unwrap();
         assert_eq!(e.count(&view).unwrap(), 3);
+    }
+
+    #[test]
+    fn a_deep_file_in_a_set_of_json_files_is_refused_and_does_not_crash() {
+        // The reader of DuckDB examines each file of a set. Before this test,
+        // the open checked the first file only, and a deep second file filled
+        // the stack and stopped the whole program with no message.
+        let d = tmpdir("deep-set");
+        write_csv(&d, "a.json", "[{\"a\": 1}]");
+        let deep = format!("[{}1{}]", "{\"a\":".repeat(100_000), "}".repeat(100_000));
+        write_csv(&d, "b.json", &deep);
+        let glob = format!("{}/*.json", d.to_string_lossy());
+        let err = Engine::open(&glob, &OpenOptions::default()).err().expect("the deep set opened");
+        let msg = err.to_string();
+        assert!(msg.contains("b.json") && msg.contains("nests deeper"), "{msg}");
+    }
+
+    #[test]
+    fn a_deep_compressed_json_file_is_refused_and_does_not_crash() {
+        // The depth test read the bytes of the file, and the bytes of a
+        // compressed file are not JSON. Before this test, a file of 77 bytes
+        // with 3000 levels filled the stack and stopped the whole program.
+        let d = tmpdir("deep-gz");
+        let conn = Connection::open_in_memory().unwrap();
+        let write = |name: &str, levels: usize| {
+            let p = db_path(&d.join(name));
+            conn.execute_batch(&format!(
+                "COPY (SELECT (repeat('{{\"a\":', {levels}) || '1' || repeat('}}', {levels}))::JSON AS j \
+                 FROM range(3)) TO {} (FORMAT json, COMPRESSION gzip)",
+                quote_str(&p)
+            ))
+            .unwrap();
+            p
+        };
+        let deep = write("deep.ndjson.gz", 3000);
+        let err = Engine::open(&deep, &OpenOptions::default()).err().expect("the deep file opened");
+        assert!(err.to_string().contains("nests deeper"), "{err}");
+
+        // A compressed file of usual depth still opens, and a deep file in a
+        // set of them is still found.
+        let flat = write("flat.ndjson.gz", 20);
+        let e = Engine::open(&flat, &OpenOptions::default()).unwrap();
+        assert_eq!(e.count(&View::default()).unwrap(), 3);
+        let glob = format!("{}/*.ndjson.gz", db_path(&d));
+        let err = Engine::open(&glob, &OpenOptions::default()).err().expect("the deep set opened");
+        assert!(err.to_string().contains("deep.ndjson.gz"), "{err}");
+    }
+
+    #[test]
+    fn the_blocks_of_a_process_that_stopped_are_removed() {
+        // A kill during a large sort left 1.5 GB below the temporary
+        // directory, and nothing removed it.
+        let d = tmpdir("temp-left");
+        for name in ["100-0", "100-1", "200-0", "300-2", "notes", "7-x"] {
+            std::fs::create_dir_all(d.join(name)).unwrap();
+            std::fs::write(d.join(name).join("duckdb_temp_storage_S256K-0.tmp"), "b").unwrap();
+        }
+        std::fs::write(d.join("400-0"), "a file and not a directory").unwrap();
+        // The process 200 is alive. This process is 300.
+        remove_dirs_of_ended_engines(&d, 300, |pid| pid == 200);
+        let mut left: Vec<String> = std::fs::read_dir(&d)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(left, ["200-0", "400-0", "7-x", "notes"]);
+
+        assert!(process_alive(std::process::id()), "this process is alive");
+    }
+
+    #[test]
+    fn two_engines_do_not_share_a_temporary_directory() {
+        // Each DuckDB names its temporary files with a counter that starts at
+        // zero, such as `duckdb_temp_storage_S256K-0.tmp`. Two engines that
+        // share one directory therefore write into the same file, and each one
+        // reads the blocks of the other. When one of them closes, it also
+        // deletes each `duckdb_temp_` file in the directory, and the other
+        // engine loses its data.
+        //
+        // The test makes both engines write to the disk, and then checks that
+        // each one reads back its own rows.
+        let d = tmpdir("temp-share");
+        let p = write_csv(&d, "s.csv", SAMPLE);
+        let opts = OpenOptions {
+            memory_limit: Some("64MB".into()),
+            threads: Some(2),
+            ..Default::default()
+        };
+        let a = Engine::open(p.to_str().unwrap(), &opts).unwrap();
+        let b = Engine::open(p.to_str().unwrap(), &opts).unwrap();
+        let dir = |e: &Engine| e.current_setting("temp_directory").unwrap();
+
+        // About 250 MB for each engine, with a limit of 64 MB: most of each
+        // table goes to the disk.
+        let fill = |e: &Engine, add: i64| {
+            e.conn
+                .execute_batch(&format!(
+                    "CREATE TABLE big AS SELECT range + {add} AS i, \
+                     repeat(md5((range + {add})::VARCHAR), 4) AS h FROM range(1500000)"
+                ))
+                .unwrap();
+        };
+        fill(&a, 0);
+        fill(&b, 10_000_000);
+        let sums = |e: &Engine| -> (i64, i64) {
+            e.conn
+                .query_row(
+                    "SELECT sum(i)::BIGINT, \
+                     count(*) FILTER (WHERE h <> repeat(md5(i::VARCHAR), 4))::BIGINT FROM big",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap()
+        };
+        let base: i64 = (0..1_500_000i64).sum();
+        assert_eq!(sums(&a), (base, 0), "the first engine read wrong rows");
+        assert_eq!(sums(&b), (base + 10_000_000 * 1_500_000, 0), "the second engine read wrong rows");
+
+        assert_ne!(dir(&a), dir(&b), "two engines share one temporary directory");
+
+        // The first engine closes. The second engine must keep its data.
+        drop(a);
+        assert_eq!(sums(&b), (base + 10_000_000 * 1_500_000, 0), "the close of one engine broke the other");
     }
 
     #[test]

@@ -4602,3 +4602,105 @@ fn ux_dump_all_screens() {
     }
 }
 
+/// Gives the first cell of the screen that holds a control character.
+///
+/// The backend writes the symbol of each cell to the terminal as it is. A
+/// cell that holds an escape character would therefore send a sequence that
+/// the terminal obeys.
+fn control_cell(term: &Terminal<TestBackend>) -> Option<(u16, u16, String)> {
+    let buf = term.backend().buffer();
+    let a = buf.area;
+    for y in a.top()..a.bottom() {
+        for x in a.left()..a.right() {
+            let s = buf[(x, y)].symbol();
+            if s.chars().any(char::is_control) {
+                return Some((x, y, s.to_string()));
+            }
+        }
+    }
+    None
+}
+
+#[test]
+fn an_escape_sequence_in_the_data_never_reaches_the_terminal() {
+    // A file can hold an escape character in a name, in a value and in a
+    // nested value. Each part of the screen that shows the data must draw it
+    // as a visible character, and an error message that quotes the data too.
+    let body = r#"[{"k\u001b[31m": "v\u001b]0;PWNED\u0007", "n": {"x\u001b[2J": "\u009b31m"}}]"#;
+    let p = write_sample("escape", body, "json");
+    let (mut app, mut term) = open(&p);
+    settle(&mut app, &mut term);
+    assert!(screen(&term).contains("PWNED"), "the value is not on the screen\n{}", screen(&term));
+    assert_eq!(control_cell(&term), None, "grid");
+
+    use ratatui::crossterm::event::KeyCode;
+    for (name, cmd) in [
+        ("metadata", Cmd::ToggleMeta),
+        ("statistics", Cmd::ToggleStats),
+        ("cell", Cmd::InspectCell),
+        ("record", Cmd::Record),
+        ("help", Cmd::Help),
+    ] {
+        app.run(cmd);
+        settle(&mut app, &mut term);
+        assert_eq!(control_cell(&term), None, "{name}\n{}", screen(&term));
+        press(&mut app, KeyCode::Esc);
+        settle(&mut app, &mut term);
+    }
+
+    // DuckDB names the column that it cannot find, and the status line shows
+    // that message.
+    app.run(Cmd::ColRight);
+    app.set_raw_filter("\"q\u{1b}[2J\" = 1");
+    app.run_startup_view();
+    settle(&mut app, &mut term);
+    assert_eq!(control_cell(&term), None, "error\n{}", screen(&term));
+}
+
+#[test]
+fn a_very_small_terminal_never_stops_the_program() {
+    // A user can make the window as small as the system allows, and a tmux
+    // pane can be one row high. Each part of the screen must then draw what
+    // fits, and never index outside the frame.
+    let p = write_sample("tiny", SAMPLE, "csv");
+    let (mut app, mut term) = open(&p);
+    app.config.band = Some("detailed".into());
+    settle(&mut app, &mut term);
+
+    use ratatui::crossterm::event::KeyCode;
+    let sizes = [(0, 0), (1, 1), (2, 1), (1, 3), (3, 2), (8, 3), (12, 4), (20, 2), (30, 6), (200, 3)];
+    let draw_all = |app: &mut App, name: &str| {
+        for (w, h) in sizes {
+            let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                t.draw(|f| ui::draw(f, app, Depth::True)).unwrap();
+                t.draw(|f| ui::draw(f, app, Depth::Indexed256)).unwrap();
+            }));
+            assert!(r.is_ok(), "{name} at {w}x{h} stopped the program");
+        }
+    };
+    draw_all(&mut app, "grid");
+    for (name, cmd) in [
+        ("metadata", Cmd::ToggleMeta),
+        ("statistics", Cmd::ToggleStats),
+        ("help", Cmd::Help),
+        ("palette", Cmd::Palette),
+        ("cell", Cmd::InspectCell),
+        ("record", Cmd::Record),
+        ("settings", Cmd::Settings),
+        ("builder", Cmd::FilterBuild),
+        ("themes", Cmd::ThemePicker),
+        ("filter", Cmd::Filter),
+    ] {
+        app.run(cmd);
+        settle(&mut app, &mut term);
+        draw_all(&mut app, name);
+        press(&mut app, KeyCode::Esc);
+        settle(&mut app, &mut term);
+    }
+    // The panels stay on; draw both together.
+    app.run(Cmd::ToggleMeta);
+    app.run(Cmd::ToggleStats);
+    settle(&mut app, &mut term);
+    draw_all(&mut app, "both panels");
+}

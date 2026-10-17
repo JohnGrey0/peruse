@@ -14,10 +14,10 @@
 use anyhow::Result;
 use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
 use duckdb::InterruptHandle;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::engine::{ColumnBrief, Engine, OpenOptions};
 use crate::meta::FileMeta;
@@ -159,6 +159,27 @@ impl Request {
             Request::Shutdown => 10,
         }
     }
+
+    /// Gives the names of the parts of the screen that wait for the answer.
+    /// A request that a cancel does not stop gives no name.
+    ///
+    /// Each name is the context of an error that a stopped request gives. A
+    /// new view waits for its rows and for its count. The metadata and a
+    /// change of the settings are short work, and the user did not ask to
+    /// lose them, so a cancel lets them run.
+    fn cancel_contexts(&self) -> &'static [&'static str] {
+        match self {
+            Request::SetView { .. } => &["rows", "count"],
+            Request::Page { .. } => &["rows"],
+            Request::Stats { .. } => &["column stats"],
+            Request::Band { .. } => &["column band"],
+            Request::Cell { .. } => &["cell"],
+            Request::RowJson { .. } => &["record"],
+            Request::Search { .. } => &["search"],
+            Request::Index { .. } => &["indexing"],
+            Request::Meta { .. } | Request::Configure { .. } | Request::Shutdown => &[],
+        }
+    }
 }
 
 /// An answer from the worker thread. Each answer carries the epoch of its
@@ -194,6 +215,45 @@ pub enum Response {
     Error { epoch: u64, context: String, message: String },
 }
 
+/// The longest time that the end of the worker waits for the engine thread.
+///
+/// The engine thread stops each statement when it receives an interrupt, so it
+/// ends in some milliseconds. A read that DuckDB cannot interrupt, such as a
+/// read from a network drive that does not answer, can take much longer. The
+/// user asked to quit, so the program then goes without the thread, and the
+/// system stops the thread with the process.
+const SHUTDOWN_WAIT: Duration = Duration::from_secs(2);
+
+/// The longest time that a cancel sends its interrupt again.
+///
+/// A statement that DuckDB cannot interrupt keeps the batch alive. The cancel
+/// then stops after this time, and the user can press Esc again.
+const CANCEL_WAIT: Duration = Duration::from_secs(10);
+
+/// What a cancel and the engine thread share.
+///
+/// DuckDB forgets an interrupt at the start of each statement. One interrupt
+/// therefore stops nothing when it arrives between two statements, and it
+/// stops one request only when the batch holds more. A cancel therefore
+/// counts itself here, and the engine thread does not start a request of a
+/// batch that began before the cancel.
+#[derive(Default)]
+struct Cancel {
+    /// The number of cancels so far.
+    asked: AtomicU64,
+    /// The value of `asked` at the start of the batch that runs now, and
+    /// `None` while the engine thread waits. A cancel sends its interrupt
+    /// with this lock held, so an interrupt can never reach a later batch.
+    batch: Mutex<Option<u64>>,
+}
+
+impl Cancel {
+    fn batch(&self) -> std::sync::MutexGuard<'_, Option<u64>> {
+        // A panic with the lock held leaves a value that is still correct.
+        self.batch.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
 /// What the caller learns when the file opens, before Peruse draws a frame.
 #[derive(Clone, Debug)]
 pub struct Opened {
@@ -213,9 +273,10 @@ pub struct Worker {
     tx: Sender<Request>,
     rx: Receiver<Response>,
     interrupt: Arc<InterruptHandle>,
-    /// Set to `true` when the worker must stop. The thread reads it before each
-    /// request, so a group of requests in the queue does not run to its end.
+    /// `true` after the caller drops the worker. The engine thread then does
+    /// no more requests.
     stop: Arc<AtomicBool>,
+    cancel: Arc<Cancel>,
     handle: Option<thread::JoinHandle<()>>,
 }
 
@@ -233,7 +294,9 @@ impl Worker {
 
         let input = input.to_string();
         let stop = Arc::new(AtomicBool::new(false));
-        let stop_in_thread = Arc::clone(&stop);
+        let stop_flag = Arc::clone(&stop);
+        let cancel = Arc::new(Cancel::default());
+        let cancel_flag = Arc::clone(&cancel);
         let handle = thread::Builder::new()
             .name("peruse-engine".into())
             .spawn(move || {
@@ -256,7 +319,7 @@ impl Worker {
                 if ready_tx.send(Ok((opened, engine.interrupt_handle()))).is_err() {
                     return;
                 }
-                run(&mut engine, &req_rx, &resp_tx, &stop_in_thread);
+                run(&mut engine, &req_rx, &resp_tx, &stop_flag, &cancel_flag);
             })?;
 
         let (opened, interrupt) = ready_rx.recv()??;
@@ -266,6 +329,7 @@ impl Worker {
                 rx: resp_rx,
                 interrupt,
                 stop,
+                cancel,
                 handle: Some(handle),
             },
             opened,
@@ -284,31 +348,56 @@ impl Worker {
         &self.rx
     }
 
-    /// Stops the query that runs now.
+    /// Stops the work that runs now: the statement that runs, the other
+    /// statements of its request, and each request behind it in the batch.
     ///
-    /// The request that stops gives an error, and the user interface shows a
-    /// message about the cancellation.
+    /// Each request that stops gives an error, and the user interface shows a
+    /// message about the cancellation. A request that the caller sends after
+    /// the cancel runs as usual.
+    ///
+    /// The function does not wait. A short thread sends the interrupt again
+    /// until the batch ends, because DuckDB forgets an interrupt at the start
+    /// of each statement.
     pub fn cancel(&self) {
-        self.interrupt.interrupt();
+        let target = self.cancel.asked.fetch_add(1, Ordering::SeqCst) + 1;
+        let cancel = Arc::clone(&self.cancel);
+        let interrupt = Arc::clone(&self.interrupt);
+        let _ = thread::Builder::new().name("peruse-cancel".into()).spawn(move || {
+            let deadline = Instant::now() + CANCEL_WAIT;
+            while Instant::now() < deadline {
+                {
+                    let batch = cancel.batch();
+                    match *batch {
+                        Some(start) if start < target => interrupt.interrupt(),
+                        // The batch ended, or it started after the cancel.
+                        _ => return,
+                    }
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+        });
     }
 }
 
 impl Drop for Worker {
     fn drop(&mut self) {
-        // Tell the thread to start no more requests, and stop the query that
-        // runs now. If that query continues, the join below waits for its end.
+        // The flag stops each request that waits in the batch of the engine
+        // thread. The interrupt stops the statement that runs now.
         self.stop.store(true, Ordering::SeqCst);
         let _ = self.tx.send(Request::Shutdown);
         let Some(h) = self.handle.take() else { return };
-        // One interrupt is not sufficient. DuckDB forgets an interrupt that
-        // arrives between two statements, because each new statement clears
-        // it. The thread can be between two statements of one request, such as
-        // the page and the count of a new view. The next statement then runs to
-        // its end, and on a large file of text that takes some minutes. The
-        // loop therefore interrupts again until the thread stops.
+        // DuckDB forgets an interrupt at the start of each statement. An
+        // interrupt that arrives between two statements of one request
+        // therefore stops nothing, so the loop sends it again until the
+        // thread ends.
+        let deadline = Instant::now() + SHUTDOWN_WAIT;
         while !h.is_finished() {
+            if Instant::now() >= deadline {
+                // Leave the thread. It ends with the process.
+                return;
+            }
             self.interrupt.interrupt();
-            thread::sleep(Duration::from_millis(10));
+            thread::sleep(Duration::from_millis(5));
         }
         let _ = h.join();
     }
@@ -322,18 +411,10 @@ fn coalesce(mut batch: Vec<Request>) -> Vec<Request> {
     // A request from an old view is work with no result, because the user
     // interface discards the response.
     //
-    // Three kinds of request have no connection to the view, so they are the
-    // exceptions:
-    //
-    // * The index builds a table of the row positions of the file. A start
-    //   with `--filter` sends the index request and then changes the view,
-    //   and without this exception the index would never be built at all.
-    // * The metadata describes the file. The user interface asks for it one
-    //   time in a session and then waits for the answer, so a request that
-    //   goes away here leaves the metadata panel and the detail band empty
-    //   until the program stops.
-    // * The settings of DuckDB belong to the connection. A change that goes
-    //   away here is a change that the user made and that has no effect.
+    // The index is the one exception. It builds a table of the row positions
+    // of the file, and that table has no connection to the view. A start with
+    // `--filter` sends the index request and then changes the view, and
+    // without this exception the index would never be built at all.
     let newest = batch.iter().map(Request::epoch).filter(|g| *g != u64::MAX).max();
     if let Some(newest) = newest {
         batch.retain(|r| r.epoch() == newest || !r.follows_the_view());
@@ -350,7 +431,13 @@ fn coalesce(mut batch: Vec<Request>) -> Vec<Request> {
 }
 
 /// The main loop of the worker thread.
-fn run(engine: &mut Engine, rx: &Receiver<Request>, tx: &Sender<Response>, stop: &AtomicBool) {
+fn run(
+    engine: &mut Engine,
+    rx: &Receiver<Request>,
+    tx: &Sender<Response>,
+    stop: &AtomicBool,
+    cancel: &Cancel,
+) {
     loop {
         // Wait for the first request, then take each request behind it. A key
         // that the user holds down therefore does not build a long queue.
@@ -367,17 +454,33 @@ fn run(engine: &mut Engine, rx: &Receiver<Request>, tx: &Sender<Response>, stop:
         if tx.send(Response::Busy(true)).is_err() {
             return;
         }
+        let start = {
+            let mut b = cancel.batch();
+            let start = cancel.asked.load(Ordering::SeqCst);
+            *b = Some(start);
+            start
+        };
         for req in batch {
-            // The owner of the worker went away while this group ran. The
-            // remaining requests have no reader, and each of them can be a
-            // full scan of the file.
             if stop.load(Ordering::SeqCst) {
                 return;
+            }
+            // The user cancelled this batch. Each request that reads the data
+            // gives an error, so the part of the screen that waits for it does
+            // not wait for ever.
+            let contexts = req.cancel_contexts();
+            if cancel.asked.load(Ordering::SeqCst) != start && !contexts.is_empty() {
+                for context in contexts {
+                    if fail(tx, req.epoch(), context, "cancelled").is_err() {
+                        return;
+                    }
+                }
+                continue;
             }
             if handle(engine, req, tx).is_err() {
                 return;
             }
         }
+        *cancel.batch() = None;
         if tx.send(Response::Busy(false)).is_err() {
             return;
         }
@@ -551,46 +654,6 @@ mod tests {
     }
 
     #[test]
-    fn a_metadata_request_survives_a_change_of_the_view() {
-        // The user interface asks for the metadata one time in a session, and
-        // it sets a latch when it asks. A sort that the user starts before the
-        // worker reads the queue changes the epoch. Without this rule, the
-        // request went away, no answer and no error came, and the metadata
-        // panel and the detail band of a Parquet file stayed empty for the
-        // whole session.
-        let out = coalesce(vec![
-            Request::Meta { epoch: 1 },
-            Request::SetView {
-                epoch: 2,
-                view: View::default(),
-                limit: 50,
-            },
-        ]);
-        assert!(
-            out.iter().any(|r| matches!(r, Request::Meta { .. })),
-            "the metadata request went away: {out:?}"
-        );
-        assert_eq!(out.len(), 2);
-    }
-
-    #[test]
-    fn a_change_of_the_settings_survives_a_change_of_the_view() {
-        // The settings belong to the connection, and not to the view.
-        let out = coalesce(vec![
-            Request::Configure {
-                epoch: 1,
-                threads: Some(2),
-                memory_limit: None,
-            },
-            page(2, 0),
-        ]);
-        assert!(
-            out.iter().any(|r| matches!(r, Request::Configure { threads: Some(2), .. })),
-            "the change of the settings went away: {out:?}"
-        );
-    }
-
-    #[test]
     fn a_page_request_from_an_old_view_still_goes_away() {
         let out = coalesce(vec![page(1, 0), page(2, 500)]);
         assert_eq!(out.len(), 1);
@@ -686,6 +749,205 @@ mod tests {
     }
 
     #[test]
+    fn the_end_of_the_program_stops_each_request_in_the_queue() {
+        // The user quits while the worker has a batch of slow requests. One
+        // interrupt stops the statement that runs now, and DuckDB forgets an
+        // interrupt at the start of the next statement. Before this test, the
+        // drop sent one interrupt and then waited for the rest of the batch,
+        // so the program stayed on the screen for each slow request after
+        // the first.
+        let dir = std::env::temp_dir().join("peruse-worker-quit");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.csv");
+        std::fs::write(&path, "id\n1\n").unwrap();
+        let opts = OpenOptions { threads: Some(2), ..OpenOptions::default() };
+        let worker = Worker::spawn(path.to_str().unwrap(), opts).unwrap().0;
+
+        // Each of these statements reads some thousand million rows.
+        let slow = View {
+            base: Base::Sql(
+                "SELECT count(*) AS n FROM range(4000000000) t(i) WHERE hash(i) % 7 = 3".into(),
+            ),
+            ..View::default()
+        };
+        let n = Column::new("n", "BIGINT", false);
+        worker.send(Request::SetView { epoch: 1, view: slow.clone(), limit: 50 });
+        worker.send(Request::Stats { epoch: 1, view: slow.clone(), column: n.clone(), top_k: 0 });
+        worker.send(Request::Band { epoch: 1, view: slow, columns: vec![n], values: true });
+        loop {
+            match worker.responses().recv_timeout(std::time::Duration::from_secs(30)) {
+                Ok(Response::Busy(true)) => break,
+                Ok(_) => {}
+                Err(e) => panic!("the worker did not start: {e}"),
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(300));
+
+        let (done_tx, done_rx) = bounded::<()>(1);
+        std::thread::spawn(move || {
+            drop(worker);
+            let _ = done_tx.send(());
+        });
+        assert!(
+            done_rx.recv_timeout(std::time::Duration::from_secs(8)).is_ok(),
+            "the end of the worker waited for the slow requests"
+        );
+    }
+
+    #[test]
+    fn one_cancel_stops_each_slow_request_of_the_batch() {
+        // The user opens a panel on a large file, and the worker gets a batch
+        // of slow requests. Before this test, Esc sent one interrupt. It
+        // stopped the statement that ran, and each request behind it then ran
+        // to the end, so the user had to press Esc once for each request. An
+        // interrupt between two statements of one request stopped nothing.
+        let dir = std::env::temp_dir().join("peruse-worker-cancel");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.csv");
+        std::fs::write(&path, "id\n1\n").unwrap();
+        let opts = OpenOptions { threads: Some(2), ..OpenOptions::default() };
+        let worker = Worker::spawn(path.to_str().unwrap(), opts).unwrap().0;
+
+        let slow = View {
+            base: Base::Sql(
+                "SELECT count(*) AS n FROM range(4000000000) t(i) WHERE hash(i) % 7 = 3".into(),
+            ),
+            ..View::default()
+        };
+        let n = Column::new("n", "BIGINT", false);
+        worker.send(Request::SetView { epoch: 1, view: slow.clone(), limit: 50 });
+        worker.send(Request::Stats { epoch: 1, view: slow.clone(), column: n.clone(), top_k: 0 });
+        worker.send(Request::Band { epoch: 1, view: slow.clone(), columns: vec![n], values: true });
+        let wait = std::time::Duration::from_secs(30);
+        loop {
+            match worker.responses().recv_timeout(wait) {
+                Ok(Response::Busy(true)) => break,
+                Ok(_) => {}
+                Err(e) => panic!("the worker did not start: {e}"),
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(300));
+
+        worker.cancel();
+        let t0 = std::time::Instant::now();
+        let mut stopped = Vec::new();
+        loop {
+            match worker.responses().recv_timeout(std::time::Duration::from_secs(8)) {
+                Ok(Response::Busy(false)) => break,
+                Ok(Response::Error { context, .. }) => stopped.push(context),
+                Ok(_) => {}
+                Err(_) => panic!("one cancel did not stop the batch; stopped so far: {stopped:?}"),
+            }
+        }
+        assert!(t0.elapsed() < std::time::Duration::from_secs(5), "{:?}", t0.elapsed());
+        assert!(stopped.iter().any(|c| c == "column stats"), "{stopped:?}");
+        assert!(stopped.iter().any(|c| c == "column band"), "{stopped:?}");
+
+        // A request after the cancel runs as usual.
+        let quick = View { base: Base::Sql("SELECT 42 AS n".into()), ..View::default() };
+        worker.send(Request::SetView { epoch: 2, view: quick, limit: 50 });
+        loop {
+            match worker.responses().recv_timeout(wait) {
+                Ok(Response::Count { epoch: 2, total }) => {
+                    assert_eq!(total, 1);
+                    break;
+                }
+                Ok(Response::Error { context, message, .. }) => {
+                    panic!("a request after the cancel failed: {context}: {message}")
+                }
+                Ok(_) => {}
+                Err(e) => panic!("no count after the cancel: {e}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_filter_that_writes_never_reaches_the_engine() {
+        // The front end checks the filter while the user types it. This test
+        // goes past the front end, as a caller of the library can, and the
+        // worker must still refuse the filter. The filter goes into a
+        // `WHERE (...)` part, so the guard for a statement does not see it.
+        let worker = worker_on_csv("filter-guard");
+        worker.send(Request::SetView {
+            epoch: 1,
+            view: View {
+                filter: Some("id IN (DELETE FROM src RETURNING id)".into()),
+                ..View::default()
+            },
+            limit: 50,
+        });
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let mut failure = None;
+        loop {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            match worker.responses().recv_timeout(left) {
+                Ok(Response::Error { context, message, .. }) => {
+                    failure = Some((context, message));
+                }
+                // The worker answers a view that it accepts with these three.
+                // None of them can come, because the guard stops the request
+                // before the worker gives the view to the engine.
+                Ok(Response::Schema { .. } | Response::Page { .. } | Response::Count { .. }) => {
+                    panic!("the worker gave the view to the engine");
+                }
+                Ok(Response::Busy(false)) => break,
+                Ok(_) => {}
+                Err(e) => panic!("the worker gave no answer: {e}"),
+            }
+        }
+
+        // The user sees `context: message` on the status line, so the message
+        // must name the word that Peruse refuses.
+        let (context, message) = failure.expect("the worker accepted a filter that writes");
+        assert_eq!(context, "filter");
+        assert!(message.contains("DELETE"), "{message}");
+        assert!(message.contains("read-only"), "{message}");
+    }
+
+    #[test]
+    fn a_metadata_request_survives_a_change_of_the_view() {
+        // The user interface asks for the metadata one time in a session, and
+        // it sets a latch when it asks. A sort that the user starts before the
+        // worker reads the queue changes the epoch. Without this rule, the
+        // request went away, no answer and no error came, and the metadata
+        // panel and the detail band of a Parquet file stayed empty for the
+        // whole session.
+        let out = coalesce(vec![
+            Request::Meta { epoch: 1 },
+            Request::SetView {
+                epoch: 2,
+                view: View::default(),
+                limit: 50,
+            },
+        ]);
+        assert!(
+            out.iter().any(|r| matches!(r, Request::Meta { .. })),
+            "the metadata request went away: {out:?}"
+        );
+        assert_eq!(out.len(), 2);
+    }
+
+    #[test]
+    fn a_change_of_the_settings_survives_a_change_of_the_view() {
+        // The settings belong to the connection, and not to the view.
+        let out = coalesce(vec![
+            Request::Configure {
+                epoch: 1,
+                threads: Some(2),
+                memory_limit: None,
+            },
+            page(2, 0),
+        ]);
+        assert!(
+            out.iter().any(|r| matches!(r, Request::Configure { threads: Some(2), .. })),
+            "the change of the settings went away: {out:?}"
+        );
+    }
+
+    #[test]
     fn the_end_of_the_worker_stops_each_request_in_the_queue() {
         // Each request here reads one million million rows, which takes some
         // minutes. The end of the worker must not wait for them. A single
@@ -740,49 +1002,5 @@ mod tests {
             done_rx.recv_timeout(std::time::Duration::from_secs(20)).is_ok(),
             "the end of the worker waited for the slow requests in the queue"
         );
-    }
-
-    #[test]
-    fn a_filter_that_writes_never_reaches_the_engine() {
-        // The front end checks the filter while the user types it. This test
-        // goes past the front end, as a caller of the library can, and the
-        // worker must still refuse the filter. The filter goes into a
-        // `WHERE (...)` part, so the guard for a statement does not see it.
-        let worker = worker_on_csv("filter-guard");
-        worker.send(Request::SetView {
-            epoch: 1,
-            view: View {
-                filter: Some("id IN (DELETE FROM src RETURNING id)".into()),
-                ..View::default()
-            },
-            limit: 50,
-        });
-
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-        let mut failure = None;
-        loop {
-            let left = deadline.saturating_duration_since(std::time::Instant::now());
-            match worker.responses().recv_timeout(left) {
-                Ok(Response::Error { context, message, .. }) => {
-                    failure = Some((context, message));
-                }
-                // The worker answers a view that it accepts with these three.
-                // None of them can come, because the guard stops the request
-                // before the worker gives the view to the engine.
-                Ok(Response::Schema { .. } | Response::Page { .. } | Response::Count { .. }) => {
-                    panic!("the worker gave the view to the engine");
-                }
-                Ok(Response::Busy(false)) => break,
-                Ok(_) => {}
-                Err(e) => panic!("the worker gave no answer: {e}"),
-            }
-        }
-
-        // The user sees `context: message` on the status line, so the message
-        // must name the word that Peruse refuses.
-        let (context, message) = failure.expect("the worker accepted a filter that writes");
-        assert_eq!(context, "filter");
-        assert!(message.contains("DELETE"), "{message}");
-        assert!(message.contains("read-only"), "{message}");
     }
 }

@@ -149,7 +149,26 @@ fn parse_delimiter(s: &str) -> Result<char> {
     Ok(c)
 }
 
-fn main() -> Result<()> {
+/// Runs the program, and writes an error in a form that is safe for the
+/// terminal.
+///
+/// The message of an error can hold the data of the file: the CSV reader of
+/// DuckDB quotes the line that it cannot read. A file can therefore put an
+/// escape sequence into the message, and the terminal would obey it. It could
+/// clear the screen, change the title of the window, or write to the clipboard.
+/// The usual `main` that gives a `Result` writes the message as it is, so this
+/// function writes it through [`text::for_terminal`].
+fn main() -> std::process::ExitCode {
+    match run_main() {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("Error: {}", text::for_terminal(&format!("{e:?}")));
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+fn run_main() -> Result<()> {
     let cli = Cli::parse();
 
     if cli.list_themes {
@@ -331,10 +350,10 @@ fn main() -> Result<()> {
 /// to look at a file.
 fn remember_recent(config: &mut Config, file: &str, path: Option<&std::path::Path>) {
     config.remember_file(file);
-    if let Some(p) = path
-        && app::write_blocked(p).is_none()
-    {
-        let _ = config.save_to(p);
+    // The function reads the file again and changes the list only, so a
+    // setting that another window of Peruse wrote since the start stays.
+    if let Some(p) = path {
+        let _ = Config::remember_file_at(p, file);
     }
 }
 
@@ -439,7 +458,16 @@ fn print_ddl(
     let profile = engine
         .profile(&view, &name)
         .with_context(|| format!("measuring {file}"))?;
-    print!("{}", peruse_core::ddl::render(&profile, d));
+    let text = peruse_core::ddl::render(&profile, d);
+    // A name of a column can hold an escape sequence. The statement keeps it
+    // when it goes into a file or a pipe, because the name is part of the
+    // data. A terminal would obey the sequence, so the terminal gets a visible
+    // form of it.
+    if std::io::IsTerminal::is_terminal(&std::io::stdout()) {
+        print!("{}", text::for_terminal(&text));
+    } else {
+        print!("{text}");
+    }
     Ok(())
 }
 

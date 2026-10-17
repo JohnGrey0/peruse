@@ -187,6 +187,13 @@ opens.
 name with a spelling mistake must not pass in silence: the user would then look
 for the reason that the setting does nothing.
 
+**Peruse never writes over a file that it cannot read.** A file with a fault
+gives the built-in settings and a message, and a write of those settings would
+remove each line that the user wrote. Each write therefore reads the file
+again first, and it stops when the file has a fault. That includes the list
+`recent`, which Peruse writes at each start: the function
+`Config::remember_file_at` changes the list in the file and nothing else.
+
 **A test never writes the settings of the user who runs it.** The functions
 `Config::load_from` and `Config::save_to` take a path, and the field
 `App::config_path` holds the one that the program uses. A test points that

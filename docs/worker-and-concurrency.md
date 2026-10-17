@@ -194,6 +194,22 @@ command `Cancel`, and that command calls `Worker::cancel` when the worker is
 busy. The request that stops gives an error, and the user interface shows a
 message about the cancellation.
 
+One interrupt is not sufficient. DuckDB forgets an interrupt at the start of
+each statement, so an interrupt between two statements of one request stops
+nothing. One interrupt also stops one statement only, and the batch can hold
+more requests behind it, each one a full scan. The cancel therefore does two
+things:
+
+- It adds one to a counter. The thread keeps the value of the counter at the
+  start of each batch, and it does not start a request of a batch that began
+  before the cancel. Each such request gives the error `cancelled`, so the
+  part of the screen that waits for it does not wait for ever. The metadata
+  and a change of the settings are short, and they still run.
+- A short thread sends the interrupt again every 5 milliseconds until the
+  batch ends, for 10 seconds at the most. It holds the lock of the batch while
+  it sends, so an interrupt never reaches a request that the user sent after
+  the cancel.
+
 The search also uses this rule. The first search request examines 250,000 rows
 at the most, and each request after it examines two times the rows of the one
 before, up to 4 million. The worker therefore answers quickly at the start, and
@@ -213,14 +229,15 @@ statement after it, and that text is too long for a status line of one row.
 
 The `Drop` code of the `Worker` does these steps:
 
-1. It sets a flag that the thread reads before each request. The thread then
-   starts no other request of the group that it works on.
+1. It sets a flag that the thread reads before each request. A batch of slow
+   requests then stops after the request that runs now.
 2. It sends the request `Shutdown`.
-3. It stops the query that runs now, and it does that again every 10
-   milliseconds until the thread ends. Then it waits for the end of the thread.
-
-One interrupt is not sufficient. DuckDB clears an interrupt when the next
-statement starts, so an interrupt that arrives between two statements has no
-effect. A new view runs three statements, and a group can hold more requests.
-Without the loop, the next statement ran to its end, and the program did not
-stop when the user quit.
+3. It stops the query that runs now, and it does that again every 5
+   milliseconds until the thread ends. DuckDB forgets an interrupt at the start
+   of each statement, so one interrupt between two statements of a request
+   would stop nothing, and the end of the program would wait for the next
+   statement.
+4. It waits for the end of the thread, for 2 seconds at the most. A read that
+   DuckDB cannot interrupt, such as a read from a network drive that does not
+   answer, must not keep the program on the screen after the user quits. The
+   thread then ends with the process.

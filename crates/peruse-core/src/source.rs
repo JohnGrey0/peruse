@@ -279,17 +279,29 @@ pub fn detect(path: &Path) -> (Format, Option<char>, bool) {
     }
 }
 
-/// The number of records that the JSON reader of DuckDB examines to find the
-/// columns, when the user gives no `--sample-size`.
+/// The number of records that the JSON reader of DuckDB examines when the
+/// user gives no `sample_size`.
+///
+/// The reader finds the columns from these records, and that step is the part
+/// that calls itself one time for each level. A record after them goes to a
+/// step that respects `maximum_depth`, so a deep record there gives an error
+/// message and not a crash.
 pub const JSON_SAMPLE_RECORDS: u64 = 20_480;
 
 /// Gives `true` when a JSON file nests deeper than `limit`.
 ///
-/// The reader of DuckDB is a C++ function that calls itself one time for each
-/// level. A file that nests a thousand levels deep therefore fills the stack
-/// of the thread and stops the whole program. A stack that is full is not a
-/// fault that Rust can catch, so Peruse has to see such a file before it
-/// gives the file to the reader.
+/// The reader of DuckDB finds the columns with a C++ function that calls
+/// itself one time for each level, and the option `maximum_depth` does not
+/// stop that function. A file that nests a thousand levels deep therefore
+/// fills the stack of the thread and stops the whole program. A stack that is
+/// full is not a fault that Rust can catch, so Peruse has to see such a file
+/// before it gives the file to the reader.
+///
+/// The value `records` is the number of records that the reader examines, and
+/// `None` means the whole file. The function reads twice that number of
+/// records, so a count that is not exact still covers each record that the
+/// reader examines. A limit in bytes is not safe: a deep record can come after
+/// some megabytes of shallow records, or after one long text.
 ///
 /// The reader goes that deep only in the records that it examines to find the
 /// columns, and those are the first `records` records of the file. A record
@@ -314,18 +326,20 @@ pub fn json_depth_over(path: &Path, limit: usize, records: Option<u64>) -> bool 
         return false;
     };
     let mut buf = vec![0u8; 64 * 1024];
+    let cap = records.map(|n| n.saturating_mul(2).max(1));
 
     let mut depth = 0usize;
     let mut in_string = false;
     let mut escaped = false;
-    // `true` when the file is one list, so that its records are one level
-    // down.
-    let mut in_list = false;
+    // A file that is one list holds one record for each item of the list.
+    // Each other file holds one record for each value at the top.
+    let mut one_list: Option<bool> = None;
     let mut seen = 0u64;
     loop {
         let n = match file.read(&mut buf) {
             Ok(0) => return false,
             Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(_) => return false,
         };
         for &b in &buf[..n] {
@@ -344,8 +358,8 @@ pub fn json_depth_over(path: &Path, limit: usize, records: Option<u64>) -> bool 
             match b {
                 b'"' => in_string = true,
                 b'{' | b'[' => {
-                    if depth == 0 {
-                        in_list = b == b'[';
+                    if depth == 0 && one_list.is_none() {
+                        one_list = Some(b == b'[');
                     }
                     depth += 1;
                     if depth > limit {
@@ -354,9 +368,10 @@ pub fn json_depth_over(path: &Path, limit: usize, records: Option<u64>) -> bool 
                 }
                 b'}' | b']' => {
                     depth = depth.saturating_sub(1);
-                    if depth == 0 || (depth == 1 && in_list) {
+                    let record_end = depth == 0 || (depth == 1 && one_list == Some(true));
+                    if record_end {
                         seen += 1;
-                        if records.is_some_and(|max| seen >= max) {
+                        if cap.is_some_and(|c| seen >= c) {
                             return false;
                         }
                     }
@@ -365,6 +380,49 @@ pub fn json_depth_over(path: &Path, limit: usize, records: Option<u64>) -> bool 
             }
         }
     }
+}
+
+/// Gives `true` when the name of the file ends with `.gz`, `.zst` or `.bz2`.
+///
+/// DuckDB decompresses a file by its extension, and not by its first bytes. A
+/// file of compressed bytes with another name gives a parse failure there.
+pub fn is_compressed(path: &Path) -> bool {
+    effective_extension(path).1
+}
+
+/// Gives `true` when one JSON text nests deeper than `limit`.
+///
+/// This is the test of [`json_depth_over`] for a text in memory. A compressed
+/// file needs it: Peruse cannot decompress the file, so DuckDB reads its
+/// records as text, and this function counts the levels of each one.
+pub fn json_text_depth_over(text: &[u8], limit: usize) -> bool {
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    for &b in text {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match b {
+            b'"' => in_string = true,
+            b'{' | b'[' => {
+                depth += 1;
+                if depth > limit {
+                    return true;
+                }
+            }
+            b'}' | b']' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    false
 }
 
 /// Writes a path in a form that a settings file can hold, and that the system
@@ -608,8 +666,9 @@ mod tests {
         std::fs::write(&p, &body).unwrap();
         assert!(json_depth_over(&p, 128, Some(JSON_SAMPLE_RECORDS)));
         // A record after the sample does not reach the deep part of the
-        // reader, so the test stops at the end of the sample.
-        assert!(!json_depth_over(&p, 128, Some(9_000)));
+        // reader, so the test stops after twice the sample: the margin covers
+        // a count that is not exact.
+        assert!(!json_depth_over(&p, 128, Some(4_000)));
         // The value -1 of `--sample-size` examines each record.
         assert!(json_depth_over(&p, 128, None));
 
@@ -617,7 +676,8 @@ mod tests {
         let list = format!("[{}{{\"a\": {}1{}}}]", "{\"a\": 1},".repeat(10), "[".repeat(200), "]".repeat(200));
         std::fs::write(&p, &list).unwrap();
         assert!(json_depth_over(&p, 128, Some(11)));
-        assert!(!json_depth_over(&p, 128, Some(10)));
+        // Twice a sample of five records ends before the deep item.
+        assert!(!json_depth_over(&p, 128, Some(5)));
     }
 
     #[test]
@@ -637,6 +697,34 @@ mod tests {
         let p = dir.join("escaped.json");
         std::fs::write(&p, format!("[{{\"a\": \"\\\"{}\"}}]", "[".repeat(500))).unwrap();
         assert!(!json_depth_over(&p, 128, Some(JSON_SAMPLE_RECORDS)), "an escaped mark ended the value");
+    }
+
+    #[test]
+    fn a_deep_record_after_many_megabytes_is_still_seen() {
+        // The reader of DuckDB examines a number of records, and not a number
+        // of bytes. Before this test, the function read 8 MB and then stopped,
+        // so a deep record behind 9 MB of shallow records, or behind one long
+        // text, went to the reader and stopped the program.
+        let dir = std::env::temp_dir().join("peruse-depth-far");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let deep = format!("{}1{}", "{\"a\":".repeat(1000), "}".repeat(1000));
+
+        let line = format!("{{\"a\":\"{}\"}}\n", "p".repeat(9000));
+        let p = dir.join("far.ndjson");
+        std::fs::write(&p, format!("{}{deep}\n", line.repeat(1000))).unwrap();
+        assert!(json_depth_over(&p, 128, Some(JSON_SAMPLE_RECORDS)), "a deep line after 9 MB");
+
+        let p = dir.join("long.json");
+        std::fs::write(&p, format!("[{{\"a\":\"{}\"}},{deep}]", "q".repeat(9 << 20))).unwrap();
+        assert!(json_depth_over(&p, 128, Some(JSON_SAMPLE_RECORDS)), "a deep item after a long text");
+
+        // A record that the reader does not examine needs no check. The reader
+        // gives an error for it, and it does not crash.
+        let p = dir.join("late.ndjson");
+        std::fs::write(&p, format!("{}{deep}\n", "{\"a\":1}\n".repeat(100))).unwrap();
+        assert!(!json_depth_over(&p, 128, Some(10)), "a record after twice the sample");
+        assert!(json_depth_over(&p, 128, None), "the whole file must be read for no sample limit");
     }
 
     #[test]
