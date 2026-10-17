@@ -853,6 +853,24 @@ pub struct App {
     pub mode: Mode,
     /// The panel that is open.
     pub panel: Panel,
+    /// The first row of the list of columns that the metadata panel showed in
+    /// the last frame.
+    ///
+    /// The list moves only when the cursor comes near one of its two ends. A
+    /// list that put the cursor in the middle at each move scrolled under the
+    /// eye of the user at each turn of the wheel, and no name stayed still.
+    /// The frame writes this value, so it is a `Cell`.
+    pub meta_list_top: std::cell::Cell<usize>,
+    /// The height of the side pane, and the most rows that the statistics
+    /// panel needed at that height, in the stacked view.
+    ///
+    /// The statistics of a column of numbers need more rows than those of a
+    /// column of text, and the word "computing" needs one row. A panel that took
+    /// only the rows of the column under the cursor moved the border at each
+    /// move, and the list of columns above it jumped up and down. The panel
+    /// therefore keeps the most rows that it needed, and gives them back only
+    /// when the side pane changes its height.
+    pub stats_reserve: std::cell::Cell<(u16, u16)>,
     /// The prompt that has the focus.
     pub input: LineInput,
     /// The message about a bad expression in the prompt.
@@ -1066,6 +1084,8 @@ impl App {
 
             mode: Mode::Normal,
             panel: Panel::None,
+            meta_list_top: std::cell::Cell::new(0),
+            stats_reserve: std::cell::Cell::new((0, 0)),
             input: LineInput::default(),
             prompt_error: None,
             filter_input: LineInput::default(),

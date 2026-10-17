@@ -156,7 +156,16 @@ fn draw_panel(f: &mut Frame, area: Rect, app: &App, p: &Paint) {
             // that its own content needs. A column of numbers asks for four
             // more rows than a column of text, for the chart of the
             // distribution.
-            let (meta, stats) = split_panels(area, panels::stats_content_height(app));
+            //
+            // The line moves up only, to give the statistics the most rows that
+            // a column needed so far: see `App::stats_reserve`. A line that moved at each column
+            // moved the list of columns above it, and the user could not read
+            // the list during a turn of the wheel.
+            let need = panels::stats_content_height(app);
+            let (at_height, most) = app.stats_reserve.get();
+            let most = if at_height == area.height { most.max(need) } else { need };
+            app.stats_reserve.set((area.height, most));
+            let (meta, stats) = split_panels(area, most);
             panels::draw_meta(f.buffer_mut(), meta, app, p);
             panels::draw_stats(f.buffer_mut(), stats, app, p);
         }
