@@ -208,7 +208,7 @@ impl Clicks {
 /// the file would cost the user the rest of it.
 ///
 /// A file that is not there is not a fault, and Peruse writes a new one.
-fn write_blocked(path: &std::path::Path) -> Option<String> {
+pub(crate) fn write_blocked(path: &std::path::Path) -> Option<String> {
     Config::load_from(path)
         .1
         .map(|why| format!("the file has a fault, so nothing was written: {why}"))
@@ -682,6 +682,15 @@ pub struct OverlayHit {
     /// past. The row on the screen is therefore not the position in the list,
     /// and a click needs this table to find the line under the pointer.
     pub lines: Vec<(u16, usize)>,
+    /// The largest first line of a box of text that scrolls: the help and the
+    /// cell inspector. Only the frame knows the height of the box, so the
+    /// frame writes it here, and a key that scrolls stops at it.
+    ///
+    /// Without this limit, each press after the end of the text counted, and
+    /// a user then pressed the key that scrolls back as many times before the
+    /// text moved again. The wheel at the end also drew the same frame again
+    /// and again.
+    pub scroll_max: Option<u16>,
 }
 
 impl OverlayHit {
@@ -691,6 +700,7 @@ impl OverlayHit {
             mode,
             area,
             lines: Vec::new(),
+            scroll_max: None,
         }
     }
 
@@ -755,6 +765,13 @@ struct Scan {
     total: u64,
     /// The number of rows that the next part covers.
     chunk: u64,
+    /// The first row and the number of rows of the part that is on its way.
+    ///
+    /// A new search, or the key `n`, starts a new scan while a part of the old
+    /// one is still on its way. The epoch cannot see that, because the view did
+    /// not change. Without this test, the matches of the old value would move
+    /// the cursor of the new search.
+    asked: (u64, u64),
 }
 
 /// One view that the user had, for the keys that go back and forward.
@@ -813,6 +830,26 @@ pub struct App {
     page_limit: u32,
     /// The offset and the limit of the page request that has no answer yet.
     requested: Option<(u64, u32)>,
+    /// The offset and the limit of each page request of this view that has no
+    /// answer yet, in the order that Peruse sent them. The request `SetView`
+    /// is the first one, because it also reads a page.
+    ///
+    /// A page holds no record of the limit that asked for it, and a page with
+    /// fewer rows than its limit is the last page. Two requests with two limits
+    /// can be on their way together: a terminal that grows asks for more rows
+    /// while the first page is still on its way. A comparison of the first page
+    /// against the newer limit then calls a full page the last one, and the
+    /// grid stops at row 520 of a file of millions until the count arrives.
+    /// Refer to [`App::limit_of`].
+    inflight: Vec<(u64, u32)>,
+    /// `true` after a page request failed or the user cancelled it.
+    ///
+    /// The grid then asks for no page until the next key. Without the flag, the
+    /// grid would never ask again for the rows at the start of the view: the
+    /// record of the request in flight still names them. A clear of that record
+    /// alone would ask again at each frame, and a request that fails each time
+    /// would make a storm.
+    rows_error: bool,
     /// The number of rows in the view.
     pub total: RowCount,
 
@@ -961,6 +998,13 @@ pub struct App {
     /// The title of the cell inspector, when the value comes from a path
     /// inside a structure and not from a column.
     pub cell_title: Option<String>,
+    /// The row and the column of the cell request that has no answer yet.
+    ///
+    /// The user can close the inspector and open it on another cell while an
+    /// answer is on its way. The epoch cannot see that, because the view did not
+    /// change, so the cell itself is the test. A value from the record view
+    /// asks the engine for nothing, and it holds `None`.
+    cell_asked: Option<(u64, String)>,
 
     /// The selected line of the record view, as a position in the list from
     /// [`App::record_lines`].
@@ -1025,6 +1069,10 @@ pub struct App {
     pub help_scroll: u16,
     /// The position of the selected theme in the theme picker.
     pub theme_sel: usize,
+    /// `true` when the settings page opened the theme picker. The picker then
+    /// goes back to the settings page when it closes, and not to the grid, as
+    /// the cell inspector goes back to the record view.
+    picker_from_settings: bool,
 
     /// `true` when the engine can go directly to any row.
     pub seekable: bool,
@@ -1039,12 +1087,29 @@ impl App {
     ///
     /// If `auto_index` is `true` and the CSV file is small, this function also
     /// asks the worker to index the file.
+    ///
+    /// The tests use this function. The program sets the view of the command
+    /// line between [`App::idle`] and [`App::start`].
+    #[cfg(test)]
     pub fn new(worker: Worker, opened: Opened, theme: Theme, auto_index: bool) -> App {
+        let mut app = App::idle(worker, opened, theme);
+        app.start(auto_index);
+        app
+    }
+
+    /// Makes the application state, and asks the worker for nothing.
+    ///
+    /// The caller sets the view of the command line, and then calls
+    /// [`App::start`]. A start with `--filter` therefore sends one view to the
+    /// worker, and not two. The first view would read the whole file: the
+    /// worker can be busy with it before the second one arrives, and the count
+    /// of a large file of text then delays the first frame by some seconds.
+    pub fn idle(worker: Worker, opened: Opened, theme: Theme) -> App {
         let ncols = opened.schema.len();
         let themes = peruse_core::theme::available();
         let theme_idx = themes.iter().position(|t| t.name == theme.name).unwrap_or(0);
 
-        let mut app = App {
+        App {
             worker,
             source: opened.source,
             read_expr: opened.read_expr,
@@ -1063,6 +1128,8 @@ impl App {
             page: RowPage::default(),
             page_limit: 0,
             requested: None,
+            inflight: Vec::new(),
+            rows_error: false,
             total: RowCount::Counting,
 
             cursor_row: 0,
@@ -1109,6 +1176,7 @@ impl App {
             cell_scroll: 0,
             cell_from_record: false,
             cell_title: None,
+            cell_asked: None,
 
             record_sel: 0,
             record_find: String::new(),
@@ -1139,21 +1207,26 @@ impl App {
             palette_sel: 0,
             help_scroll: 0,
             theme_sel: 0,
+            picker_from_settings: false,
 
             seekable: opened.seekable,
             indexing: false,
             quit: false,
-        };
-        app.reload(true);
-        if auto_index
-            && !app.seekable
-            && app.source.bytes < AUTO_INDEX_BYTES
-            && app.schema.len() <= AUTO_INDEX_COLUMNS
-        {
-            app.indexing = true;
-            app.worker.send(Request::Index { epoch: app.epoch });
         }
-        app
+    }
+
+    /// Asks for the first view, and indexes a small file of text when
+    /// `auto_index` is `true`.
+    pub fn start(&mut self, auto_index: bool) {
+        self.reload(true);
+        if auto_index
+            && !self.seekable
+            && self.source.bytes < AUTO_INDEX_BYTES
+            && self.schema.len() <= AUTO_INDEX_COLUMNS
+        {
+            self.indexing = true;
+            self.worker.send(Request::Index { epoch: self.epoch });
+        }
     }
 
     // ------------------------------------------------------- helper functions
@@ -1226,7 +1299,7 @@ impl App {
         self.total = RowCount::Counting;
         self.page = RowPage::default();
         self.page_limit = 0;
-        self.requested = None;
+        self.rows_error = false;
         // The statistics describe the rows of one view. A new view therefore
         // makes each answer wrong. The facts of the band follow the same rule.
         self.stats_cache.clear();
@@ -1245,7 +1318,28 @@ impl App {
             self.cursor_row = 0;
             self.top_row = 0;
         }
+        self.send_set_view();
+        // The worker keeps the requests of the newest view only, and it can
+        // therefore drop a metadata request that is still in its queue. The
+        // answer would then never come, and the metadata panel would stay
+        // empty for the whole session. Ask again with the new epoch. A second
+        // answer only replaces the first one.
+        if self.meta_asked && self.meta.is_none() && !self.meta_error {
+            self.worker.send(Request::Meta { epoch: self.epoch });
+        }
+    }
+
+    /// Sends the request `SetView` for the current view and epoch.
+    ///
+    /// The request reads the page at the start of the view. That page counts as
+    /// the page request in flight, so the first frame does not ask for the same
+    /// rows a second time. A second read of the first page repeats the complete
+    /// query, and over a sort of a large file that is a second sort.
+    fn send_set_view(&mut self) {
         let limit = self.window_limit();
+        self.inflight.clear();
+        self.inflight.push((0, limit));
+        self.requested = Some((0, limit));
         self.worker.send(Request::SetView {
             epoch: self.epoch,
             view: self.view.clone(),
@@ -1253,9 +1347,39 @@ impl App {
         });
     }
 
-    /// Applies a view that the command line gives, after the start.
+    /// Gives the limit of the request that a page of rows answers, and removes
+    /// that request and each older one from the list in flight.
+    ///
+    /// The worker does the requests of one view in the order that Peruse sent
+    /// them, and it can drop an older page request for a newer one. A page
+    /// therefore answers the oldest request in flight with its offset, or a
+    /// newer request with the same offset. Of those, the function gives the
+    /// smallest limit. A page with fewer rows than that limit is the last page
+    /// whichever request it answers, so the grid never stops before the end.
+    fn limit_of(&mut self, offset: u64) -> Option<u32> {
+        let i = self.inflight.iter().position(|(o, _)| *o == offset)?;
+        let limit = self.inflight[i..]
+            .iter()
+            .filter(|(o, _)| *o == offset)
+            .map(|(_, l)| *l)
+            .min();
+        self.inflight.drain(..=i);
+        limit
+    }
+
+    /// Applies a view that a test sets, after the start.
+    ///
+    /// The program does not use it: the view of the command line goes in
+    /// before the start. Refer to [`App::idle`].
+    #[cfg(test)]
     pub fn run_startup_view(&mut self) {
         self.reload(true);
+    }
+
+    /// Gives the epoch of the current view, for a test that makes a response.
+    #[cfg(test)]
+    pub fn epoch(&self) -> u64 {
+        self.epoch
     }
 
     /// Gives the number of rows to ask for in one page request.
@@ -1270,7 +1394,7 @@ impl App {
     pub fn ensure_rows(&mut self) {
         self.ensure_stats();
         self.ensure_band();
-        if self.schema.is_empty() {
+        if self.schema.is_empty() || self.rows_error {
             return;
         }
         let visible = self.viewport_rows.max(1) as u64;
@@ -1285,6 +1409,7 @@ impl App {
             return;
         }
         self.requested = Some((start, limit));
+        self.inflight.push((start, limit));
         self.worker.send(Request::Page {
             epoch: self.epoch,
             view: self.view.clone(),
@@ -1295,7 +1420,7 @@ impl App {
     }
 
     /// Moves the viewport, if necessary, to keep the cursor on the screen.
-    fn follow_cursor(&mut self) {
+    pub(crate) fn follow_cursor(&mut self) {
         let vis = self.viewport_rows.max(1) as u64;
         if self.cursor_row < self.top_row {
             self.top_row = self.cursor_row;
@@ -1619,6 +1744,16 @@ impl App {
             Response::Error { ref context, .. } if context == "metadata" => {
                 self.meta_error = true;
             }
+            // A failure of the index also describes the file. The index takes
+            // some seconds, and the user changes the view in that time, so the
+            // epoch of the answer is old more often than not. Without this, the
+            // footer would say "indexing" for the whole session, and the key `I`
+            // would answer "already indexing" for ever.
+            Response::Error { ref context, ref message, .. } if context == "indexing" => {
+                self.indexing = false;
+                self.report_error(context, message);
+                return true;
+            }
             _ => {}
         }
         let epoch = match &resp {
@@ -1661,9 +1796,14 @@ impl App {
                 }
             }
             Response::Page { page, .. } => {
-                self.page_limit = self.requested.map(|(_, l)| l).unwrap_or(page.nrows as u32);
+                // With no request on record, the page counts as a full page. A
+                // wrong "full" costs one more request, and a wrong "last" stops
+                // the grid before the end of the data.
+                self.page_limit = self.limit_of(page.offset).unwrap_or(page.nrows as u32);
                 self.page = page;
-                self.requested = None;
+                // The newest request can still be on its way. Without this, the
+                // next frame would send the same request again.
+                self.requested = self.inflight.last().copied();
                 if !self.widths_fitted && self.page.nrows > 0 {
                     self.fit_widths();
                 }
@@ -1713,7 +1853,11 @@ impl App {
                 let n = self.record_lines().len();
                 self.record_sel = self.record_sel.min(n.saturating_sub(1));
             }
-            Response::Cell { value, .. } => {
+            Response::Cell { row, column, value, .. } => {
+                if self.cell_asked.as_ref() != Some(&(row, column)) {
+                    return false;
+                }
+                self.cell_asked = None;
                 self.cell_value = Some(value.unwrap_or_else(|| "NULL".into()));
                 self.cell_scroll = 0;
             }
@@ -1721,11 +1865,23 @@ impl App {
                 self.duck_threads = threads;
                 self.duck_memory = memory_limit;
             }
-            Response::Search { hits, .. } => self.apply_search(hits),
+            Response::Search { hits, from, scan, .. } => {
+                if self.scan.is_none_or(|s| s.asked != (from, scan)) {
+                    return false;
+                }
+                self.apply_search(hits);
+            }
             // The code above handles these two, before the test of the epoch.
             Response::Indexed { .. } | Response::Meta { .. } => {}
             Response::Error { context, message, .. } => {
-                self.indexing = false;
+                // A view that failed before its first page gives the grid
+                // nothing to draw, and the grid would show a screen of points
+                // under the bad filter until the user found the key `u`. That
+                // view is a typing mistake more often than not, so the view
+                // before it comes back, and the message stays. The prompt
+                // keeps the bad text in its history for a correction.
+                let failed_view = matches!(context.as_str(), "query" | "filter" | "schema" | "rows")
+                    && self.page.ncols == 0;
                 // A request that failed must not leave its part of the screen
                 // waiting for ever. Each of these two parts asks one time and
                 // then waits for the answer, so a failure has to say that no
@@ -1738,6 +1894,14 @@ impl App {
                 // next frame, and a request that fails every time would then make
                 // a storm. The key of each part clears the flag instead.
                 match context.as_str() {
+                    // A count that stopped never arrives, so the screen must
+                    // not say "counting" for ever. The commands that need the
+                    // count start it again. Refer to `App::wait_for_count`.
+                    "count" => self.total = RowCount::Unknown,
+                    "rows" => {
+                        self.rows_error = true;
+                        self.requested = None;
+                    }
                     "column band" => self.band_error = true,
                     "column stats" => {
                         self.stats_error = true;
@@ -1745,14 +1909,44 @@ impl App {
                     }
                     _ => {}
                 }
-                // The first line holds the useful part. DuckDB adds the full
-                // statement after it, and that text is too long for a status
-                // line of one row.
-                let first = message.lines().next().unwrap_or(&message).trim().to_string();
-                self.error(format!("{context}: {first}"));
+                self.report_error(&context, &message);
+                if failed_view
+                    && self.go_back_after_failure()
+                    && let Some(s) = self.status.as_mut()
+                {
+                    s.text.push_str(" — the view before it is back");
+                }
             }
         }
         true
+    }
+
+    /// Puts back the view from the time before a view that failed, and gives
+    /// `true` when there was one.
+    ///
+    /// The view that failed does not go into the history. It gave no rows, so
+    /// the key `u` must not go back to it.
+    fn go_back_after_failure(&mut self) -> bool {
+        let Some(step) = self.history.pop() else {
+            return false;
+        };
+        self.view = step.view;
+        self.fset = step.fset;
+        self.restoring = true;
+        self.reload(true);
+        self.restoring = false;
+        // `reload` put the view that failed into the history. Remove it.
+        self.history.pop();
+        true
+    }
+
+    /// Shows the failure of a request on the status line.
+    fn report_error(&mut self, context: &str, message: &str) {
+        // The first line holds the useful part. DuckDB adds the full
+        // statement after it, and that text is too long for a status
+        // line of one row.
+        let first = message.lines().next().unwrap_or(message).trim().to_string();
+        self.error(format!("{context}: {first}"));
     }
 
     /// Finds the nearest known match in the given direction. The function does
@@ -1788,6 +1982,22 @@ impl App {
             format!("{n}+")
         };
         self.ok(format!("match {at}/{total}{note}"));
+    }
+
+    /// Tells the user that a command needs the number of rows, which is not
+    /// known yet.
+    ///
+    /// A count that failed, or that the key `Esc` stopped, gives no answer. The
+    /// function then starts it again: the user asked for something that needs
+    /// the count, and a message that says "try again" must be true.
+    fn wait_for_count(&mut self) {
+        if self.total == RowCount::Unknown {
+            self.total = RowCount::Counting;
+            self.send_set_view();
+            self.info("counting the rows again — try again in a moment (Esc stops it)");
+        } else {
+            self.info("still counting — try again in a moment");
+        }
     }
 
     /// Moves the cursor to the next match or to the previous match.
@@ -1828,7 +2038,7 @@ impl App {
         let Some(total) = self.total.value() else {
             // A row offset has a meaning only with a known number of rows.
             // The worker counts the rows already, so the user can try again.
-            self.info("still counting — try again in a moment");
+            self.wait_for_count();
             return;
         };
         self.scan = Some(Scan {
@@ -1838,6 +2048,7 @@ impl App {
             examined: 0,
             total,
             chunk: SEARCH_CHUNK,
+            asked: (0, 0),
         });
         self.request_scan_chunk();
     }
@@ -1866,6 +2077,7 @@ impl App {
             s.next = from;
             (from, end - from)
         };
+        s.asked = (from, len);
         s.examined = s.examined.saturating_add(len);
         let pct = (s.examined.min(s.total) * 100) / s.total.max(1);
         self.info(format!("searching… {pct}%  (Esc cancels)"));
@@ -1936,13 +2148,18 @@ impl App {
     /// Gives one key to the part of Peruse that has the focus.
     pub fn on_key(&mut self, key: &KeyEvent) {
         self.status = None;
+        // A key is the way back after a page request that failed. Refer to
+        // `App::rows_error`.
+        self.rows_error = false;
         match self.mode {
             Mode::Prompt(kind) => self.prompt_key(kind, key),
             Mode::Help => self.overlay_key(key, |app, d| {
-                app.help_scroll = app.help_scroll.saturating_add_signed(d as i16);
+                let max = app.scroll_max();
+                app.help_scroll = app.help_scroll.min(max).saturating_add_signed(d as i16).min(max);
             }),
             Mode::Cell => self.overlay_key(key, |app, d| {
-                app.cell_scroll = app.cell_scroll.saturating_add_signed(d as i16);
+                let max = app.scroll_max();
+                app.cell_scroll = app.cell_scroll.min(max).saturating_add_signed(d as i16).min(max);
             }),
             Mode::Record => self.record_key(key),
             Mode::Settings => self.settings_key(key),
@@ -1968,7 +2185,7 @@ impl App {
         // the grid can never join into one double click.
         let double = ev.kind == MouseEventKind::Down(MouseButton::Left)
             && self.clicks.press_now(ev.column, ev.row);
-        match self.mode {
+        let acted = match self.mode {
             Mode::Normal => self.grid_mouse(ev, double),
             // A prompt keeps the grid on the screen, and a user who writes a
             // filter looks at the data while doing it. The wheel therefore
@@ -1976,7 +2193,23 @@ impl App {
             // the prompt, and a click does nothing.
             Mode::Prompt(_) => self.wheel_grid(ev),
             _ => self.overlay_mouse(ev, double),
+        };
+        // An event that acts is the way back after a page request that failed,
+        // as a key is. Refer to `App::rows_error`.
+        if acted {
+            self.rows_error = false;
         }
+        acted
+    }
+
+    /// Gives the largest first line of the box of text that is open, from the
+    /// last frame. Before the first frame, the function gives no limit.
+    fn scroll_max(&self) -> u16 {
+        self.overlay
+            .as_ref()
+            .filter(|h| h.mode == self.mode)
+            .and_then(|h| h.scroll_max)
+            .unwrap_or(u16::MAX)
     }
 
     /// Gives one key to the program, as a press with no modifier.
@@ -2059,7 +2292,7 @@ impl App {
             // or a click outside would keep a theme that the user only looked at.
             Mode::ThemePicker => {
                 self.theme = self.themes[self.theme_idx.min(self.themes.len() - 1)].clone();
-                self.mode = Mode::Normal;
+                self.mode = self.after_picker();
             }
             // The cell inspector can come from the record view. Leaving it gives
             // the record back, and not the grid.
@@ -2265,13 +2498,18 @@ impl App {
 
     /// Moves the grid for a turn of the wheel. Gives `true` when the event was
     /// a turn of the wheel.
+    ///
+    /// A turn at an end of the view moves nothing, and it gives `false`. The
+    /// caller then draws no frame: a user who turns the wheel at the top of the
+    /// file would otherwise draw the same screen again and again.
     fn wheel_grid(&mut self, ev: &MouseEvent) -> bool {
+        let before = (self.cursor_row, self.top_row, self.cursor_col);
         match wheel_of(ev) {
             Wheel::Rows(n) => self.move_rows(n),
             Wheel::Cols(n) => self.move_cols(n),
             Wheel::None => return false,
         }
-        true
+        (self.cursor_row, self.top_row, self.cursor_col) != before
     }
 
     /// Gives one mouse event to the grid.
@@ -2417,7 +2655,7 @@ impl App {
                 // Go back to the theme from the time before the user opened
                 // the picker.
                 self.theme = self.themes[self.theme_idx].clone();
-                self.mode = Mode::Normal;
+                self.mode = self.after_picker();
             }
             KeyCode::Up | KeyCode::Char('k') => {
                 self.theme_preview(self.theme_sel.saturating_sub(1));
@@ -2428,10 +2666,19 @@ impl App {
             KeyCode::Enter => {
                 self.theme_idx = self.theme_sel;
                 self.theme = self.themes[self.theme_idx].clone();
-                self.mode = Mode::Normal;
+                self.mode = self.after_picker();
                 self.remember_theme();
             }
             _ => {}
+        }
+    }
+
+    /// Gives the mode that the theme picker goes back to when it closes.
+    fn after_picker(&mut self) -> Mode {
+        if std::mem::take(&mut self.picker_from_settings) {
+            Mode::Settings
+        } else {
+            Mode::Normal
         }
     }
 
@@ -2694,30 +2941,86 @@ impl App {
                 // word, arrives here as a cancel. Without this line, that jump
                 // deletes the work of the user.
                 self.input.remember();
+                // The prompt edits a copy of the history of its kind, and the
+                // next open starts from the kept copy again. The line must
+                // therefore go back into the kept copy, or the next open
+                // forgets it.
+                match kind {
+                    PromptKind::Filter => self.filter_input = self.input.clone(),
+                    PromptKind::Sql => self.sql_input = self.input.clone(),
+                    PromptKind::Search => self.search_input = self.input.clone(),
+                    PromptKind::Goto => {}
+                }
                 self.mode = Mode::Normal;
                 self.prompt_error = None;
             }
             Action::Submit => self.submit_prompt(kind),
-            Action::Changed => {
-                // Check the text while the user types it. A bad expression
-                // is then visible before the user presses Enter, and not
-                // after a request to the worker.
-                self.prompt_error = match kind {
-                    PromptKind::Filter if !self.input.is_empty() => {
-                        sql_guard::ensure_safe_predicate(&self.input.text())
-                            .err()
-                            .map(|e| e.to_string())
-                    }
-                    PromptKind::Sql if !self.input.is_empty() => {
-                        sql_guard::ensure_read_only(&self.input.text())
-                            .err()
-                            .map(|e| e.to_string())
-                    }
-                    _ => None,
-                };
-            }
+            Action::Changed => self.prompt_changed(kind),
             Action::Ignored => {}
         }
+    }
+
+    /// Checks the text of the prompt after a change.
+    fn prompt_changed(&mut self, kind: PromptKind) {
+        // Check the text while the user types it. A bad expression
+        // is then visible before the user presses Enter, and not
+        // after a request to the worker.
+        self.prompt_error = match kind {
+            PromptKind::Filter if !self.input.is_empty() => {
+                sql_guard::ensure_safe_predicate(&self.input.text())
+                    .err()
+                    .map(|e| e.to_string())
+            }
+            PromptKind::Sql if !self.input.is_empty() => {
+                sql_guard::ensure_read_only(&self.input.text())
+                    .err()
+                    .map(|e| e.to_string())
+            }
+            _ => None,
+        };
+    }
+
+    /// Gives a pasted text to the box that takes text now, and gives `true`
+    /// when the screen changed.
+    ///
+    /// The terminal sends a paste as one event, and not as keys. A paste that
+    /// arrives as keys has two faults. The line break of a statement in more
+    /// than one line is the key Enter, so the prompt runs the first line alone.
+    /// Each character after it then reaches the grid as a command: the letter
+    /// `R` resets the view, `t` changes the theme, and `q` stops the program.
+    ///
+    /// The grid takes no text, so a paste there does nothing.
+    pub fn on_paste(&mut self, text: &str) -> bool {
+        let takes_text = match self.mode {
+            Mode::Prompt(_) | Mode::Palette => true,
+            Mode::Record => self.record_finding,
+            Mode::Settings => self.settings_editing,
+            Mode::FilterBuild => matches!(
+                self.build,
+                Build::Column | Build::Value | Build::Value2 | Build::Raw
+            ),
+            _ => false,
+        };
+        if !takes_text || self.input.insert_str(text) != Action::Changed {
+            return false;
+        }
+        self.status = None;
+        match self.mode {
+            Mode::Prompt(kind) => self.prompt_changed(kind),
+            Mode::Palette => self.palette_sel = 0,
+            Mode::Record => {
+                self.record_find = self.input.text();
+                self.record_sel = 0;
+            }
+            Mode::FilterBuild if self.build == Build::Column => self.pick_sel = 0,
+            Mode::FilterBuild if self.build == Build::Raw => {
+                self.prompt_error = sql_guard::ensure_safe_predicate(&self.input.text())
+                    .err()
+                    .map(|e| e.to_string());
+            }
+            _ => {}
+        }
+        true
     }
 
     /// Applies the text of the prompt after the user presses Enter.
@@ -2804,7 +3107,7 @@ impl App {
                         // fit in 64 bits.
                         let max = self.max_row();
                         if max == u64::MAX {
-                            self.info("still counting — try again in a moment");
+                            self.wait_for_count();
                             return;
                         }
                         self.cursor_row = (n - 1).min(max);
@@ -2864,7 +3167,9 @@ impl App {
 
     /// Gives the text in the cell under the cursor, from the current page.
     fn current_cell_text(&self) -> Option<String> {
-        let r = self.cursor_row.checked_sub(self.page.offset)? as usize;
+        // A row outside the page is no cell. An empty view has no row at all,
+        // and `y` there copied the word NULL.
+        let r = self.page_row()?;
         Some(self.page.cell(r, self.cursor_col).unwrap_or("NULL").to_string())
     }
 
@@ -3140,6 +3445,7 @@ impl App {
         // already, and the inspector takes it as it is.
         self.cell_value = Some(v);
         self.cell_scroll = 0;
+        self.cell_asked = None;
         self.cell_from_record = true;
         self.cell_title = Some(line.path_text());
         self.mode = Mode::Cell;
@@ -3582,6 +3888,7 @@ impl App {
             }
             KeyCode::Char('T') => {
                 self.theme_sel = self.theme_idx;
+                self.picker_from_settings = true;
                 self.mode = Mode::ThemePicker;
             }
             _ => {}
@@ -4072,8 +4379,20 @@ impl App {
                 self.mode = Mode::Palette;
             }
             Cmd::Cancel => {
+                // A search asks for its next part as soon as one part
+                // arrives, so the worker can be idle for a moment while the
+                // search still runs. The key must stop the search then too.
+                //
+                // An idle worker gets no interrupt: that would stop the next
+                // request, whatever it is. The part on its way then finishes,
+                // and the test of `App::scan` discards its answer.
+                let searching = self.scan.take().is_some();
                 if self.busy {
                     self.worker.cancel();
+                }
+                if searching {
+                    self.info("search stopped");
+                } else if self.busy {
                     self.info("cancelled");
                 } else if self.panel != Panel::None {
                     self.panel = Panel::None;
@@ -4097,7 +4416,7 @@ impl App {
             Cmd::Bottom => {
                 let max = self.max_row();
                 if max == u64::MAX {
-                    self.info("still counting — try again in a moment");
+                    self.wait_for_count();
                 } else {
                     self.cursor_row = max;
                     self.follow_cursor();
@@ -4119,7 +4438,7 @@ impl App {
                 // nothing happened, reads as a fault in the program.
                 let max = self.max_row();
                 if max == u64::MAX {
-                    self.info("still counting — try again in a moment");
+                    self.wait_for_count();
                     return;
                 }
                 self.move_cols(self.schema.len() as i64);
@@ -4232,6 +4551,11 @@ impl App {
             }
             Cmd::Record => self.open_record(),
             Cmd::InspectCell => {
+                // An empty view has no cell to show.
+                if self.is_empty() {
+                    self.error("no rows here");
+                    return;
+                }
                 let Some(col) = self.schema.columns.get(self.cursor_col) else {
                     return;
                 };
@@ -4254,6 +4578,7 @@ impl App {
                 self.mode = Mode::Cell;
                 // Ask the engine for the complete value. The copy in the
                 // grid stops at the limit, in the middle of the value.
+                self.cell_asked = Some((self.cursor_row, col.name.clone()));
                 self.worker.send(Request::Cell {
                     epoch: self.epoch,
                     view: self.view.clone(),
@@ -4281,11 +4606,19 @@ impl App {
                     self.error("cannot hide the last visible column");
                     return;
                 }
-                self.hidden[self.cursor_col] = true;
+                let hid = self.cursor_col;
+                self.hidden[hid] = true;
+                // The cursor goes to the column that takes the place of the
+                // hidden one, as in a spreadsheet. A user who presses `x` three
+                // times then hides three columns that are side by side. Only
+                // the last column moves the cursor to the left.
                 let vis = self.visible_columns();
-                if !vis.contains(&self.cursor_col) {
-                    self.cursor_col = *vis.last().unwrap();
-                }
+                self.cursor_col = vis
+                    .iter()
+                    .copied()
+                    .find(|c| *c > hid)
+                    .or_else(|| vis.last().copied())
+                    .unwrap_or(0);
                 let name = self.schema.columns[self.cursor_col].name.clone();
                 self.ok(format!("hidden — X shows all again ({name} selected)"));
             }
@@ -4341,6 +4674,7 @@ impl App {
             }
             Cmd::ThemePicker => {
                 self.theme_sel = self.theme_idx;
+                self.picker_from_settings = false;
                 self.mode = Mode::ThemePicker;
             }
             Cmd::Settings => self.open_settings(),

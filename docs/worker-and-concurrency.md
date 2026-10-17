@@ -107,15 +107,50 @@ the view. An offset is a position in the old view, and a new sort makes each
 offset wrong. It empties `stats_cache` and `band_cache` for the same reason: the
 numbers of those two describe the rows of one view.
 
+Some answers can be old in the same view, and the epoch cannot see that. Each of
+them therefore carries what it answers, and `App::on_response` compares that
+with what the screen waits for:
+
+| Response | The test |
+|---|---|
+| `RowJson` | The row of the record view |
+| `Cell` | The row and the column of the cell inspector |
+| `Search` | The first row and the number of rows of the part of the search on its way |
+| `Page` | The offset of the page. Refer to [The pages](#the-pages). |
+
+## The pages
+
+A page with fewer rows than its limit is the last page of the view, and the
+grid then knows where the view ends before the count arrives. A page holds no
+record of its limit, so `App::inflight` holds the offset and the limit of each
+page request on its way, in the order that Peruse sent them. The request
+`SetView` is the first entry, because it reads the first page.
+
+Two requests with two limits can be on their way together. The first view asks
+for the rows of a terminal of 20 rows, because the true height is known after
+the first frame only, and a taller terminal then asks for more rows. A page of
+520 rows compared with the newer limit of 550 would be the last page, and the
+grid would stop at row 520 of a file of millions until the count arrived. The
+function `App::limit_of` therefore takes the smallest limit of the requests with
+the offset of the page. A full page then never counts as the last one.
+
+The page of `SetView` also counts as the page request in flight. The first frame
+of a new view therefore does not ask for the same rows again: that would repeat
+the complete query, and over a sort of a large file it is a second sort.
+
+A count that fails, or that the key `Esc` stops, never arrives. The count then
+becomes `RowCount::Unknown`, and the next command that needs it, such as `G`,
+`#` or `/`, sends `SetView` again with the same epoch.
+
 ## Work that has no view
 
 Two operations describe the file, and not the view: the index and the file
 metadata. A third one, `Configure`, changes the connection. The epoch must not
 touch them.
 
-`App::new` sends the index request at the start. A start with `--filter` or
-with `--query` then changes the view immediately, and the epoch goes from 1 to
-2. Without an exception, two things would go wrong at the same time:
+`App::start` sends the index request at the start, and the key `I` sends it
+later. The index takes some seconds, and the user can change the view in that
+time. Without an exception, two things would go wrong at the same time:
 
 - `coalesce` would remove the index request from the group, so the table would
   never be built.
@@ -124,15 +159,24 @@ with `--query` then changes the view immediately, and the epoch goes from 1 to
   show the note "press I to index" for ever, and the key `I` would answer
   "already indexing" for ever.
 
-Two rules stop this:
+Three rules stop this:
 
 - `coalesce` keeps a request `Index`, `Meta` or `Configure` whatever its epoch
   is. The metadata needs the same rule as the index: the user interface asks
   for it one time and sets a latch, so a request that went away left the
   metadata panel and the detail band of a Parquet file empty for the whole
   session.
-- `App::on_response` applies the responses `Indexed` and `Meta` in front of the
-  test of the epoch.
+- `App::on_response` applies the responses `Indexed` and `Meta`, and a failure
+  of the index or of the metadata, in front of the test of the epoch.
+- `App::reload` sends a metadata request that has no answer yet again, with the
+  new epoch. The rule of `coalesce` already keeps the first request, so this
+  second request is a guard only.
+
+A start with `--filter` or with `--query` sends one view only. The function
+`main` makes the state with `App::idle`, puts the view of the command line in
+it, and then calls `App::start`. A first view of the whole file would read the
+whole file: the worker can start it before the second view arrives, and the
+count of a large file of text then delays the first frame by some seconds.
 
 Peruse asks for the metadata one time in a session, and it keeps the answer. The
 metadata panel and the compact detail band both read that one answer. A read of

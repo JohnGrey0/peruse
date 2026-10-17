@@ -519,9 +519,19 @@ pub const GROUPS: &[&str] = &["Move", "Query", "Inspect", "Columns", "Other"];
 /// A character that the terminal can print holds its own shift state. The
 /// character `G` is the shift key and the key `g`. A test of the shift key
 /// would therefore make each binding of a capital letter impossible to match.
+///
+/// Two more forms hold a modifier key that is not a choice of the user:
+///
+/// * The key `AltGr` of a European keyboard gives a character such as `#`,
+///   `@` or `[`. Windows reports that key as Ctrl and Alt together. A French
+///   keyboard therefore sends `#` as Ctrl+Alt+`#`, and without this rule the
+///   key `#` would do nothing there.
+/// * The terminal library always sends `Shift-Tab` as the key `BackTab` with
+///   the shift key. The name of the key holds the shift state already.
 fn normalise(key: &KeyEvent) -> KeyModifiers {
     match key.code {
-        KeyCode::Char(_) => key.modifiers.difference(KeyModifiers::SHIFT),
+        KeyCode::Char(_) if crate::input::is_altgr(key) => KeyModifiers::NONE,
+        KeyCode::Char(_) | KeyCode::BackTab => key.modifiers.difference(KeyModifiers::SHIFT),
         _ => key.modifiers,
     }
 }
@@ -586,6 +596,32 @@ mod tests {
             Some(Cmd::Bottom)
         );
         assert_eq!(resolve(&ev(KeyCode::Char('g'), N)), Some(Cmd::Top));
+    }
+
+    #[test]
+    fn shift_tab_moves_to_the_previous_column() {
+        // The terminal library sends Shift-Tab as BackTab with the shift key,
+        // on Windows and on Unix. The table binds BackTab with no modifier, so
+        // the key did nothing before.
+        assert_eq!(
+            resolve(&ev(KeyCode::BackTab, KeyModifiers::SHIFT)),
+            Some(Cmd::ColLeft)
+        );
+        assert_eq!(resolve(&ev(KeyCode::BackTab, N)), Some(Cmd::ColLeft));
+    }
+
+    #[test]
+    fn a_character_from_the_altgr_key_starts_its_command() {
+        // Windows reports AltGr as Ctrl and Alt together. A French keyboard
+        // gives `#` with AltGr, and a German keyboard gives `$` without it.
+        let altgr = KeyModifiers::CONTROL | KeyModifiers::ALT;
+        assert_eq!(resolve(&ev(KeyCode::Char('#'), altgr)), Some(Cmd::GotoRow));
+        assert_eq!(
+            resolve(&ev(KeyCode::Char('^'), altgr | KeyModifiers::SHIFT)),
+            Some(Cmd::ColFirst)
+        );
+        // Ctrl alone still makes a chord.
+        assert_eq!(resolve(&ev(KeyCode::Char('f'), CTRL)), Some(Cmd::PageDown));
     }
 
     #[test]

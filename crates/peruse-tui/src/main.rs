@@ -27,7 +27,10 @@ use clap::{CommandFactory, Parser};
 use crossbeam_channel::{select, unbounded};
 use peruse_core::query::Base;
 use peruse_core::{sql_guard, OpenOptions, View, Worker};
-use ratatui::crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event};
+use ratatui::crossterm::event::{
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event,
+};
 use ratatui::crossterm::execute;
 
 use crate::app::App;
@@ -279,12 +282,11 @@ fn main() -> Result<()> {
     if !peruse_core::source::looks_like_glob(&file)
         && let Ok(full) = std::fs::canonicalize(&file)
     {
-        config.remember_file(&peruse_core::source::tidy_path(&full));
-        if let Some(p) = Config::path() {
-            // A list that Peruse cannot write is not a reason to stop. The
-            // user came here to look at a file.
-            let _ = config.save_to(&p);
-        }
+        remember_recent(
+            &mut config,
+            &peruse_core::source::tidy_path(&full),
+            Config::path().as_deref(),
+        );
     }
 
     let auto_index = !(cli.no_index || config.no_index.unwrap_or(false));
@@ -292,7 +294,9 @@ fn main() -> Result<()> {
     // the mouse in the usual way. A user who copies out of the grid with the
     // mouse each day can therefore turn the mouse off.
     let mouse = !cli.no_mouse && config.mouse.unwrap_or(true);
-    let mut application = App::new(worker, opened, theme, auto_index);
+    // The view of the command line goes in before the first request. Refer to
+    // `App::idle`.
+    let mut application = App::idle(worker, opened, theme);
     application.config = config;
     // The user asked for these panels in an earlier session. Put them on the
     // screen, and ask for what they need.
@@ -309,11 +313,29 @@ fn main() -> Result<()> {
     if let Some(f) = cli.filter {
         application.set_raw_filter(&f);
     }
-    if application.view != View::default() {
-        application.run_startup_view();
-    }
+    application.start(auto_index);
 
     run(&mut application, mouse)
+}
+
+/// Puts a file at the top of the list of recent files, and keeps the list in
+/// the settings file when that file has no fault.
+///
+/// A settings file that Peruse cannot read gives the built-in settings. A write
+/// of those settings replaces the whole file, so one typing mistake in it would
+/// cost the user each setting and each note, at the next file that the user
+/// opens. The file therefore stays as it is, as for each other write. Refer to
+/// `app::write_blocked`.
+///
+/// A list that Peruse cannot write is not a reason to stop. The user came here
+/// to look at a file.
+fn remember_recent(config: &mut Config, file: &str, path: Option<&std::path::Path>) {
+    config.remember_file(file);
+    if let Some(p) = path
+        && app::write_blocked(p).is_none()
+    {
+        let _ = config.save_to(p);
+    }
 }
 
 /// What the table picker gave back.
@@ -472,11 +494,33 @@ fn enable_mouse() -> bool {
     true
 }
 
+/// Asks the terminal to send a paste as one event, and makes sure that a panic
+/// turns that mode off again.
+///
+/// The hook of `ratatui::init` knows nothing about this mode. A shell after a
+/// panic would otherwise get marks around each paste, as text.
+fn enable_paste() -> bool {
+    if execute!(std::io::stdout(), EnableBracketedPaste).is_err() {
+        return false;
+    }
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = execute!(std::io::stdout(), DisableBracketedPaste);
+        previous(info);
+    }));
+    true
+}
+
 /// Draws the frames and reads the events until the user quits.
 fn run(application: &mut App, mouse: bool) -> Result<()> {
     let depth = Depth::detect();
     let mut terminal = ratatui::init();
     let mouse = mouse && enable_mouse();
+    // The terminal then sends a paste as one event. Without it, a statement in
+    // more than one line arrives as keys, and its first line break runs the
+    // prompt. Refer to `App::on_paste`. A terminal that does not know the
+    // request ignores it, and the paste then arrives as keys, as before.
+    let paste = enable_paste();
 
     // A read from the terminal blocks. The reads therefore run on their own
     // thread, and each event arrives as a message. The engine responses
@@ -526,7 +570,11 @@ fn run(application: &mut App, mouse: bool) -> Result<()> {
                 }
             }
             recv(resp_rx) -> resp => {
-                let Ok(resp) = resp else { break Ok(()) };
+                // The engine thread stopped while the program runs. That is
+                // a fault, and the exit code must say so.
+                let Ok(resp) = resp else {
+                    break Err(anyhow::anyhow!("the engine stopped unexpectedly"));
+                };
                 dirty |= application.on_response(resp);
                 while let Ok(resp) = resp_rx.try_recv() {
                     dirty |= application.on_response(resp);
@@ -535,6 +583,9 @@ fn run(application: &mut App, mouse: bool) -> Result<()> {
         }
     };
 
+    if paste {
+        let _ = execute!(std::io::stdout(), DisableBracketedPaste);
+    }
     if mouse {
         let _ = execute!(std::io::stdout(), DisableMouseCapture);
     }
@@ -555,6 +606,7 @@ fn handle_event(application: &mut App, ev: Event) -> bool {
             true
         }
         Event::Mouse(m) => application.on_mouse(&m),
+        Event::Paste(text) => application.on_paste(&text),
         Event::Resize(_, _) => true,
         _ => false,
     }
@@ -563,6 +615,33 @@ fn handle_event(application: &mut App, ev: Event) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_settings_file_with_a_fault_is_not_written_over_by_the_list_of_recent_files() {
+        let dir = std::env::temp_dir().join("peruse-recent-blocked");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+
+        // One typing mistake. The load gives the built-in settings.
+        let bad = "theme = \"nord\"\nstep = 25\nthheme = \"x\"\n";
+        std::fs::write(&path, bad).unwrap();
+        let (mut config, why) = Config::load_from(&path);
+        assert!(why.is_some(), "the file must have a fault for this test");
+        remember_recent(&mut config, "/data/a.csv", Some(&path));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), bad, "the file was written over");
+        assert_eq!(config.recent.first().map(String::as_str), Some("/data/a.csv"));
+
+        // A file with no fault gets the list, and keeps its settings.
+        std::fs::write(&path, "theme = \"nord\"\nstep = 25\n").unwrap();
+        let (mut config, why) = Config::load_from(&path);
+        assert!(why.is_none());
+        remember_recent(&mut config, "/data/a.csv", Some(&path));
+        let (back, _) = Config::load_from(&path);
+        assert_eq!(back.recent, vec!["/data/a.csv".to_string()]);
+        assert_eq!(back.step, Some(25));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn the_ddl_name_comes_from_the_table_of_a_database() {

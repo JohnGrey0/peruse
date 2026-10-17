@@ -3356,3 +3356,467 @@ fn the_border_between_the_two_panels_does_not_jump_back() {
         assert_eq!(border(&app, &term), Some(fixed), "computed, step {step}\n{}", screen(&term));
     }
 }
+
+// ------------------------------------------------ the state of the grid
+
+/// Takes each response of the worker and gives none of them to the program.
+///
+/// A test that makes its own response, such as a count that stopped, needs the
+/// true answer out of the way.
+fn drop_responses(app: &App) {
+    let rx = app.worker.responses().clone();
+    while rx.recv_timeout(Duration::from_millis(300)).is_ok() {}
+}
+
+/// A file of one column of numbers, with `n` rows.
+fn numbers(n: usize) -> String {
+    let mut s = String::from("id\n");
+    for i in 1..=n {
+        s.push_str(&format!("{i}\n"));
+    }
+    s
+}
+
+#[test]
+fn shift_tab_moves_the_cursor_to_the_previous_column() {
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    let p = write_sample("shift-tab", SAMPLE, "csv");
+    let (mut app, mut term) = open(&p);
+    settle(&mut app, &mut term);
+    app.run(Cmd::ColRight);
+    app.run(Cmd::ColRight);
+    // The terminal library sends this form of Shift-Tab on each system.
+    app.on_key(&KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
+    assert_eq!(app.cursor_col, 1, "Shift-Tab did not move to the left");
+}
+
+#[test]
+fn esc_keeps_the_line_of_a_prompt_in_its_history() {
+    use ratatui::crossterm::event::KeyCode;
+    let p = write_sample("esc-history", SAMPLE, "csv");
+    let (mut app, mut term) = open(&p);
+    settle(&mut app, &mut term);
+
+    press_char(&mut app, 'E');
+    type_text(&mut app, "region = 'EU' AND amount > 5");
+    press(&mut app, KeyCode::Esc);
+    assert_eq!(app.view.filter, None, "Esc must not apply the filter");
+
+    // The next prompt gives the line back with the arrow key.
+    press_char(&mut app, 'E');
+    assert_eq!(app.input.text(), "");
+    press(&mut app, KeyCode::Up);
+    assert_eq!(app.input.text(), "region = 'EU' AND amount > 5");
+    press(&mut app, KeyCode::Esc);
+
+    // The same for the search, and the two histories stay apart.
+    press_char(&mut app, '/');
+    type_text(&mut app, "carol");
+    press(&mut app, KeyCode::Esc);
+    press_char(&mut app, '/');
+    press(&mut app, KeyCode::Up);
+    assert_eq!(app.input.text(), "carol");
+}
+
+#[test]
+fn a_pasted_statement_stays_in_the_prompt_and_never_reaches_the_grid() {
+    let p = write_sample("paste", SAMPLE, "csv");
+    let (mut app, mut term) = open(&p);
+    settle(&mut app, &mut term);
+
+    // A paste in the grid is no command. The letter q would stop the program.
+    assert!(!app.on_paste("q"));
+    assert!(!app.quit);
+
+    app.run(Cmd::Sql);
+    app.input.set("");
+    assert!(app.on_paste("SELECT name\r\nFROM src\nWHERE region = 'EU'"));
+    assert_eq!(app.mode, Mode::Prompt(PromptKind::Sql));
+    assert_eq!(app.input.text(), "SELECT name FROM src WHERE region = 'EU'");
+    assert!(!app.quit);
+    press(&mut app, ratatui::crossterm::event::KeyCode::Enter);
+    settle(&mut app, &mut term);
+    let s = screen(&term);
+    assert!(s.contains("carol") && !s.contains("bob"), "the statement did not run\n{s}");
+
+    // The filter prompt checks a pasted text as it checks a typed one.
+    app.run(Cmd::Filter);
+    app.on_paste("1; DROP TABLE x");
+    assert!(app.prompt_error.is_some(), "a pasted text was not checked");
+}
+
+#[test]
+fn hiding_a_column_moves_the_cursor_to_the_column_that_takes_its_place() {
+    let p = write_sample("hide-next", &wide_sample(), "csv");
+    let (mut app, mut term) = open(&p);
+    settle(&mut app, &mut term);
+    app.run(Cmd::ColRight);
+    app.run(Cmd::ColRight);
+    // Three presses hide three columns that are side by side.
+    for _ in 0..3 {
+        app.run(Cmd::HideColumn);
+    }
+    assert_eq!(app.cursor_col, 5, "the cursor left the place of the hidden columns");
+    assert_eq!(
+        (0..60).filter(|i| app.hidden[*i]).collect::<Vec<_>>(),
+        vec![2, 3, 4]
+    );
+    // The last column has no column to its right, so the cursor goes left.
+    app.run(Cmd::ColLast);
+    app.run(Cmd::HideColumn);
+    assert_eq!(app.cursor_col, 58);
+}
+
+#[test]
+fn the_cursor_stays_on_the_screen_when_the_grid_loses_rows() {
+    let p = write_sample("follow-shrink", &numbers(200), "csv");
+    let (mut app, mut term) = open(&p);
+    settle(&mut app, &mut term);
+    // Move the cursor to the last row on the screen.
+    let rows = app.viewport_rows as i64;
+    for _ in 0..rows - 1 {
+        app.run(Cmd::RowDown);
+    }
+    assert_eq!(app.top_row, 0);
+    // The detailed band takes four rows of the grid.
+    app.run(Cmd::CycleBand);
+    app.run(Cmd::CycleBand);
+    settle(&mut app, &mut term);
+    assert!(
+        app.cursor_row < app.top_row + app.viewport_rows as u64,
+        "the cursor is on row {} and the screen shows {}..{}",
+        app.cursor_row,
+        app.top_row,
+        app.top_row + app.viewport_rows as u64
+    );
+    let at = (app.cursor_row + 1).to_string();
+    assert!(
+        lines(&term).iter().any(|l| l.trim_start().starts_with(&at)),
+        "the row of the cursor is not on the screen\n{}",
+        screen(&term)
+    );
+
+    // A terminal that gets smaller does the same.
+    let mut small = Terminal::new(TestBackend::new(110, 12)).unwrap();
+    settle(&mut app, &mut small);
+    assert!(app.cursor_row < app.top_row + app.viewport_rows as u64);
+}
+
+#[test]
+fn a_full_first_page_is_not_the_last_page_on_a_tall_terminal() {
+    use peruse_core::Response;
+    // The first view asks for the rows of a terminal of 20 rows, because the
+    // true height is known after the first frame only. The first frame of a
+    // taller terminal then asks for more rows while the first page is on its
+    // way. That page is full, and it must not count as the end of the view.
+    let p = write_sample("tall-first-page", &numbers(3000), "csv");
+    let (mut app, _) = open(&p);
+    let mut term = Terminal::new(TestBackend::new(110, 60)).unwrap();
+    term.draw(|f| ui::draw(f, &mut app, Depth::True)).unwrap();
+    app.ensure_rows();
+
+    let rx = app.worker.responses().clone();
+    loop {
+        let r = rx.recv_timeout(Duration::from_secs(20)).expect("no page arrived");
+        let is_page = matches!(r, Response::Page { .. });
+        let is_count = matches!(r, Response::Count { .. });
+        app.on_response(r);
+        if is_count {
+            panic!("the count arrived before the first page");
+        }
+        if is_page {
+            break;
+        }
+    }
+    assert!(app.page.nrows > 0);
+    assert_eq!(
+        app.max_row(),
+        u64::MAX,
+        "a full page of {} rows counted as the last page",
+        app.page.nrows
+    );
+}
+
+#[test]
+fn a_new_view_reads_its_first_page_one_time() {
+    use peruse_core::Response;
+    // The request SetView reads the first page. A second request for the same
+    // rows repeats the query, and over a sort of a large file that is a second
+    // sort of the whole file.
+    let p = write_sample("one-first-page", &numbers(2000), "csv");
+    let (mut app, mut term) = open(&p);
+    settle(&mut app, &mut term);
+    app.run(Cmd::SortCycle);
+    let rx = app.worker.responses().clone();
+    let mut pages = 0;
+    let mut quiet = 0;
+    while quiet < 4 {
+        term.draw(|f| ui::draw(f, &mut app, Depth::True)).unwrap();
+        app.ensure_rows();
+        let mut got = false;
+        while let Ok(r) = rx.recv_timeout(Duration::from_millis(75)) {
+            if matches!(r, Response::Page { .. }) {
+                pages += 1;
+            }
+            app.on_response(r);
+            got = true;
+        }
+        quiet = if got { 0 } else { quiet + 1 };
+    }
+    assert_eq!(pages, 1, "the first page of the sorted view was read {pages} times");
+}
+
+#[test]
+fn a_count_that_stopped_starts_again_when_a_command_needs_it() {
+    use peruse_core::Response;
+    let p = write_sample("count-stopped", SAMPLE, "csv");
+    let (mut app, mut term) = open(&p);
+    settle(&mut app, &mut term);
+
+    // A new view, and then the key Esc stops its count.
+    app.run(Cmd::SortCycle);
+    drop_responses(&app);
+    app.on_response(Response::Error {
+        epoch: app.epoch(),
+        context: "count".into(),
+        message: "INTERRUPT Error: Interrupted!".into(),
+    });
+    settle(&mut app, &mut term);
+    assert!(
+        !screen(&term).contains("counting"),
+        "the screen says counting for a count that stopped\n{}",
+        screen(&term)
+    );
+
+    // The last row needs the count. The key starts it again, and a second
+    // press then does its work.
+    app.run(Cmd::Bottom);
+    settle(&mut app, &mut term);
+    app.run(Cmd::Bottom);
+    assert_eq!(app.cursor_row, 4, "G never reached the last row");
+    settle(&mut app, &mut term);
+    assert!(screen(&term).contains("5 × 4"), "{}", screen(&term));
+}
+
+#[test]
+fn a_failed_index_never_leaves_the_index_running() {
+    use peruse_core::Response;
+    let p = write_sample("index-failed", SAMPLE, "csv");
+    let (mut app, mut term) = open(&p);
+    settle(&mut app, &mut term);
+    app.seekable = false;
+
+    // The index takes some seconds, and the user changes the view in that
+    // time. The failure then carries the epoch of an older view.
+    app.indexing = true;
+    let old = app.epoch();
+    app.run(Cmd::SortCycle);
+    app.on_response(Response::Error {
+        epoch: old,
+        context: "indexing".into(),
+        message: "INTERRUPT Error: Interrupted!".into(),
+    });
+    assert!(!app.indexing, "the footer would say indexing for ever");
+    assert!(app.status.as_ref().is_some_and(|s| s.text.contains("indexing")));
+
+    // A failure of another request leaves the index running.
+    app.indexing = true;
+    app.on_response(Response::Error {
+        epoch: app.epoch(),
+        context: "filter".into(),
+        message: "bad".into(),
+    });
+    assert!(app.indexing, "a bad filter does not stop the index");
+}
+
+#[test]
+fn an_old_answer_for_another_cell_does_not_replace_the_inspector() {
+    use peruse_core::Response;
+    let p = write_sample("cell-stale", SAMPLE, "csv");
+    let (mut app, mut term) = open(&p);
+    settle(&mut app, &mut term);
+    app.run(Cmd::ColRight);
+    app.run(Cmd::InspectCell);
+    settle(&mut app, &mut term);
+    assert_eq!(app.cell_value.as_deref(), Some("alice"));
+
+    // The answer for a cell that the user opened before arrives late.
+    app.on_response(Response::Cell {
+        epoch: app.epoch(),
+        row: 3,
+        column: "name".into(),
+        value: Some("dave".into()),
+    });
+    assert_eq!(app.cell_value.as_deref(), Some("alice"));
+}
+
+#[test]
+fn an_old_part_of_a_search_does_not_move_the_cursor_of_a_new_one() {
+    use peruse_core::Response;
+    let p = write_sample("search-stale", SAMPLE, "csv");
+    let (mut app, mut term) = open(&p);
+    settle(&mut app, &mut term);
+
+    app.run(Cmd::Search);
+    type_text(&mut app, "erin");
+    press(&mut app, ratatui::crossterm::event::KeyCode::Enter);
+    drop_responses(&app);
+    // A part of an older search arrives. It examined other rows.
+    app.on_response(Response::Search {
+        epoch: app.epoch(),
+        hits: vec![2],
+        from: 1000,
+        scan: 7,
+    });
+    assert_eq!(app.cursor_row, 0, "the match of an older search moved the cursor");
+}
+
+#[test]
+fn a_view_from_the_command_line_is_the_first_view_that_the_worker_reads() {
+    // A start with --filter must send one view. The worker would otherwise be
+    // busy with the whole file first.
+    let p = write_sample("startup-view", SAMPLE, "csv");
+    let (worker, opened) = Worker::spawn(p.to_str().unwrap(), OpenOptions::default()).unwrap();
+    let mut app = App::idle(worker, opened, peruse_core::theme::builtin("peruse-dark").unwrap());
+    app.config_path = p.parent().map(|d| d.join("config.toml"));
+    app.set_raw_filter("region = 'EU'");
+    app.start(false);
+    assert_eq!(app.epoch(), 1, "more than one view went to the worker");
+    let mut term = Terminal::new(TestBackend::new(110, 24)).unwrap();
+    settle(&mut app, &mut term);
+    assert!(screen(&term).contains("3 × 4"), "{}", screen(&term));
+}
+
+#[test]
+fn a_key_that_scrolls_back_moves_the_help_at_once_after_the_end() {
+    use ratatui::crossterm::event::KeyCode;
+    let p = write_sample("help-scroll-end", SAMPLE, "csv");
+    let (mut app, mut term) = open(&p);
+    settle(&mut app, &mut term);
+    app.run(Cmd::Help);
+    frame(&mut app, &mut term);
+    // Hold the key down far past the end of the text.
+    for _ in 0..300 {
+        press_char(&mut app, 'j');
+    }
+    frame(&mut app, &mut term);
+    let end = screen(&term);
+    press_char(&mut app, 'k');
+    frame(&mut app, &mut term);
+    assert_ne!(screen(&term), end, "the first press of k after the end did nothing");
+
+    // The wheel at the end draws no frame.
+    for _ in 0..300 {
+        press(&mut app, KeyCode::Down);
+    }
+    frame(&mut app, &mut term);
+    assert!(
+        !mouse(&mut app, ratatui::crossterm::event::MouseEventKind::ScrollDown, 50, 10),
+        "the wheel at the end of the help asked for a frame"
+    );
+}
+
+#[test]
+fn the_theme_picker_of_the_settings_page_goes_back_to_the_settings_page() {
+    use ratatui::crossterm::event::KeyCode;
+    let p = write_sample("picker-from-settings", SAMPLE, "csv");
+    let (mut app, mut term) = open(&p);
+    settle(&mut app, &mut term);
+    app.run(Cmd::Settings);
+    press_char(&mut app, 'T');
+    assert_eq!(app.mode, Mode::ThemePicker);
+    press(&mut app, KeyCode::Esc);
+    assert_eq!(app.mode, Mode::Settings, "Esc left the settings page too");
+    press_char(&mut app, 'T');
+    press(&mut app, KeyCode::Enter);
+    assert_eq!(app.mode, Mode::Settings, "Enter left the settings page too");
+    // The picker from the grid still goes back to the grid.
+    press(&mut app, KeyCode::Esc);
+    app.run(Cmd::ThemePicker);
+    press(&mut app, KeyCode::Esc);
+    assert_eq!(app.mode, Mode::Normal);
+}
+
+#[test]
+fn the_wheel_at_the_top_of_the_file_draws_no_frame() {
+    use ratatui::crossterm::event::{KeyModifiers, MouseEventKind};
+    let p = write_sample("wheel-at-top", SAMPLE, "csv");
+    let (mut app, mut term) = open(&p);
+    settle(&mut app, &mut term);
+    assert!(!wheel(&mut app, MouseEventKind::ScrollUp, KeyModifiers::NONE, 20, 5));
+    assert!(!wheel(&mut app, MouseEventKind::ScrollUp, KeyModifiers::SHIFT, 20, 5));
+    assert!(wheel(&mut app, MouseEventKind::ScrollDown, KeyModifiers::NONE, 20, 5));
+}
+
+#[test]
+fn esc_stops_a_search_between_two_parts() {
+    use peruse_core::Response;
+    let p = write_sample("search-esc-idle", SAMPLE, "csv");
+    let (mut app, mut term) = open(&p);
+    settle(&mut app, &mut term);
+    app.run(Cmd::Search);
+    type_text(&mut app, "erin");
+    press(&mut app, ratatui::crossterm::event::KeyCode::Enter);
+    drop_responses(&app);
+    // The worker has a moment with no work between two parts of a search.
+    app.busy = false;
+    press(&mut app, ratatui::crossterm::event::KeyCode::Esc);
+    assert!(app.status.as_ref().is_some_and(|s| s.text.contains("search stopped")));
+    // The part that was on its way arrives, and it changes nothing.
+    app.on_response(Response::Search {
+        epoch: app.epoch(),
+        hits: vec![4],
+        from: 0,
+        scan: 5,
+    });
+    assert_eq!(app.cursor_row, 0, "a search that Esc stopped moved the cursor");
+}
+
+#[test]
+fn a_filter_that_fails_gives_back_the_rows_of_the_view_before_it() {
+    use ratatui::crossterm::event::KeyCode;
+    let p = write_sample("bad-filter-back", SAMPLE, "csv");
+    let (mut app, mut term) = open(&p);
+    settle(&mut app, &mut term);
+    app.run(Cmd::SortCycle);
+    settle(&mut app, &mut term);
+
+    // The prompt checks the safety of the text, and only DuckDB knows the
+    // columns, so this filter fails in the engine.
+    press_char(&mut app, 'E');
+    type_text(&mut app, "no_such_column > 1");
+    press(&mut app, KeyCode::Enter);
+    settle(&mut app, &mut term);
+    let s = screen(&term);
+    assert!(s.contains("alice") && s.contains("dave"), "the grid lost its rows\n{s}");
+    assert!(s.contains("no_such_column"), "the message is gone\n{s}");
+    assert!(s.contains("5 × 4"), "{s}");
+    assert_eq!(app.view.filter, None);
+    assert_eq!(app.view.sort.len(), 1, "the sort of the view before was lost");
+
+    // The key u goes back past the view that failed, to the view before the
+    // sort.
+    press_char(&mut app, 'u');
+    assert!(app.view.sort.is_empty());
+
+    // The text is in the history of the prompt, for a correction.
+    press_char(&mut app, 'E');
+    press(&mut app, KeyCode::Up);
+    assert_eq!(app.input.text(), "no_such_column > 1");
+}
+
+#[test]
+fn an_empty_view_has_no_cell_to_copy_or_to_show() {
+    let p = write_sample("empty-cell", SAMPLE, "csv");
+    let (mut app, mut term) = open(&p);
+    settle(&mut app, &mut term);
+    app.view.filter = Some("id > 100".into());
+    app.run_startup_view();
+    settle(&mut app, &mut term);
+    assert!(app.is_empty());
+    app.run(Cmd::CopyCell);
+    let msg = app.status.as_ref().map(|s| s.text.clone()).unwrap_or_default();
+    assert!(!msg.contains("copied"), "y copied a cell of an empty view: {msg}");
+    app.run(Cmd::InspectCell);
+    assert_eq!(app.mode, Mode::Normal, "Enter opened a cell of an empty view");
+}
