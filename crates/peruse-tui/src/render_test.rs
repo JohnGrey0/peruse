@@ -3162,3 +3162,29 @@ fn every_mode_draws_at_every_size_over_awkward_text() {
     }
 }
 
+#[test]
+fn the_scroll_bar_never_covers_the_last_character_of_a_column() {
+    // Six columns of six screen columns each, after a gutter of four, end
+    // exactly at the right edge of a terminal of 45 columns. The scroll bar
+    // sits on that edge, so it covered the last digit of each number in the
+    // last column.
+    let mut body = String::from("a,b,c,d,e,f\n");
+    for i in 0..100 {
+        body.push_str(&format!("{i},{i},{i},{i},{i},{}\n", 900 + i));
+    }
+    let p = write_sample("scrollbar", &body, "csv");
+    let (mut app, _) = open(&p);
+    let mut term = Terminal::new(TestBackend::new(45, 24)).unwrap();
+    settle(&mut app, &mut term);
+    let s = screen(&term);
+    assert!(s.contains('│') && s.contains('█'), "no scroll bar\n{s}");
+
+    let (ci, x, w) = *app.hit.cols.last().expect("no column on the screen");
+    assert!(x + w < 45, "the last column reaches under the scroll bar\n{s}");
+    // The first row of data holds the whole value of the last column.
+    let row = &lines(&term)[2];
+    let shown: String = row.chars().skip(x as usize).take(w as usize).collect();
+    let want = app.page.cell(0, ci).expect("the first row did not arrive").to_string();
+    assert_eq!(shown.trim(), want, "the value is cut\n{s}");
+}
+

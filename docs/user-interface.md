@@ -71,7 +71,8 @@ and the body both need the result. The function does these steps:
 3. It gives the columns that fit, with a position and a width for each one.
 
 The header shows a sign at the left edge or at the right edge when more columns
-are outside the screen.
+are outside the screen. The last screen column stays free for that sign and for
+the scroll bar, so no column loses its last character under them.
 
 The width of each column comes from `App::fit_widths`, which measures the name
 of the column and the widest value on the screen. The function `fitted_width`
