@@ -179,10 +179,26 @@ impl View {
     }
 
     /// Gives the one relation that each generated statement reads from.
+    ///
+    /// The statement from the user goes inside parentheses, and the name `q`
+    /// comes after them on a new line. The new line is not for looks: a
+    /// statement that ends with a line comment, such as `SELECT * FROM src --
+    /// note`, would otherwise put `) AS q` on the same line as the comment, and
+    /// the comment would hide the parenthesis. The guard accepts such a
+    /// statement, so the generated SQL must not break on it.
+    ///
+    /// The trailing semicolons and the trailing spaces come off first, so a
+    /// statement such as `SELECT 1;` does not leave a semicolon inside the
+    /// parentheses.
     fn relation(&self) -> String {
         match &self.base {
             Base::Source => format!("src AS {ALIAS}"),
-            Base::Sql(sql) => format!("({}) AS {ALIAS}", sql.trim().trim_end_matches(';')),
+            Base::Sql(sql) => {
+                let inner = sql
+                    .trim()
+                    .trim_end_matches(|c: char| c == ';' || c.is_whitespace());
+                format!("({inner}\n) AS {ALIAS}")
+            }
         }
     }
 
@@ -292,7 +308,11 @@ impl View {
                 let id = quote_ident(&c.name);
                 let value = match c.kind {
                     CellKind::Binary => format!("('blob ' || octet_length({id}) || ' B')"),
-                    CellKind::Text => format!("substr({id}, 1, {MAX_CELL_CHARS})"),
+                    // The cast is free for a VARCHAR column, and it is
+                    // necessary for a column such as UUID that the family reads
+                    // as text but that substr() does not take. Refer to
+                    // [`View::search_sql`].
+                    CellKind::Text => format!("substr(CAST({id} AS VARCHAR), 1, {MAX_CELL_CHARS})"),
                     _ => id,
                 };
                 format!("{}: {value}", quote_str(&c.name))
@@ -488,10 +508,14 @@ impl View {
         let width = (hi - lo) / bins as f64;
         let wh = self.where_clause();
         let conj = if wh.is_empty() { " WHERE" } else { " AND" };
+        // The group and the order are by position, and not by the alias `b`.
+        // A column of the file can be named `b` or `n`, the same as the two
+        // aliases here, and DuckDB then refuses `GROUP BY b` because the name
+        // is ambiguous. The position cannot clash with a column name.
         format!(
             "SELECT least({bins} - 1, floor(({c}::DOUBLE - {lo:?}) / {width:?}))::BIGINT AS b, \
              count(*)::BIGINT AS n FROM {}{wh}{conj} {c} IS NOT NULL AND isfinite({c}::DOUBLE) \
-             GROUP BY b ORDER BY b",
+             GROUP BY 1 ORDER BY 1",
             self.relation()
         )
     }
@@ -539,12 +563,16 @@ impl View {
             .map(|c| {
                 let id = quote_ident(&c.name);
                 match c.kind {
-                    // The column is text already. A cast would copy each
-                    // value and give no gain.
-                    CellKind::Text => format!("contains(lower({id}), {low})"),
                     // The grid shows the size of a BLOB value, and not its
                     // bytes. A match on those bytes would confuse the user.
                     CellKind::Binary => String::new(),
+                    // Each other column goes through CAST(... AS VARCHAR). For
+                    // a VARCHAR column the cast is free: DuckDB removes a cast
+                    // to the same type, so the plan is the same as a bare
+                    // column. For a column such as UUID, which the family reads
+                    // as text but which is not a VARCHAR, the cast is
+                    // necessary: lower() and contains() take text only, and a
+                    // UUID with no cast gives a binder error.
                     _ => format!("contains(lower(CAST({id} AS VARCHAR)), {low})"),
                 }
             })
@@ -678,8 +706,31 @@ mod tests {
             base: Base::Sql("SELECT 1 AS x;".into()),
             ..Default::default()
         };
-        assert_eq!(v.select("*"), "SELECT * FROM (SELECT 1 AS x) AS q");
+        assert_eq!(v.select("*"), "SELECT * FROM (SELECT 1 AS x\n) AS q");
         assert!(!v.is_source());
+    }
+
+    #[test]
+    fn a_user_statement_that_ends_with_a_line_comment_still_wraps() {
+        // The guard accepts a statement that ends with a line comment, so the
+        // generated SQL must not break on it. The name `q` comes on a new
+        // line, below the comment, and not on the same line after it.
+        let v = View {
+            base: Base::Sql("SELECT * FROM src -- note".into()),
+            ..Default::default()
+        };
+        let sql = v.count_sql();
+        assert!(
+            sql.ends_with("-- note\n) AS q"),
+            "the comment would hide `) AS q`: {sql}"
+        );
+        // A statement that ends with a semicolon leaves no semicolon inside
+        // the parentheses, which would be a second, empty statement.
+        let semi = View {
+            base: Base::Sql("SELECT 1 AS x ;  ".into()),
+            ..Default::default()
+        };
+        assert_eq!(semi.select("*"), "SELECT * FROM (SELECT 1 AS x\n) AS q");
     }
 
     #[test]
@@ -871,7 +922,10 @@ mod tests {
         // The database must fold the case of the needle and of the value with
         // the same rule. It therefore calls lower() on both.
         let sql = View::default().search_sql(&schema(), "Carol", 0, 1000, 10);
-        assert!(sql.contains("contains(lower(\"name\"), lower('Carol'))"), "got {sql}");
+        assert!(
+            sql.contains("contains(lower(CAST(\"name\" AS VARCHAR)), lower('Carol'))"),
+            "got {sql}"
+        );
     }
 
     #[test]
@@ -882,14 +936,42 @@ mod tests {
     }
 
     #[test]
-    fn search_does_not_cast_text_or_probe_blobs() {
+    fn search_casts_every_searched_column_and_skips_blobs() {
+        // Each searched column goes through CAST(... AS VARCHAR). The cast is
+        // free for a VARCHAR column and necessary for a type such as UUID that
+        // the family reads as text but that lower() does not take.
         let sql = View::default().search_sql(&schema(), "x", 0, 100, 10);
-        assert!(sql.contains("contains(lower(\"name\")"), "VARCHAR should not be cast: {sql}");
+        assert!(
+            sql.contains("contains(lower(CAST(\"name\" AS VARCHAR))"),
+            "text column is cast: {sql}"
+        );
         assert!(
             sql.contains("contains(lower(CAST(\"id\" AS VARCHAR))"),
             "BIGINT needs a cast: {sql}"
         );
         assert!(!sql.contains("\"payload\""), "blobs are not searched: {sql}");
+    }
+
+    #[test]
+    fn search_and_record_view_work_over_a_column_that_is_not_varchar() {
+        // A UUID column reads as text, but it is not a VARCHAR. The string
+        // functions lower(), contains() and substr() take text only, so the
+        // builders must cast such a column. Without the cast DuckDB gives a
+        // binder error, and search and the record view fail for the whole
+        // table.
+        let s = Schema {
+            columns: vec![Column::new("ref", "UUID", true)],
+        };
+        let search = View::default().search_sql(&s, "0001", 0, 100, 10);
+        assert!(
+            search.contains("CAST(\"ref\" AS VARCHAR)"),
+            "a UUID must be cast for search: {search}"
+        );
+        let json = View::default().row_json_sql(&s, 0);
+        assert!(
+            json.contains("substr(CAST(\"ref\" AS VARCHAR)"),
+            "a UUID must be cast for the record view: {json}"
+        );
     }
 
     #[test]
@@ -903,6 +985,18 @@ mod tests {
             sql.contains("ORDER BY \"id\" DESC LIMIT 100 OFFSET 0"),
             "slice must be taken from the sorted view: {sql}"
         );
+    }
+
+    #[test]
+    fn the_histogram_groups_by_position_so_a_column_name_cannot_clash() {
+        // The aliases are `b` and `n`. A column of the file can carry either
+        // name, and a group by the alias would then be ambiguous and DuckDB
+        // would refuse the statement. A group by the position cannot clash.
+        for col in ["n", "b", "amount"] {
+            let sql = View::default().histogram_sql(col, 0.0, 10.0, 24);
+            assert!(sql.contains("GROUP BY 1 ORDER BY 1"), "got {sql}");
+            assert!(!sql.contains("GROUP BY b"), "a named group can clash: {sql}");
+        }
     }
 
     #[test]

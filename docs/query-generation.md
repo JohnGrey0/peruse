@@ -264,9 +264,14 @@ The function `search_sql` builds this statement. The design has a reason:
 
 The conditions use one item for each column:
 
-- For a text column: `contains(lower("c"), lower('needle'))`
 - For a BLOB column: no item, because the grid shows the size only
 - For each other column: `contains(lower(CAST("c" AS VARCHAR)), lower('needle'))`
+
+A text column is cast too. The cast is free for a `VARCHAR` column, because
+DuckDB removes a cast to the same type. The cast is necessary for a column such
+as `UUID`, which the schema reads as text but which `lower` does not take: with
+no cast the statement gives an error from the database, and the search then
+fails for the whole table.
 
 The function `contains` looks for a plain part of a text. `ILIKE` reads a
 pattern first, and it costs about three times as much for the same answer. Over
@@ -278,7 +283,6 @@ constant. Both sides of the test therefore follow the same rule for a letter,
 also for a letter that English does not use.
 
 The needle needs no escape character. A search for `50%` looks for the three
-characters, and `%` is not a wildcard here. A text column needs no cast, because
-a cast would copy each value for no gain.
+characters, and `%` is not a wildcard here.
 
 The statement is empty when the schema holds BLOB columns only.
