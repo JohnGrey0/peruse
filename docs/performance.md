@@ -280,6 +280,21 @@ A table of a DuckDB database needs no index. The database holds its rows in
 blocks already, so `Engine::is_seekable` gives `true` for it, as it does for a
 Parquet file.
 
+## Decision 9: sort the positions one time for a deep sorted page
+
+A sorted page deep in the view made DuckDB sort each column of each row, and
+each scroll there asked for that sort again. On 10 million rows of Parquet one
+window at the middle cost 0.7 to 1.1 s. The engine now sorts the sort columns
+and the position of each row one time, into a table in memory, at the first
+sorted request past row 100,000. The first window there costs 0.1 to 0.2 s, and
+each later window costs 10 to 20 ms. A jump to the last row of a sorted view
+fell from 914 ms to 18 ms. Near the start of the view the direct sort keeps the
+first rows only and costs less than the table, so it stays. Refer to
+[engine.md](engine.md#a-sorted-page).
+
+The table costs about 11 bytes of memory for each row of the view: DuckDB
+reported 108 MB for 10 million rows. It holds one view at a time.
+
 ## The costs that stay
 
 Two operations need a full scan, and no decision can remove that cost:

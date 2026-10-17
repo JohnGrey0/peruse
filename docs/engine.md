@@ -300,6 +300,29 @@ megabytes can therefore not stop a redraw. For a BLOB column, the statement
 gives the size only, and not the bytes. The cell inspector asks for the
 complete value of one cell with `Engine::cell`.
 
+### A sorted page
+
+A sorted page over the file reads the view `src_ord`, which holds each column of
+`src` and the position of each row in the file. The sort ends with that
+position, so each row has one place in the sort. Refer to
+[query-generation.md](query-generation.md).
+
+A sorted page deep in the view is a different case. There DuckDB must sort each
+column of each row, and the next page sorts them again. A sorted request that
+ends after row 100,000 (`SORT_TABLE_ROWS`) therefore fills the table
+`__peruse_sorted` with the positions of the rows of the view, in the order of the
+view. That sort holds the sort columns and the position only. The row id of a
+position in the table is the number of its row in the view, so each page takes
+its positions from the table with `LIMIT` and `OFFSET`, and its rows from
+`src_ord` by position. The cell inspector and the record view read the same
+way.
+
+The table holds one view at a time. A request for another view below row
+100,000 sorts directly, and a request past it fills the table again. The engine
+drops the table when the view `src` changes, for example when it indexes a file
+of text. A source with no position, such as a file of text with no index, sorts
+directly at each depth.
+
 ## The counts
 
 The function `Engine::count` runs `SELECT count(*)`. The statement has no
