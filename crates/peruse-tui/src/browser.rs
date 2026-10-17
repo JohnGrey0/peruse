@@ -631,14 +631,21 @@ pub fn draw(f: &mut Frame, b: &mut Browser, theme: &Theme, depth: Depth) -> Opti
         y += 2;
     }
 
+    // The row of keys takes the last row of the screen. A message must stay
+    // above it, and it must never go below the screen: a write outside the
+    // buffer stops the program. A short screen with the find box open had its
+    // message on the row under the screen.
+    let last_free = area.bottom().saturating_sub(1);
     if let Some(e) = &b.error {
-        buf.set_stringn(
-            area.x + 1,
-            y,
-            text::truncate(e, area.width.saturating_sub(2) as usize),
-            area.width.saturating_sub(2) as usize,
-            p.on(t.error, t.bg),
-        );
+        if y < last_free {
+            buf.set_stringn(
+                area.x + 1,
+                y,
+                text::truncate(e, area.width.saturating_sub(2) as usize),
+                area.width.saturating_sub(2) as usize,
+                p.on(t.error, t.bg),
+            );
+        }
         y += 2;
     }
 
@@ -647,7 +654,7 @@ pub fn draw(f: &mut Frame, b: &mut Browser, theme: &Theme, depth: Depth) -> Opti
     let rows = b.rows();
     let list_h = area.bottom().saturating_sub(y + 2) as usize;
     let items = rows.iter().filter(|r| matches!(r, Row::Item(_))).count();
-    if items == 0 {
+    if items == 0 && y < last_free {
         let msg = if !b.find.is_empty() {
             "no name holds that text"
         } else if b.database.is_some() {
@@ -1546,6 +1553,36 @@ mod render_tests {
             })
             .unwrap();
             b.on_key(&key(KeyCode::Esc));
+        }
+    }
+
+    #[test]
+    fn a_find_box_with_no_match_draws_on_a_short_screen() {
+        // The find box takes two rows, and the message about a directory that
+        // Peruse cannot read takes two more. On a short screen, the row for
+        // the message "no name holds that text" was then the row under the
+        // screen, and a write there stops the program.
+        let d = sample("short-find");
+        let theme = peruse_core::theme::builtin("peruse-dark").unwrap();
+        for error in [false, true] {
+            let mut b = Browser::new(d.clone(), &Config::default());
+            if error {
+                b.error = Some("cannot read this directory".into());
+            }
+            b.on_key(&key(KeyCode::Char('/')));
+            for c in "zzz".chars() {
+                b.on_key(&key(KeyCode::Char(c)));
+            }
+            assert!(b.items().is_empty(), "the find box found a name");
+            for h in 4..=8u16 {
+                for w in [20u16, 40, 90] {
+                    let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+                    term.draw(|f| {
+                        draw(f, &mut b, &theme, Depth::True);
+                    })
+                    .unwrap();
+                }
+            }
         }
     }
 
