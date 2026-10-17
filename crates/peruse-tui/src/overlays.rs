@@ -277,7 +277,9 @@ pub fn draw_help(buf: &mut Buffer, area: Rect, app: &App, p: &Paint) -> OverlayH
     }
     // The help holds text and no list. A click inside it therefore selects
     // nothing, and a click outside it closes the overlay.
-    OverlayHit::new(app.mode, outer)
+    let mut hit = OverlayHit::new(app.mode, outer);
+    hit.scroll_max = Some(max_scroll);
+    hit
 }
 
 /// The width of the marker column of the palette, in screen columns.
@@ -742,7 +744,9 @@ pub fn draw_cell(buf: &mut Buffer, area: Rect, app: &App, p: &Paint) -> OverlayH
     );
     // The inspector holds one value and no list. A click inside it therefore
     // selects nothing.
-    OverlayHit::new(app.mode, outer)
+    let mut hit = OverlayHit::new(app.mode, outer);
+    hit.scroll_max = Some(max_scroll);
+    hit
 }
 
 /// Writes the keys along the bottom edge of an overlay.

@@ -682,6 +682,15 @@ pub struct OverlayHit {
     /// past. The row on the screen is therefore not the position in the list,
     /// and a click needs this table to find the line under the pointer.
     pub lines: Vec<(u16, usize)>,
+    /// The largest first line of a box of text that scrolls: the help and the
+    /// cell inspector. Only the frame knows the height of the box, so the
+    /// frame writes it here, and a key that scrolls stops at it.
+    ///
+    /// Without this limit, each press after the end of the text counted, and
+    /// a user then pressed the key that scrolls back as many times before the
+    /// text moved again. The wheel at the end also drew the same frame again
+    /// and again.
+    pub scroll_max: Option<u16>,
 }
 
 impl OverlayHit {
@@ -691,6 +700,7 @@ impl OverlayHit {
             mode,
             area,
             lines: Vec::new(),
+            scroll_max: None,
         }
     }
 
@@ -2086,10 +2096,12 @@ impl App {
         match self.mode {
             Mode::Prompt(kind) => self.prompt_key(kind, key),
             Mode::Help => self.overlay_key(key, |app, d| {
-                app.help_scroll = app.help_scroll.saturating_add_signed(d as i16);
+                let max = app.scroll_max();
+                app.help_scroll = app.help_scroll.min(max).saturating_add_signed(d as i16).min(max);
             }),
             Mode::Cell => self.overlay_key(key, |app, d| {
-                app.cell_scroll = app.cell_scroll.saturating_add_signed(d as i16);
+                let max = app.scroll_max();
+                app.cell_scroll = app.cell_scroll.min(max).saturating_add_signed(d as i16).min(max);
             }),
             Mode::Record => self.record_key(key),
             Mode::Settings => self.settings_key(key),
@@ -2130,6 +2142,16 @@ impl App {
             self.rows_error = false;
         }
         acted
+    }
+
+    /// Gives the largest first line of the box of text that is open, from the
+    /// last frame. Before the first frame, the function gives no limit.
+    fn scroll_max(&self) -> u16 {
+        self.overlay
+            .as_ref()
+            .filter(|h| h.mode == self.mode)
+            .and_then(|h| h.scroll_max)
+            .unwrap_or(u16::MAX)
     }
 
     /// Gives one key to the program, as a press with no modifier.

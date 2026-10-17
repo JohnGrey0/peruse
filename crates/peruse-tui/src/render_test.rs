@@ -3305,3 +3305,32 @@ fn a_view_from_the_command_line_is_the_first_view_that_the_worker_reads() {
     settle(&mut app, &mut term);
     assert!(screen(&term).contains("3 × 4"), "{}", screen(&term));
 }
+
+#[test]
+fn a_key_that_scrolls_back_moves_the_help_at_once_after_the_end() {
+    use ratatui::crossterm::event::KeyCode;
+    let p = write_sample("help-scroll-end", SAMPLE, "csv");
+    let (mut app, mut term) = open(&p);
+    settle(&mut app, &mut term);
+    app.run(Cmd::Help);
+    frame(&mut app, &mut term);
+    // Hold the key down far past the end of the text.
+    for _ in 0..300 {
+        press_char(&mut app, 'j');
+    }
+    frame(&mut app, &mut term);
+    let end = screen(&term);
+    press_char(&mut app, 'k');
+    frame(&mut app, &mut term);
+    assert_ne!(screen(&term), end, "the first press of k after the end did nothing");
+
+    // The wheel at the end draws no frame.
+    for _ in 0..300 {
+        press(&mut app, KeyCode::Down);
+    }
+    frame(&mut app, &mut term);
+    assert!(
+        !mouse(&mut app, ratatui::crossterm::event::MouseEventKind::ScrollDown, 50, 10),
+        "the wheel at the end of the help asked for a frame"
+    );
+}
