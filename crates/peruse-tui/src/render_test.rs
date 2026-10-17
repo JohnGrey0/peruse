@@ -2975,3 +2975,102 @@ fn the_mouse_does_not_stop_the_program_on_a_small_terminal() {
         }
     }
 }
+
+/// Writes a file of 40 columns: even columns hold numbers, odd columns text.
+///
+/// A column of numbers gets a chart and more rows of statistics than a column
+/// of text, so a move across the columns changes what the statistics need.
+fn wide_mixed_sample(tag: &str) -> PathBuf {
+    let names: Vec<String> = (0..40)
+        .map(|i| if i % 2 == 0 { format!("num_{i:02}") } else { format!("txt_{i:02}") })
+        .collect();
+    let mut body = names.join(",");
+    body.push('\n');
+    for r in 0..60 {
+        let row: Vec<String> = (0..40)
+            .map(|i| {
+                if i % 2 == 0 {
+                    format!("{}", (r * (i + 3)) % 17)
+                } else {
+                    format!("v{}", (r + i) % 5)
+                }
+            })
+            .collect();
+        body.push_str(&row.join(","));
+        body.push('\n');
+    }
+    write_sample(tag, &body, "csv")
+}
+
+/// Gives the row of the screen that holds this text, if any.
+fn find_row(term: &Terminal<TestBackend>, needle: &str) -> Option<usize> {
+    lines(term).iter().position(|l| l.contains(needle))
+}
+
+#[test]
+fn the_list_of_columns_stays_still_while_the_cursor_moves_through_it() {
+    // The owner reported that the list of columns jumped at each turn of the
+    // wheel, and that the list was hard to read until the wheel stopped. The
+    // list put the cursor in the middle at each move, so each name moved one
+    // row at each column.
+    let p = wide_mixed_sample("meta-still");
+    let (mut app, _) = open(&p);
+    let mut term = Terminal::new(TestBackend::new(160, 45)).unwrap();
+    settle(&mut app, &mut term);
+    app.run(Cmd::ToggleMeta);
+    assert_eq!(app.panel, Panel::Meta);
+    settle(&mut app, &mut term);
+
+    // Move to the middle of the list, where the old window put the cursor in
+    // the middle at each move, and remember where a name below it is.
+    for _ in 0..18 {
+        app.run(Cmd::ColRight);
+    }
+    settle(&mut app, &mut term);
+    let anchor = find_row(&term, "txt_25").expect("txt_25 is in the list");
+    for step in 0..4 {
+        app.run(Cmd::ColRight);
+        term.draw(|f| ui::draw(f, &mut app, Depth::True)).unwrap();
+        assert_eq!(
+            find_row(&term, "txt_25"),
+            Some(anchor),
+            "the list moved at step {step}\n{}",
+            screen(&term)
+        );
+    }
+}
+
+#[test]
+fn the_border_between_the_two_panels_does_not_jump_back() {
+    // In the stacked view, the statistics took only the rows of the column
+    // under the cursor, and one row while they were not there yet. The border
+    // moved at each column, and the list of columns above it moved with it.
+    let p = wide_mixed_sample("both-border");
+    let (mut app, _) = open(&p);
+    let mut term = Terminal::new(TestBackend::new(160, 45)).unwrap();
+    settle(&mut app, &mut term);
+    app.run(Cmd::ToggleMeta);
+    app.run(Cmd::ToggleStats);
+    assert_eq!(app.panel, Panel::Both);
+
+    // The first pass finds the largest statistics. After it, the border must
+    // stay on one row, for numbers and text, and while the engine computes.
+    let border = |app: &App, term: &Terminal<TestBackend>| {
+        let name = app.schema.columns[app.cursor_col].name.clone();
+        find_row(term, &format!("┌ {name} "))
+    };
+    for _ in 0..6 {
+        settle(&mut app, &mut term);
+        app.run(Cmd::ColRight);
+    }
+    settle(&mut app, &mut term);
+    let fixed = border(&app, &term).expect("the statistics panel is on the screen");
+    for step in 0..6 {
+        app.run(Cmd::ColRight);
+        // The frame before the answer of the engine: the panel says "computing".
+        term.draw(|f| ui::draw(f, &mut app, Depth::True)).unwrap();
+        assert_eq!(border(&app, &term), Some(fixed), "computing, step {step}\n{}", screen(&term));
+        settle(&mut app, &mut term);
+        assert_eq!(border(&app, &term), Some(fixed), "computed, step {step}\n{}", screen(&term));
+    }
+}
