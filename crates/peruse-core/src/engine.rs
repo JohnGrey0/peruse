@@ -290,6 +290,20 @@ pub struct Engine {
     /// The value is `None` for a file. A file holds one table, and that table
     /// has no name of its own.
     table: Option<DbTable>,
+    /// Open handles that keep the source files read-only for the session.
+    ///
+    /// This is Layer D of the read-only promise, on Windows only. Each handle
+    /// is open with a share mode that lets another program read the file but
+    /// not write it and not delete it, so no program can change the data under
+    /// Peruse while Peruse shows it. The handles close when the engine closes,
+    /// which is when the session ends or the user opens another file. Refer to
+    /// [`read_only_locks`]. On Linux and macOS the field is empty, because
+    /// those systems have no equivalent of this share mode. Refer to
+    /// `docs/read-only-guard.md`.
+    // The handles are held only for their effect on the file system, and never
+    // read, so the field is dead code to the compiler.
+    #[allow(dead_code)]
+    locks: Vec<std::fs::File>,
 }
 
 /// What the DuckDB CSV sniffer found about a file.
@@ -589,6 +603,8 @@ impl Engine {
         }
 
         let plain = build_read_expr(&src, opts);
+        // Layer D: keep the files read-only for the session, on a local disk.
+        let locks = read_only_locks(&src.files, false, &crate::remote::System);
         let mut engine = Engine {
             conn,
             source: src,
@@ -598,6 +614,7 @@ impl Engine {
             base_schema: Schema::default(),
             csv_dialect: None,
             table: None,
+            locks,
         };
 
         // A file of text and a file of JSON hold no schema. DuckDB therefore
@@ -672,6 +689,9 @@ impl Engine {
         src.table = Some(table.label());
 
         let scan = table.qualified();
+        // Layer D: keep the database file and its log read-only for the
+        // session, on a local disk.
+        let locks = read_only_locks(&src.files, true, &crate::remote::System);
         let mut engine = Engine {
             read_expr: database_read_expr(&src, &table),
             conn,
@@ -681,6 +701,7 @@ impl Engine {
             base_schema: Schema::default(),
             csv_dialect: None,
             table: Some(table),
+            locks,
         };
         // Read the schema now, in the same way as for a file. A name that the
         // database does not hold therefore gives an error here.
@@ -1792,6 +1813,56 @@ fn allowed_files(files: &[PathBuf], database: bool) -> Vec<PathBuf> {
         }
     }
     out
+}
+
+/// Opens a read-only handle on each source file on a local disk, for the whole
+/// session.
+///
+/// This is Layer D of the read-only promise, on Windows only. Each handle is
+/// open with the share mode `FILE_SHARE_READ`, with no `FILE_SHARE_WRITE` and
+/// no `FILE_SHARE_DELETE`. While Peruse holds it, another program can read the
+/// file but cannot write it or delete it, so the data cannot change under
+/// Peruse. The caller keeps the handles in the engine, and they close when the
+/// engine closes: at the end of the session, or when the user opens another
+/// file.
+///
+/// The function never locks a file on a network drive, because a coworker must
+/// still write the file. It uses the same test as the local copies, through
+/// `probe`. A file that it cannot open read-only, such as a log that DuckDB
+/// holds, is left out, because the lock is a safety net and not a necessity.
+///
+/// On Linux and macOS there is no equivalent of this share mode: a handle there
+/// does not stop another program from writing the file. The function gives an
+/// empty list, and the promise rests on the other layers. Refer to
+/// `docs/read-only-guard.md`.
+#[cfg(windows)]
+fn read_only_locks(files: &[PathBuf], database: bool, probe: &dyn crate::remote::Probe) -> Vec<std::fs::File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    // FILE_SHARE_READ only. No FILE_SHARE_WRITE (0x2), no FILE_SHARE_DELETE (0x4).
+    const FILE_SHARE_READ: u32 = 0x0000_0001;
+    let mut out = Vec::new();
+    for f in allowed_files(files, database) {
+        if !f.is_file() || probe.is_remote(&f) {
+            continue;
+        }
+        let mut o = std::fs::OpenOptions::new();
+        o.read(true).share_mode(FILE_SHARE_READ);
+        if let Ok(h) = o.open(&f) {
+            out.push(h);
+        }
+    }
+    out
+}
+
+/// The other systems have no share mode that stops a write. Refer to the
+/// Windows form of this function and to `docs/read-only-guard.md`.
+#[cfg(not(windows))]
+fn read_only_locks(
+    _files: &[PathBuf],
+    _database: bool,
+    _probe: &dyn crate::remote::Probe,
+) -> Vec<std::fs::File> {
+    Vec::new()
 }
 
 /// Locks the connection, so that it can read the source files and nothing else.
@@ -3799,6 +3870,59 @@ mod tests {
         assert_eq!(e.count(&View::default()).unwrap(), 2);
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn a_local_file_cannot_be_written_while_peruse_reads_it() {
+        // Layer D, Windows. While the engine is open on a local file, the
+        // handle that it holds must stop another program from writing the file
+        // or deleting it. When the engine closes, the write must work again.
+        use std::os::windows::fs::OpenOptionsExt;
+        let d = tmpdir("lock-in-place");
+        let p = write_csv(&d, "s.csv", SAMPLE);
+        let engine = Engine::open(p.to_str().unwrap(), &OpenOptions::default()).unwrap();
+        assert!(!engine.locks.is_empty(), "a local file is locked");
+        // A write to the file now fails, because the share mode of the lock
+        // denies write access to another handle.
+        let write_now = std::fs::OpenOptions::new().write(true).open(&p);
+        assert!(write_now.is_err(), "the file was writable while Peruse read it");
+        // DuckDB opened and read the file with the lock held.
+        assert_eq!(engine.count(&View::default()).unwrap(), 3);
+        drop(engine);
+        // With the engine closed, the file is writable again.
+        let mut w = std::fs::OpenOptions::new()
+            .write(true)
+            .share_mode(1)
+            .open(&p)
+            .expect("the lock did not release at the end of the session");
+        use std::io::Write as _;
+        w.write_all(b"x").unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_file_on_a_network_drive_is_never_locked() {
+        // The lock must never fall on a file on a network drive, or a coworker
+        // could not write it. The test uses a probe that calls one local
+        // directory a network drive.
+        struct Remote(PathBuf);
+        impl crate::remote::Probe for Remote {
+            fn is_remote(&self, path: &Path) -> bool {
+                let full =
+                    |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+                full(path).starts_with(full(&self.0))
+            }
+            fn free_bytes(&self, _dir: &Path) -> Option<u64> {
+                None
+            }
+        }
+        let d = tmpdir("lock-remote");
+        let p = write_csv(&d, "s.csv", SAMPLE);
+        let locks = read_only_locks(&[p.clone()], false, &Remote(d.clone()));
+        assert!(locks.is_empty(), "a network file must not be locked");
+        // With no lock, another program can write the file.
+        assert!(std::fs::OpenOptions::new().write(true).open(&p).is_ok());
+    }
+
     #[test]
     fn the_lock_stops_a_write_to_a_file_outside_the_source() {
         // Layer C, the backstop for gap 1. A statement that reaches the
@@ -4408,7 +4532,10 @@ mod tests {
         }
 
         // A set of files with the same columns still gets its answer from the
-        // footer.
+        // footer. The engine holds a read-only handle on each file while it is
+        // open (Layer D), so close it before the file is replaced, as Peruse
+        // does when the user opens another source.
+        drop(e);
         std::fs::remove_file(d.join("a.parquet")).unwrap();
         conn.execute_batch(&format!(
             "COPY (SELECT i AS id FROM range(5) t(i)) TO '{}' (FORMAT parquet);",
