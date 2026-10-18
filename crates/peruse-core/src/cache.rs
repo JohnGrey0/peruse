@@ -67,6 +67,15 @@ const DATA: &str = "data";
 const TMP: &str = "tmp";
 const LEASE: &str = "lease-";
 
+/// The marker file that says Peruse made an entry of the cache.
+///
+/// The functions that remove an entry delete a directory tree, so they must
+/// never touch a directory that Peruse did not make. The file is the proof:
+/// [`remove_entry`] removes an entry only when the entry holds this file, is a
+/// true directory and not a link, and sits directly below the cache root.
+/// Refer to `docs/read-only-guard.md`, Layer E.
+const MARKER: &str = ".peruse-cache";
+
 /// When Peruse copies a file to the local disk.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Policy {
@@ -796,6 +805,12 @@ pub fn plan(input: &str, settings: &Settings, probe: &dyn Probe) -> Plan {
             data.display()
         )));
     }
+    // Mark the entry as one that Peruse made. The removal of old entries
+    // deletes a directory tree, and the marker is how it knows that the tree
+    // is a copy of Peruse and not another directory. An entry from an earlier
+    // version of Peruse gets the marker here, the first time this version uses
+    // it. Refer to [`MARKER`] and [`remove_entry`].
+    let _ = fs::write(entry.join(MARKER), b"peruse local copy cache entry\n");
     let local_input = if source::looks_like_glob(&t.suffix) {
         let d = data.to_string_lossy().replace('\\', "/");
         // A directory name with a wildcard character would change the glob.
@@ -934,25 +949,89 @@ fn evict(root: &Path, keep: &str, need: u64, cap: u64, probe: &dyn Probe) {
         if !over && !short {
             break;
         }
-        if remove_entry(&e.dir) {
+        if remove_entry(root, &e.dir) {
             total = total.saturating_sub(e.bytes);
             freed += e.bytes;
         }
     }
 }
 
-/// Removes one entry, unless a Peruse reads it now.
+/// Removes one entry of the cache, unless a Peruse reads it now.
+///
+/// The function removes a directory tree, so it first makes sure that the
+/// directory is an entry that Peruse made. This is Layer E of the read-only
+/// promise: a write of Peruse, here a delete, must never reach a path that is
+/// not a cache entry of Peruse. [`is_peruse_entry`] checks three things: the
+/// directory sits directly below the cache root, it is a true directory and
+/// not a link, and it holds the marker file. A directory that fails any of
+/// them stays, so a link or a junction that points outside the cache, or a
+/// directory that another program put in the cache, is never followed and
+/// never deleted.
 ///
 /// The manifest goes first. An entry that Windows cannot remove completely,
 /// because a file is open, then counts as an entry with no copy, and the next
 /// session copies the file again and does not read a copy that is not
 /// complete.
-fn remove_entry(dir: &Path) -> bool {
-    if in_use(dir) {
+fn remove_entry(root: &Path, dir: &Path) -> bool {
+    if in_use(dir) || !is_peruse_entry(root, dir) {
         return false;
     }
     let _ = fs::remove_file(dir.join(MANIFEST));
-    fs::remove_dir_all(dir).is_ok()
+    let cleaned = remove_tree_no_follow(dir);
+    let gone = fs::remove_dir(dir).is_ok();
+    cleaned && gone
+}
+
+/// Gives `true` when the directory is a cache entry that Peruse made.
+///
+/// The directory must sit directly below the cache root, be a true directory
+/// and not a symbolic link or a junction, and hold the marker file as a true
+/// file. Refer to [`MARKER`] and [`remove_entry`].
+fn is_peruse_entry(root: &Path, dir: &Path) -> bool {
+    if dir.parent() != Some(root) {
+        return false;
+    }
+    match fs::symlink_metadata(dir) {
+        Ok(m) if m.is_dir() && !m.file_type().is_symlink() => {}
+        _ => return false,
+    }
+    matches!(fs::symlink_metadata(dir.join(MARKER)), Ok(m) if m.is_file() && !m.file_type().is_symlink())
+}
+
+/// Removes each file and directory below `dir`, and never follows a link.
+///
+/// A link, a junction or any other reparse point is removed as the link
+/// itself, so the target of the link stays. A directory on Windows that is a
+/// junction needs `remove_dir`, and a link to a file needs `remove_file`, so
+/// the function tries both. It gives `false` when it cannot remove something.
+fn remove_tree_no_follow(dir: &Path) -> bool {
+    let Ok(list) = fs::read_dir(dir) else {
+        return false;
+    };
+    let mut ok = true;
+    for e in list.flatten() {
+        let p = e.path();
+        let Ok(meta) = fs::symlink_metadata(&p) else {
+            ok = false;
+            continue;
+        };
+        if meta.file_type().is_symlink() {
+            // Remove the link, and never the target. A link to a directory
+            // needs `remove_dir` on Windows, and a link to a file needs
+            // `remove_file`.
+            if fs::remove_file(&p).is_err() && fs::remove_dir(&p).is_err() {
+                ok = false;
+            }
+        } else if meta.is_dir() {
+            ok &= remove_tree_no_follow(&p);
+            if fs::remove_dir(&p).is_err() {
+                ok = false;
+            }
+        } else if fs::remove_file(&p).is_err() {
+            ok = false;
+        }
+    }
+    ok
 }
 
 /// Gives `true` when a Peruse holds a lease on the entry.
@@ -981,7 +1060,7 @@ pub fn clear(root: &Path) -> Cleared {
     let mut out = Cleared::default();
     for e in entries(root) {
         let counts = e.complete || e.bytes > 0;
-        if remove_entry(&e.dir) {
+        if remove_entry(root, &e.dir) {
             out.removed += usize::from(counts);
             out.bytes += e.bytes;
         } else if counts {
@@ -1392,7 +1471,10 @@ mod tests {
             .unwrap()
             .unwrap()
             .path();
-        assert_eq!(dir_bytes(&entry), 0, "no part of the copy stays");
+        // The copy data and the temporary parts are gone. The entry still
+        // holds the marker file, which is metadata and not a part of the copy,
+        // in the same way as a manifest or a lease.
+        assert_eq!(dir_bytes(&entry.join(DATA)) + dir_bytes(&entry.join(TMP)), 0, "no part of the copy stays");
         assert_eq!(usage(&cache), (0, 0), "an empty entry is not a copy");
         // The next session copies again, from the start.
         assert!(matches!(
@@ -1592,6 +1674,85 @@ mod tests {
         remove_old_parts(&tmp);
         assert!(!old.exists());
         assert!(fresh.exists(), "a copy that runs now keeps its part");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_cache_entry_without_the_marker_is_never_removed() {
+        // Layer E. A directory in the cache root that Peruse did not make, so
+        // it has no marker, must stay. The removal of old entries deletes a
+        // directory tree, and it must only ever delete a copy of Peruse.
+        let (base, _share, cache) = setup("marker");
+        fs::create_dir_all(&cache).unwrap();
+        let intruder = cache.join("not-ours");
+        fs::create_dir_all(&intruder).unwrap();
+        fs::write(intruder.join("keep.txt"), "keep").unwrap();
+        // `clear` and `evict` both leave it, because it has no marker.
+        assert_eq!(clear(&cache), Cleared::default());
+        let probe = Fake::new(&base);
+        evict(&cache, "none", 1, 0, &probe);
+        assert!(intruder.join("keep.txt").is_file(), "an intruder entry was removed");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_junction_in_the_cache_is_removed_as_a_link_and_its_target_survives() {
+        // Layer E, Windows. A junction inside the cache root must never be
+        // followed: removing the entry must remove the junction itself, and
+        // the files that it points at must stay. The test makes a Peruse entry
+        // whose `data` directory holds a junction to a directory of precious
+        // files.
+        let (base, share, cache) = setup("junction");
+        fs::create_dir_all(&cache).unwrap();
+        let precious = base.join("precious");
+        fs::create_dir_all(&precious).unwrap();
+        fs::write(precious.join("secret.txt"), "do not delete").unwrap();
+
+        // A real copy, so the entry has the marker and a manifest.
+        let f = share.join("data.csv");
+        fs::write(&f, "id\n1\n").unwrap();
+        let probe = Fake::new(&share);
+        let local = run(expect_copy(plan(f.to_str().unwrap(), &settings(&cache), &probe)), &probe);
+        let entry = local.dir.parent().unwrap().to_path_buf();
+        drop(local);
+        // Put a junction inside the entry that points at the precious files.
+        let link = entry.join(DATA).join("link");
+        let status = std::process::Command::new("cmd")
+            .args(["/c", "mklink", "/J"])
+            .arg(&link)
+            .arg(&precious)
+            .status()
+            .unwrap();
+        assert!(status.success(), "could not make a junction for the test");
+
+        let c = clear(&cache);
+        assert!(c.removed >= 1, "the entry was not removed: {c:?}");
+        assert!(!entry.exists(), "the entry stayed");
+        // The target of the junction, outside the cache, is untouched.
+        assert_eq!(
+            fs::read_to_string(precious.join("secret.txt")).unwrap(),
+            "do not delete",
+            "the delete followed the junction out of the cache"
+        );
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_normal_copy_still_clears_with_the_marker() {
+        // Layer E must not break the ordinary case. A copy that Peruse made
+        // has the marker, and `clear` removes it.
+        let (base, share, cache) = setup("marker-clear");
+        let f = share.join("data.csv");
+        fs::write(&f, "id\n1\n").unwrap();
+        let probe = Fake::new(&share);
+        let local = run(expect_copy(plan(f.to_str().unwrap(), &settings(&cache), &probe)), &probe);
+        let entry = local.dir.parent().unwrap().to_path_buf();
+        assert!(entry.join(MARKER).is_file(), "plan did not write the marker");
+        drop(local);
+        let c = clear(&cache);
+        assert_eq!(c.removed, 1, "{c:?}");
+        assert!(!entry.exists());
         let _ = fs::remove_dir_all(&base);
     }
 
