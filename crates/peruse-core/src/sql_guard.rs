@@ -419,6 +419,15 @@ pub fn ensure_read_only(sql: &str) -> Result<(), GuardError> {
         return Err(GuardError::NotAQuery(lead));
     }
 
+    scan_forbidden(&scrubbed)
+}
+
+/// Rejects a clean text that holds a keyword that writes, or a call to a
+/// function that writes, changes the state, or runs SQL from a value.
+///
+/// The function does not check the first word, so a caller can use it on the
+/// body of a view or a macro, which does not start with a query keyword.
+fn scan_forbidden(scrubbed: &str) -> Result<(), GuardError> {
     for word in scrubbed.split(|c: char| !(c.is_alphanumeric() || c == '_')) {
         if word.is_empty() {
             continue;
@@ -428,13 +437,66 @@ pub fn ensure_read_only(sql: &str) -> Result<(), GuardError> {
             return Err(GuardError::Forbidden(up));
         }
     }
-
     // A function that writes a file, changes the state, or runs SQL from a
     // value, called with no keyword that the step above catches.
-    if let Some(name) = contains_forbidden_call(&scrubbed) {
+    if let Some(name) = contains_forbidden_call(scrubbed) {
         return Err(GuardError::Forbidden(name));
     }
     Ok(())
+}
+
+/// Checks the stored SQL of a view inside a `.duckdb` file, before Peruse reads
+/// the view.
+///
+/// A database file can hold a view whose query calls a function that writes a
+/// file. DuckDB runs that query when Peruse reads the view, so the check comes
+/// before the read. Refer to `docs/read-only-guard.md`, Layer B.
+///
+/// The stored text is a complete `CREATE VIEW <name> AS <query>` statement. The
+/// function drops the part up to the first `AS`, which removes the `CREATE` and
+/// the name, and it then checks the query for a keyword or a function that
+/// writes. The clean-up blanks the name first, so an `AS` inside a name in
+/// quotation marks does not end the search too early.
+pub fn ensure_view_body_read_only(sql: &str) -> Result<(), GuardError> {
+    let (scrubbed, _) = scrub(sql)?;
+    let body = body_after_as(&scrubbed).unwrap_or(&scrubbed);
+    scan_forbidden(body)
+}
+
+/// Checks the body of a macro inside a `.duckdb` file, before Peruse reads an
+/// object that can call the macro.
+///
+/// The catalogue gives the body of a macro with no `CREATE` in front of it, so
+/// the function checks the whole text. Refer to [`ensure_view_body_read_only`].
+pub fn ensure_macro_body_read_only(sql: &str) -> Result<(), GuardError> {
+    let (scrubbed, _) = scrub(sql)?;
+    scan_forbidden(&scrubbed)
+}
+
+/// Gives the part of a clean `CREATE ... AS <body>` text after the first `AS`
+/// word, or `None` when there is no such word.
+fn body_after_as(scrubbed: &str) -> Option<&str> {
+    let b: Vec<char> = scrubbed.chars().collect();
+    let mut i = 0;
+    while i < b.len() {
+        if is_ident_char(b[i]) && (i == 0 || !is_ident_char(b[i - 1])) {
+            let start = i;
+            while i < b.len() && is_ident_char(b[i]) {
+                i += 1;
+            }
+            let word: String = b[start..i].iter().collect();
+            if word.eq_ignore_ascii_case("AS") {
+                // The byte index of `AS` in the original text equals the
+                // character index here, because the scrubber keeps each
+                // character outside a value or a comment as one character.
+                let byte = scrubbed.char_indices().nth(i).map(|(p, _)| p);
+                return byte.map(|p| &scrubbed[p..]);
+            }
+        } else {
+            i += 1;
+        }
+    }
+    None
 }
 
 /// Checks a `WHERE` expression from the filter prompt.

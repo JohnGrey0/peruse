@@ -659,6 +659,11 @@ impl Engine {
     /// statement.
     fn open_database(conn: Connection, mut src: Source, opts: &OpenOptions) -> Result<Engine> {
         attach_database(&conn, &src)?;
+        // Layer B of the read-only promise. A `.duckdb` file can hold a view or
+        // a macro whose SQL writes a file. DuckDB runs that SQL when Peruse
+        // reads the object, so the check comes before the first read, and a
+        // database with a failing object does not open at all.
+        check_stored_objects(&conn, &src.label)?;
         let tables = read_tables(&conn)
             .with_context(|| format!("reading the tables of {}", src.label))?;
         let table = choose_table(&src, &tables, opts.table.as_deref())?;
@@ -2067,6 +2072,69 @@ fn storage_version(duck: &str) -> Option<String> {
         .take_while(|c| c.is_ascii_digit())
         .collect();
     (!digits.is_empty()).then_some(digits)
+}
+
+/// Checks the SQL of each view and each macro of the attached database, before
+/// Peruse reads any of them.
+///
+/// This is Layer B of the read-only promise. A hostile `.duckdb` file can hold
+/// a view whose query, or a macro whose body, calls a function that writes a
+/// file. DuckDB runs that SQL when Peruse reads the object. The function checks
+/// the stored text with [`crate::sql_guard`] first, so a failing object never
+/// runs. A database with such an object does not open, and the message names
+/// the object.
+///
+/// The function checks every view and macro, not only the one that the grid
+/// shows, because a statement in the SQL prompt can name any of them.
+fn check_stored_objects(conn: &Connection, label: &str) -> Result<()> {
+    let alias = quote_str(DB_ALIAS);
+    // The views. The column `sql` holds a `CREATE VIEW ... AS <query>`.
+    let sql = format!(
+        "SELECT view_name, sql FROM duckdb_views() \
+         WHERE database_name = {alias} AND NOT internal AND sql IS NOT NULL"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let mut rows = stmt.query([])?;
+    while let Some(r) = rows.next()? {
+        let name: String = r.get(0)?;
+        let text: String = r.get(1)?;
+        if let Err(e) = crate::sql_guard::ensure_view_body_read_only(&text) {
+            bail!(stored_object_message(label, "view", &name, &e));
+        }
+    }
+    drop(rows);
+    drop(stmt);
+
+    // The macros. The column `macro_definition` holds the body with no
+    // `CREATE` in front of it.
+    let sql = format!(
+        "SELECT function_name, macro_definition FROM duckdb_functions() \
+         WHERE database_name = {alias} AND macro_definition IS NOT NULL"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let mut rows = stmt.query([])?;
+    while let Some(r) = rows.next()? {
+        let name: String = r.get(0)?;
+        let text: String = r.get(1)?;
+        if let Err(e) = crate::sql_guard::ensure_macro_body_read_only(&text) {
+            bail!(stored_object_message(label, "macro", &name, &e));
+        }
+    }
+    Ok(())
+}
+
+/// Writes the message for a view or a macro that the guard refuses.
+fn stored_object_message(
+    label: &str,
+    kind: &str,
+    name: &str,
+    e: &crate::sql_guard::GuardError,
+) -> String {
+    format!(
+        "{label}: the {kind} {name:?} in this database is not read-only ({e}), \
+         so Peruse does not open the database. A viewer must not run SQL that \
+         changes the data, and a database can hide such SQL in a {kind}."
+    )
 }
 
 /// Reads the tables and the views of the attached database.
@@ -3677,6 +3745,58 @@ mod tests {
         // The alias is in the text that the panel shows, so the user can read
         // it there.
         assert!(e.read_expr().contains("__peruse_db"), "{}", e.read_expr());
+    }
+
+    #[test]
+    fn a_database_with_a_view_that_writes_does_not_open() {
+        // Gap 1, Layer B. A `.duckdb` file holds a view whose query calls a
+        // function that writes a file. Peruse must refuse the database before
+        // it reads the view, name the view, and never run its SQL. The
+        // sentinel beside the database must stay byte-for-byte the same.
+        let d = tmpdir("db-view-writes");
+        let sentinel = d.join("sentinel.txt");
+        std::fs::write(&sentinel, "keep me").unwrap();
+        let before = stat_file(&sentinel);
+        let out = db_path(&d.join("stolen.log"));
+        let p = write_db(
+            &d,
+            "evil.duckdb",
+            &format!(
+                "CREATE TABLE t AS SELECT 1 AS a;\n\
+                 CREATE VIEW v AS SELECT * FROM enable_logging(storage := 'file', \
+                 storage_path := '{out}');"
+            ),
+        );
+        // The view is named in the message, and the database does not open,
+        // whichever table the user asks for.
+        for opts in [OpenOptions::default(), with_table("t"), with_table("v")] {
+            let err = Engine::open(p.to_str().unwrap(), &opts)
+                .err()
+                .map(|e| format!("{e:#}"))
+                .expect("the database with a writing view opened");
+            assert!(err.contains("\"v\""), "{err}");
+            assert!(err.contains("not read-only"), "{err}");
+            assert!(err.contains("enable_logging"), "{err}");
+        }
+        assert!(!d.join("stolen.log").exists(), "the view wrote a file");
+        assert_eq!(stat_file(&sentinel), before, "the sentinel changed");
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"keep me");
+    }
+
+    #[test]
+    fn a_database_with_a_normal_view_still_opens() {
+        // Layer B must not refuse an ordinary view. A view that reads is the
+        // usual case, and the read-only test corpus keeps working.
+        let d = tmpdir("db-view-ok");
+        let p = write_db(
+            &d,
+            "shop.duckdb",
+            "CREATE TABLE t AS SELECT i AS a FROM range(3) t(i);\n\
+             CREATE VIEW v AS SELECT a, a * 2 AS b FROM t WHERE a > 0;\n\
+             CREATE MACRO plus(x) AS x + 1;",
+        );
+        let e = Engine::open(p.to_str().unwrap(), &with_table("v")).unwrap();
+        assert_eq!(e.count(&View::default()).unwrap(), 2);
     }
 
     #[test]
