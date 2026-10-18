@@ -77,13 +77,18 @@ pub fn layout(app: &mut App, area: Rect) -> Layout {
         app.left_col = cursor_at;
     }
 
+    // The last screen column stays free. The scroll bar and the sign for the
+    // columns outside the screen both sit there, and a column that reached
+    // that screen column lost its last character under them: the number 900
+    // read as 90. The width of one column has the same limit, one line above.
+    //
     // Move the first column to the right until the cursor column fits.
     loop {
         let mut used = 0u16;
         let mut last = app.left_col;
         for (n, &ci) in vis.iter().enumerate().skip(app.left_col) {
             let w = app.widths[ci].min(avail.saturating_sub(1).max(1));
-            if used + w > avail && n > app.left_col {
+            if used + w >= avail && n > app.left_col {
                 break;
             }
             used += w + GAP;
@@ -119,7 +124,7 @@ pub fn layout(app: &mut App, area: Rect) -> Layout {
     let mut x = gutter;
     for &ci in vis.iter().skip(app.left_col) {
         let w = app.widths[ci].min(avail.saturating_sub(1).max(1));
-        if x + w > area.width && !drawn.is_empty() {
+        if x + w >= area.width && !drawn.is_empty() {
             break;
         }
         drawn.push((ci, x, w));
@@ -178,6 +183,11 @@ pub fn draw(buf: &mut Buffer, area: Rect, app: &mut App, p: &Paint) {
         height: area.height - 1 - band,
     };
     app.viewport_rows = body.height as usize;
+    // The grid can lose rows with no movement of the cursor: the terminal
+    // gets smaller, the band or the prompt takes rows, or a panel opens under
+    // the grid. A cursor in the lost rows would then be off the screen until
+    // the next key that moves it.
+    app.follow_cursor();
     // Keep where the grid is on the screen. A click of the mouse arrives as a
     // row and a column of the terminal, and only the code that draws the grid
     // knows which cell is at that position.

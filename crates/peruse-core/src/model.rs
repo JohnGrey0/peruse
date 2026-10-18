@@ -42,7 +42,11 @@ impl CellKind {
         let u = ty.trim().to_ascii_uppercase();
         // Test the container types first. The type `INTEGER[]` is a nested
         // type, and not a number.
-        if u.contains('[')
+        //
+        // The mark of a list is at the end of the type. A test for a bracket
+        // anywhere made the type `ENUM('a[1]', 'b')` a list, because the
+        // values of an enumeration are part of the type.
+        if u.ends_with(']')
             || u.starts_with("STRUCT")
             || u.starts_with("MAP")
             || u.starts_with("UNION")
@@ -435,6 +439,16 @@ mod tests {
     #[test]
     fn arrays_of_numbers_are_nested_not_numeric() {
         assert_eq!(CellKind::from_sql_type("BIGINT[3]"), CellKind::Nested);
+    }
+
+    #[test]
+    fn an_enumeration_with_a_bracket_in_a_value_is_text() {
+        // The values of an enumeration are part of its type. A bracket in one
+        // of them does not make the type a list.
+        assert_eq!(CellKind::from_sql_type("ENUM('a[1]', 'b')"), CellKind::Text);
+        assert_eq!(CellKind::from_sql_type("ENUM('a[1]', 'b')[]"), CellKind::Nested);
+        assert_eq!(CellKind::from_sql_type("STRUCT(a INTEGER[])"), CellKind::Nested);
+        assert_eq!(CellKind::from_sql_type("DECIMAL(10,2)[]"), CellKind::Nested);
     }
 
     #[test]

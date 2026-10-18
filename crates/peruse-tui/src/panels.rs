@@ -45,13 +45,36 @@ fn kv(buf: &mut Buffer, area: Rect, y: u16, label: &str, value: &str, p: &Paint,
         p.on(t.dim, t.bg),
     );
     let vw = (area.width as usize).saturating_sub(lw + 1);
+    // The smallest value and the largest value of a column come from the
+    // data, and a value can hold a line end or a tab. The grid writes such a
+    // character as a visible mark, and the panel must say the same.
     buf.set_stringn(
         area.x + lw as u16 + 1,
         y,
-        text::truncate(value, vw),
+        text::truncate(&text::sanitize(value), vw),
         vw,
         p.on(t.fg, t.bg),
     );
+}
+
+/// Gives the end of a text that fits in `w` columns, with an ellipsis in
+/// front when the text is too long.
+fn keep_end(s: &str, w: usize) -> String {
+    if text::width(s) <= w || w == 0 {
+        return s.to_string();
+    }
+    let mut out: Vec<char> = Vec::new();
+    let mut used = 1;
+    for c in s.chars().rev() {
+        let cw = text::width(c.encode_utf8(&mut [0; 4]));
+        if used + cw > w {
+            break;
+        }
+        used += cw;
+        out.push(c);
+    }
+    out.push('…');
+    out.into_iter().rev().collect()
 }
 
 /// Draws the title of a section of a panel.
@@ -187,6 +210,42 @@ fn plan_meta(height: u16, summary: u16, columns: u16, read_lines: u16) -> MetaPl
     }
 }
 
+/// The rows that the list of columns keeps between the cursor and each end of
+/// the window, when the window has the room. A text editor does the same, so
+/// the user always sees some names before and after the column under the cursor.
+const LIST_MARGIN: usize = 3;
+
+/// Gives the first row of the window on the list of columns.
+///
+/// `prev` is the first row of the last frame. The window stays where it was
+/// while the rows from `at` to `last` are inside it, at `LIST_MARGIN` rows or
+/// more from each end. Otherwise it moves the smallest distance that puts them
+/// there again. The names on the screen therefore stay still while the cursor
+/// moves through them, and the eye can read the list during a turn of the wheel.
+///
+/// A window that cannot hold all of the rows from `at` to `last` keeps `at`.
+fn list_window(prev: usize, n: usize, window: usize, at: usize, last: usize) -> usize {
+    if window == 0 || n <= window {
+        return 0;
+    }
+    let max_start = n - window;
+    // A small window cannot keep the full margin on the two sides.
+    let margin = LIST_MARGIN.min(window.saturating_sub(1) / 2);
+    let mut start = prev.min(max_start);
+    // The end of the rows that must show, and its margin, inside the window.
+    let want_end = last.min(at + window - 1).saturating_add(margin).min(n - 1);
+    if want_end >= start + window {
+        start = want_end + 1 - window;
+    }
+    // The start of the rows that must show, and its margin. This test comes
+    // second, so `at` wins when the two cannot both hold.
+    let want_start = at.saturating_sub(margin);
+    if want_start < start {
+        start = want_start;
+    }
+    start.min(max_start)
+}
+
 /// Draws the metadata panel.
 ///
 /// The panel divides the room it has: see [`plan_meta`]. A short panel writes
@@ -212,7 +271,17 @@ pub fn draw_meta(buf: &mut Buffer, area: Rect, app: &App, p: &Paint) {
         return;
     };
 
-    let summary = meta.summary_rows();
+    let mut summary = meta.summary_rows();
+    // A file from a network drive opens from a copy on the local disk. The
+    // panel names both, so that the user knows where the rows come from.
+    //
+    // A path that is too long loses its start and keeps its end, because the
+    // end names the file.
+    if let Some(copy) = &app.source.local_copy {
+        let w = (inner.width as usize).saturating_sub(15usize.min(inner.width as usize / 2) + 1);
+        summary.insert(0, ("source".into(), keep_end(&app.source.input, w)));
+        summary.insert(1, ("local copy".into(), keep_end(copy, w)));
+    }
     let (rows, at) = column_rows(app);
     let read_lines = text::wrap(&app.read_expr, inner.width as usize);
     let plan = plan_meta(
@@ -246,7 +315,13 @@ pub fn draw_meta(buf: &mut Buffer, area: Rect, app: &App, p: &Paint) {
     } else {
         n.min(rows_left)
     };
-    let start = at.saturating_sub(window / 2).min(n.saturating_sub(window));
+    // The fields of a structure under the cursor come after its row. Keep them
+    // on the screen with it, when the window has the room.
+    // A file with no columns gives an empty list.
+    let after = rows.get(at + 1..).unwrap_or(&[]);
+    let fields = after.iter().take_while(|r| r.depth > 0).count();
+    let start = list_window(app.meta_list_top.get(), n, window, at, at + fields);
+    app.meta_list_top.set(start);
 
     let num_rows = meta.parquet.as_ref().map(|pq| pq.num_rows).unwrap_or(0);
     for row in rows.iter().skip(start).take(window) {
@@ -515,6 +590,60 @@ pub fn draw_stats(buf: &mut Buffer, area: Rect, app: &App, p: &Paint) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_list_of_columns_stays_still_while_the_cursor_moves_inside_it() {
+        // 40 columns and a window of 10. The cursor moves from row 3 to row 6,
+        // which is inside the margin of the window: the window must not move.
+        let mut start = 0;
+        for at in 0..=6 {
+            start = list_window(start, 40, 10, at, at);
+            assert_eq!(start, 0, "the window moved with the cursor at {at}");
+        }
+        // Row 7 comes inside the margin at the bottom, so the window moves one
+        // row, and not to put the cursor in the middle.
+        assert_eq!(list_window(0, 40, 10, 7, 7), 1);
+        // Back up through the window: it stays until the margin at the top.
+        let mut start = 20;
+        for at in (23..=26).rev() {
+            start = list_window(start, 40, 10, at, at);
+            assert_eq!(start, 20, "the window moved with the cursor at {at}");
+        }
+        assert_eq!(list_window(20, 40, 10, 22, 22), 19);
+    }
+
+    #[test]
+    fn the_window_of_the_list_keeps_the_cursor_and_stays_inside_the_list() {
+        for n in 0..30 {
+            for window in 0..12 {
+                for prev in 0..32 {
+                    for at in 0..n {
+                        let start = list_window(prev, n, window, at, at);
+                        if window == 0 || n <= window {
+                            assert_eq!(start, 0);
+                            continue;
+                        }
+                        assert!(start + window <= n, "past the end: n {n} w {window} at {at}");
+                        assert!(
+                            start <= at && at < start + window,
+                            "the cursor is outside: n {n} w {window} prev {prev} at {at}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_window_shows_the_fields_of_a_structure_under_the_cursor() {
+        // The cursor is on row 5 and its structure has fields on rows 6 to 9.
+        let start = list_window(0, 40, 10, 5, 9);
+        assert!(start + 10 > 9, "a field is outside the window");
+        assert!(start <= 5, "the column itself is outside the window");
+        // A structure with more fields than the window keeps its own row.
+        let start = list_window(0, 40, 10, 5, 30);
+        assert!(start <= 5 && 5 < start + 10);
+    }
 
     #[test]
     fn a_tall_panel_writes_the_whole_summary_and_the_read_expression() {

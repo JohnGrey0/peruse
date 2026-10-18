@@ -4,6 +4,39 @@ The versions follow [Semantic Versioning](https://semver.org). Peruse is
 below version 1.0, so a minor version can still change the keys or the
 settings. Each such change is in this file.
 
+## Unreleased
+
+### New keys
+
+- `c` jumps to a column by its name. The prompt completes the name, and a part
+  of the name is enough. A hidden column comes back when you ask for it.
+- `v` shows each value of the column under the cursor with the number of rows
+  that hold it, as a grid. The counts follow the filter, and `u` goes back.
+
+### Fixed
+
+- A statement that changed the columns, from `e` or from `--query`, left the
+  message `rows: Binder Error: Referenced column … not found` on the status
+  line over a grid that was correct. Peruse asked for a page with the schema
+  of the old view before the schema of the new view had arrived.
+- A search moves the cursor to the column that holds the value, and not only
+  to the row. A match in a column outside the screen looked like no match.
+- A statement longer than the prompt moves to the left so that the cursor
+  stays on the screen. It went past the right edge before.
+- The settings page said that Peruse indexes a file of text below 256 MB. The
+  limit is 64 MB, and the page now reads it from the program.
+- A terminal of fewer than 120 columns gets a short form of the note `CSV:
+  press I to index`, so the hints for the filter and the undo stay in the
+  footer.
+- The keys `r`, `y`, `Y`, `=`, `!` and `Enter` on a view with no row say
+  `the view holds no row`, and not `no row here yet`.
+- The cell inspector writes `1 line` and `1 char`, and not `1 lines`.
+- The help names the second job of `Esc`: it closes the side panels when no
+  query runs.
+- A count that `Esc` stopped left the keys `G`, `O`, `#` and `/` saying `still
+  counting` for the rest of the session. They now say that the count did not
+  finish, and that `R` counts again.
+
 ## 0.2.0
 
 ### The keys that moved

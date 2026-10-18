@@ -36,6 +36,7 @@ pub enum Cmd {
     Origin,
     LastCell,
     GotoRow,
+    GotoColumn,
     // The commands that change the view.
     SortCycle,
     SortClear,
@@ -45,6 +46,7 @@ pub enum Cmd {
     FilterExcludeValue,
     FilterClear,
     Sql,
+    ValueCounts,
     Undo,
     Redo,
     ResetView,
@@ -71,6 +73,7 @@ pub enum Cmd {
     ThemeNext,
     ThemePicker,
     Settings,
+    ClearCopies,
     Help,
     Palette,
     Cancel,
@@ -259,6 +262,15 @@ pub static BINDINGS: &[Binding] = &[
         desc: "jump to row number",
         group: "Move",
     },
+    // A file with 300 columns needs a way to one column by its name. The
+    // letter `c` is for the column, and the prompt completes the name.
+    Binding {
+        cmd: Cmd::GotoColumn,
+        keys: &[(KeyCode::Char('c'), N)],
+        label: "c",
+        desc: "jump to a column by name",
+        group: "Move",
+    },
     Binding {
         cmd: Cmd::SortCycle,
         keys: &[(KeyCode::Char('s'), N)],
@@ -313,6 +325,16 @@ pub static BINDINGS: &[Binding] = &[
         keys: &[(KeyCode::Char('e'), N)],
         label: "e",
         desc: "edit the SQL query behind the grid",
+        group: "Query",
+    },
+    // The statistics panel shows the eight most frequent values. This command
+    // shows each value with its count, as a grid, so the user can read and
+    // sort the whole list. The key `u` goes back.
+    Binding {
+        cmd: Cmd::ValueCounts,
+        keys: &[(KeyCode::Char('v'), N)],
+        label: "v",
+        desc: "count the rows of each value in this column (u goes back)",
         group: "Query",
     },
     Binding {
@@ -480,6 +502,13 @@ pub static BINDINGS: &[Binding] = &[
         group: "Other",
     },
     Binding {
+        cmd: Cmd::ClearCopies,
+        keys: &[(KeyCode::Char('C'), N)],
+        label: "C",
+        desc: "clear the local copies of files from network drives",
+        group: "Other",
+    },
+    Binding {
         cmd: Cmd::Help,
         keys: &[(KeyCode::Char('?'), N), (KeyCode::F(1), N)],
         label: "? / F1",
@@ -499,7 +528,7 @@ pub static BINDINGS: &[Binding] = &[
         cmd: Cmd::Cancel,
         keys: &[(KeyCode::Esc, N)],
         label: "Esc",
-        desc: "cancel the running query",
+        desc: "cancel the running query, or close the side panels",
         group: "Other",
     },
     Binding {
@@ -519,9 +548,19 @@ pub const GROUPS: &[&str] = &["Move", "Query", "Inspect", "Columns", "Other"];
 /// A character that the terminal can print holds its own shift state. The
 /// character `G` is the shift key and the key `g`. A test of the shift key
 /// would therefore make each binding of a capital letter impossible to match.
+///
+/// Two more forms hold a modifier key that is not a choice of the user:
+///
+/// * The key `AltGr` of a European keyboard gives a character such as `#`,
+///   `@` or `[`. Windows reports that key as Ctrl and Alt together. A French
+///   keyboard therefore sends `#` as Ctrl+Alt+`#`, and without this rule the
+///   key `#` would do nothing there.
+/// * The terminal library always sends `Shift-Tab` as the key `BackTab` with
+///   the shift key. The name of the key holds the shift state already.
 fn normalise(key: &KeyEvent) -> KeyModifiers {
     match key.code {
-        KeyCode::Char(_) => key.modifiers.difference(KeyModifiers::SHIFT),
+        KeyCode::Char(_) if crate::input::is_altgr(key) => KeyModifiers::NONE,
+        KeyCode::Char(_) | KeyCode::BackTab => key.modifiers.difference(KeyModifiers::SHIFT),
         _ => key.modifiers,
     }
 }
@@ -573,7 +612,7 @@ mod tests {
         assert_eq!(resolve(&ev(KeyCode::Char('j'), N)), Some(Cmd::RowDown));
         assert_eq!(resolve(&ev(KeyCode::Down, N)), Some(Cmd::RowDown));
         assert_eq!(resolve(&ev(KeyCode::Char('q'), N)), Some(Cmd::Quit));
-        assert_eq!(resolve(&ev(KeyCode::Char('v'), N)), None);
+        assert_eq!(resolve(&ev(KeyCode::Char('b'), N)), None);
     }
 
     #[test]
@@ -589,6 +628,32 @@ mod tests {
     }
 
     #[test]
+    fn shift_tab_moves_to_the_previous_column() {
+        // The terminal library sends Shift-Tab as BackTab with the shift key,
+        // on Windows and on Unix. The table binds BackTab with no modifier, so
+        // the key did nothing before.
+        assert_eq!(
+            resolve(&ev(KeyCode::BackTab, KeyModifiers::SHIFT)),
+            Some(Cmd::ColLeft)
+        );
+        assert_eq!(resolve(&ev(KeyCode::BackTab, N)), Some(Cmd::ColLeft));
+    }
+
+    #[test]
+    fn a_character_from_the_altgr_key_starts_its_command() {
+        // Windows reports AltGr as Ctrl and Alt together. A French keyboard
+        // gives `#` with AltGr, and a German keyboard gives `$` without it.
+        let altgr = KeyModifiers::CONTROL | KeyModifiers::ALT;
+        assert_eq!(resolve(&ev(KeyCode::Char('#'), altgr)), Some(Cmd::GotoRow));
+        assert_eq!(
+            resolve(&ev(KeyCode::Char('^'), altgr | KeyModifiers::SHIFT)),
+            Some(Cmd::ColFirst)
+        );
+        // Ctrl alone still makes a chord.
+        assert_eq!(resolve(&ev(KeyCode::Char('f'), CTRL)), Some(Cmd::PageDown));
+    }
+
+    #[test]
     fn the_letter_d_cycles_the_detail_band() {
         // The band and the half page both live on the letter `d`. The chord ^D
         // moves the cursor, and the plain letter changes the band.
@@ -601,7 +666,18 @@ mod tests {
         assert_eq!(resolve(&ev(KeyCode::Char('f'), N)), Some(Cmd::FilterBuild));
         assert_eq!(resolve(&ev(KeyCode::Char('f'), CTRL)), Some(Cmd::PageDown));
         assert_eq!(resolve(&ev(KeyCode::Char('c'), CTRL)), Some(Cmd::Quit));
-        assert_eq!(resolve(&ev(KeyCode::Char('c'), N)), None);
+        assert_eq!(resolve(&ev(KeyCode::Char('c'), N)), Some(Cmd::GotoColumn));
+        assert_eq!(resolve(&ev(KeyCode::Char('b'), CTRL)), Some(Cmd::PageUp));
+        assert_eq!(resolve(&ev(KeyCode::Char('b'), N)), None);
+    }
+
+    #[test]
+    fn a_column_and_its_values_have_a_key_each() {
+        // A file with 300 columns needs a way to one column by its name, and
+        // the question "which values does this column hold, and how often"
+        // needs one key and not a statement.
+        assert_eq!(resolve(&ev(KeyCode::Char('c'), N)), Some(Cmd::GotoColumn));
+        assert_eq!(resolve(&ev(KeyCode::Char('v'), N)), Some(Cmd::ValueCounts));
     }
 
     #[test]

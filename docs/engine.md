@@ -19,7 +19,7 @@ file on the disk. The function `configure` then sends these settings:
 | `threads` | The option `--threads`, or one thread for each core | It controls the parallel work. |
 | `enable_progress_bar` | `false` | A progress bar would write to the terminal and break the frame. |
 | `preserve_insertion_order` | `true` | The rows must always come back in the order of the file. |
-| `temp_directory` | The temporary directory of the system, plus `peruse` | DuckDB writes here when the data does not fit in memory. |
+| `temp_directory` | The temporary directory of the system, plus `peruse`, plus a name for each engine | DuckDB writes here when the data does not fit in memory. Two engines must never share it, because DuckDB gives the same names to the files of each engine. A process that stops before the engine closes leaves its directory, so the first engine of each process removes the directory of each process that is not alive. |
 | `memory_limit` | The option `--memory-limit`, or the setting `memory_limit`, or one half of the memory of the machine, and three tenths of a machine of 8 GB or less | It limits the memory before DuckDB writes to the disk. |
 | `parquet_metadata_cache` | `true` | DuckDB then reads the footer of a Parquet file one time and keeps the result. |
 | `late_materialization_max_rows` | 4096 | DuckDB then reads a sorted page or a page of a filtered view in two steps: the sort column or the filter column first, and then the other columns of the page rows only. |
@@ -69,6 +69,11 @@ The function `Engine::open` does these steps:
     file, it writes the columns into the read call. See [One examination of a
     file of text](#one-examination-of-a-file-of-text).
 
+A large file on a network drive arrives here as the path of a local copy. The
+engine reads the copy, and it does not know that the copy is a copy. The worker
+writes the path of the source into the source and into each message. See
+[local-copies.md](local-copies.md).
+
 The engine changes each backslash in a path to a forward slash. DuckDB accepts
 a forward slash on each platform. In a glob pattern, DuckDB reads a backslash
 as an escape character.
@@ -98,7 +103,8 @@ that holds a SQLite database therefore gets a message about SQLite, and not a
 parse failure from the CSV reader. The marks are `DUCK` after the eight bytes of
 the checksum for DuckDB, and `SQLite format 3` and one zero byte for SQLite.
 For the third test the marks are `PAR1` for Parquet, `ARROW1` for Arrow, and `{`
-or `[` for JSON, after any spaces.
+or `[` for JSON, after any spaces and after a byte order mark. The head for this
+test is 4096 bytes long, so a JSON file can start with some empty lines.
 
 The function reads the head of the file with a limit and `read_to_end`, and not
 with one call to `read`. One call can give fewer bytes than the caller asked
@@ -113,7 +119,10 @@ to change the file to Parquet.
 
 For a CSV file, the expression takes more options:
 
-- `delim`, when the user or the file extension gives a delimiter
+- `delim`, when the user or the file extension gives a delimiter. The
+  extensions `.tsv` and `.tab` give a tab, and `.psv` gives `|`. The extension
+  `.csv` gives none: a spreadsheet program in a country that writes a decimal
+  comma saves a `.csv` file with a semicolon, so the sniffer decides.
 - `header`, when the user gives the option `--no-header`
 - `all_varchar`, `ignore_errors` and `sample_size`, from the options
 - `union_by_name`, when the source holds more than one file
@@ -135,10 +144,26 @@ Two rules stop it:
 - The function `source::json_depth_over` counts the levels with a loop and a
   number, so it can never fill the stack itself. It stops at the first level
   above 128, so a file that is made to be deep costs almost nothing to refuse.
-  It reads 8 MB of the file at the most: a file that nests too deep does so at
-  its start, because each level is one character.
+  It reads twice the number of records that the reader examines, which is
+  `sample_size`, and 20480 when the user gives none. A limit in bytes is not
+  safe: a deep record can come after some megabytes of shallow records. The
+  check reads each file of a set, because the reader examines each of them.
+- The bytes of a compressed file (`.json.gz`, `.json.zst`) are not JSON, and a
+  file of 80 bytes can hold 3000 levels. Peruse holds no decompressor, but
+  DuckDB does. For such a file, `compressed_json_too_deep` reads the same
+  records with `read_json_objects`, which gives each record as text and finds
+  no columns. Then `source::json_text_depth_over` counts the levels of each
+  text with a loop.
 - The read call also holds `maximum_depth = 128`. The reader then stops at that
-  level and gives the value below it as text.
+  level and gives the value below it as text. This limit does not protect the
+  part of the reader that finds the columns, so the first rule is necessary.
+
+A JSON file that holds a list behind a byte order mark needs one more option.
+PowerShell 5 writes the mark in front of each file that it writes as UTF-8. The
+reader of DuckDB does not see the list behind the mark, and it reads the whole
+file as one row with one column `json`. The function
+`source::json_list_behind_bom` finds such a file, and the read call then holds
+`format = 'array'`.
 
 ## One examination of a file of text
 

@@ -63,6 +63,15 @@ none, and the same page changed when the user scrolled back to it.
 * A file with a column of the name `__peruse_row_order`, or of the name that
   gives the position, gets no `src_ord`, and its sort ends with `COLUMNS(*)`.
 
+The part `COLUMNS(*)` at the end of a sort is necessary. The sort of DuckDB is
+not stable, and it uses each thread, so two rows with the same sort value can
+come in a different order in each statement. Each page is one statement. Without
+the part, a sort on a column with repeated values showed some rows on two pages
+and other rows on none, and the same page changed when the user scrolled back to
+it. With the part, the database sorts such rows by each of their values, and two
+rows that it still cannot put in order look the same. On a Parquet file of 20
+million rows, the first sorted page costs about 200 milliseconds and not 80.
+
 Two public functions join those parts:
 
 | Function | Result |
@@ -178,13 +187,20 @@ The last four values follow the family of the column:
 
 | Family | Minimum and maximum | Mean and deviation |
 |---|---|---|
-| Number | `min()` and `max()` | `avg()` and `stddev_samp()` |
+| Number | `min()` and `max()` | `avg()` and `stddev_samp()`, over the value as a DOUBLE |
 | Text, Bool, Temporal | `min()` and `max()` | `NULL` |
 | Binary, Nested | `NULL` | `NULL` |
 
 The minimum and the maximum have a meaning for each type that has an order. The
 mean and the deviation do not. A call to `avg()` on a VARCHAR column gives an
 error, and not a NULL.
+
+The mean and the deviation read the value as a DOUBLE. The sum behind `avg()`
+over a HUGEINT is a HUGEINT, and three large values gave an overflow. The
+deviation also leaves out each value that is not finite. One NaN made
+`stddev_samp()` fail with "out of range", and pandas writes NaN for each missing
+value of a column of floating-point numbers. The mean keeps such a value, so the
+panel shows `nan` and the user sees that the column holds one.
 
 A column of numbers gets two more values at the end: the smallest value and the
 largest value as a DOUBLE. The histogram needs those two edges, and this
@@ -290,9 +306,14 @@ The function `search_sql` builds this statement. The design has a reason:
 
 The conditions use one item for each column:
 
-- For a text column: `contains(lower("c"), lower('needle'))`
 - For a BLOB column: no item, because the grid shows the size only
 - For each other column: `contains(lower(CAST("c" AS VARCHAR)), lower('needle'))`
+
+A text column is cast too. The cast is free for a `VARCHAR` column, because
+DuckDB removes a cast to the same type. The cast is necessary for a column such
+as `UUID`, which the schema reads as text but which `lower` does not take: with
+no cast the statement gives an error from the database, and the search then
+fails for the whole table.
 
 The function `contains` looks for a plain part of a text. `ILIKE` reads a
 pattern first, and it costs about three times as much for the same answer. Over
@@ -304,7 +325,6 @@ constant. Both sides of the test therefore follow the same rule for a letter,
 also for a letter that English does not use.
 
 The needle needs no escape character. A search for `50%` looks for the three
-characters, and `%` is not a wildcard here. A text column needs no cast, because
-a cast would copy each value for no gain.
+characters, and `%` is not a wildcard here.
 
 The statement is empty when the schema holds BLOB columns only.

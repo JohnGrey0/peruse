@@ -79,9 +79,44 @@ pub fn config_dir() -> Option<PathBuf> {
     Some(base.join("peruse"))
 }
 
+/// Gives the directory that holds the local copies of files from a network
+/// drive.
+///
+/// | System | The directory |
+/// |---|---|
+/// | Windows | `%LOCALAPPDATA%\peruse\cache` |
+/// | macOS | `~/Library/Caches/peruse` |
+/// | Each other | `$XDG_CACHE_HOME/peruse`, or `~/.cache/peruse` |
+///
+/// On Windows the directory is in `LOCALAPPDATA` and not in `APPDATA`. A
+/// company can copy the folder `APPDATA` to a server at each sign-in, and a
+/// copy of some gigabytes of data there would be slow for each sign-in and
+/// would put the data back on the network.
+pub fn cache_dir() -> Option<PathBuf> {
+    if cfg!(windows) {
+        return Some(var("LOCALAPPDATA")?.join("peruse").join("cache"));
+    }
+    if cfg!(target_os = "macos") {
+        return Some(home_dir()?.join("Library").join("Caches").join("peruse"));
+    }
+    let base = var("XDG_CACHE_HOME")
+        .filter(|p| p.is_absolute())
+        .or_else(|| Some(home_dir()?.join(".cache")))?;
+    Some(base.join("peruse"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_directory_of_the_local_copies_is_not_the_directory_of_the_settings() {
+        if let (Some(cache), Some(config)) = (cache_dir(), config_dir()) {
+            assert!(cache.is_absolute(), "{cache:?} is not a complete path");
+            assert_ne!(cache, config);
+            assert!(cache.to_string_lossy().to_lowercase().contains("peruse"));
+        }
+    }
 
     #[test]
     fn the_directory_of_the_settings_ends_with_the_name_of_the_program() {

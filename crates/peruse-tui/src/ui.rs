@@ -31,6 +31,17 @@ pub fn draw(f: &mut Frame, app: &mut App, depth: Depth) {
     let area = f.area();
     let t = app.theme.clone();
 
+    // A terminal with no row or no column has no cell for a character, and a
+    // write outside the buffer stops the program. The rows along the bottom
+    // edge of an overlay wrote to the row 0 of a terminal with no row at all.
+    // No click can land on anything either, so the positions of an older
+    // frame must go.
+    if area.width == 0 || area.height == 0 {
+        app.hit = crate::app::Hit::default();
+        app.overlay = None;
+        return;
+    }
+
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -156,7 +167,16 @@ fn draw_panel(f: &mut Frame, area: Rect, app: &App, p: &Paint) {
             // that its own content needs. A column of numbers asks for four
             // more rows than a column of text, for the chart of the
             // distribution.
-            let (meta, stats) = split_panels(area, panels::stats_content_height(app));
+            //
+            // The line moves up only, to give the statistics the most rows that
+            // a column needed so far: see `App::stats_reserve`. A line that moved at each column
+            // moved the list of columns above it, and the user could not read
+            // the list during a turn of the wheel.
+            let need = panels::stats_content_height(app);
+            let (at_height, most) = app.stats_reserve.get();
+            let most = if at_height == area.height { most.max(need) } else { need };
+            app.stats_reserve.set((area.height, most));
+            let (meta, stats) = split_panels(area, most);
             panels::draw_meta(f.buffer_mut(), meta, app, p);
             panels::draw_stats(f.buffer_mut(), stats, app, p);
         }
@@ -242,6 +262,12 @@ fn draw_title(f: &mut Frame, area: Rect, app: &App, p: &Paint) {
     put(&human_bytes(app.source.bytes), p.on(t.dim, t.bg_alt), buf, &mut x);
     put("  ", base, buf, &mut x);
     put(&app.source.format.to_string(), p.on(t.dim, t.bg_alt), buf, &mut x);
+    // The file is on a network drive, and the grid reads a copy of it on the
+    // local disk. The metadata panel names the source and the copy.
+    if app.source.local_copy.is_some() {
+        put("  ", base, buf, &mut x);
+        put("local copy", p.on(t.ok, t.bg_alt), buf, &mut x);
+    }
 
     // Show each part of the view that removes rows or columns. The user
     // must always know why the grid shows fewer rows than the file holds.
@@ -319,10 +345,46 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App, p: &Paint) -> Option<Positi
         let vx = area.x + lw as u16;
         let avail = (area.width as usize).saturating_sub(lw);
 
+        // Report a bad expression while the user types it. The message goes
+        // at the right side, so it does not move the text of the user. Its
+        // width is known first, so the line can keep the cursor out from
+        // under it.
+        let err = app.prompt_error.as_ref().map(|err| format!(" ✕ {err}"));
+        let err_w = err
+            .as_ref()
+            .map(|msg| text::width(msg).min(area.width as usize / 2))
+            .filter(|mw| *mw > 4)
+            .unwrap_or(0);
+
+        // A line that is longer than the prompt scrolls, so the cursor and the
+        // text in front of it stay on the screen. The first `skip` screen
+        // columns of the line are then outside the screen, at the left.
+        let window = if err_w > 0 {
+            avail.saturating_sub(err_w + 1).max(1)
+        } else {
+            avail
+        };
+        let skip = text::scroll_start(app.input.cursor_col(), window);
+        let cursor_x = vx.saturating_add((app.input.cursor_col() - skip) as u16);
+
         match kind {
             PromptKind::Filter | PromptKind::Sql => {
                 let mut x = vx;
+                // The screen column of the segment inside the whole line.
+                let mut col = 0usize;
                 for (seg, tok) in sqlhl::tokens(&value) {
+                    let sw = text::width(&seg);
+                    if col + sw <= skip {
+                        col += sw;
+                        continue;
+                    }
+                    let (shown, blank) = if col < skip {
+                        text::drop_cols(&seg, skip - col)
+                    } else {
+                        (seg.as_str(), 0)
+                    };
+                    col += sw;
+                    x = x.saturating_add(blank as u16);
                     if x >= area.right() {
                         break;
                     }
@@ -335,46 +397,50 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App, p: &Paint) -> Option<Positi
                         Tok::Punct | Tok::Space => base,
                     };
                     let w = (area.right() - x) as usize;
-                    buf.set_stringn(x, area.y, &seg, w, style);
-                    x += text::width(&seg).min(w) as u16;
+                    buf.set_stringn(x, area.y, shown, w, style);
+                    x += text::width(shown).min(w) as u16;
                 }
             }
             _ => {
-                buf.set_stringn(vx, area.y, text::truncate(&value, avail), avail, base);
+                let (shown, blank) = text::drop_cols(&value, skip);
+                let bx = vx.saturating_add(blank as u16);
+                if bx < area.right() {
+                    let w = (area.right() - bx) as usize;
+                    buf.set_stringn(bx, area.y, text::truncate(shown, w), w, base);
+                }
             }
+        }
+
+        // A mark at the left edge says that the line goes on there. It covers
+        // the first character on the screen, and never the cursor: a line
+        // that scrolls has the cursor at its right end.
+        if skip > 0 && cursor_x > vx {
+            buf.set_stringn(vx, area.y, "…", 1, p.on(t.dim, t.bg));
         }
 
         // The name of a column that the user did not type yet, in a dim
         // color, after the cursor. The key Tab and the key -> take it.
-        if let Some(rest) = app.ghost() {
-            let gx = vx + app.input.cursor_col() as u16;
-            if gx < area.right() {
-                let w = (area.right() - gx) as usize;
-                buf.set_stringn(
-                    gx,
-                    area.y,
-                    text::truncate(&rest, w),
-                    w,
-                    p.on(t.dim, t.bg),
-                );
-            }
+        if let Some(rest) = app.ghost()
+            && cursor_x < area.right()
+        {
+            let w = (area.right() - cursor_x) as usize;
+            buf.set_stringn(
+                cursor_x,
+                area.y,
+                text::truncate(&rest, w),
+                w,
+                p.on(t.dim, t.bg),
+            );
         }
 
-        // Report a bad expression while the user types it. The message
-        // goes at the right side, so it does not move the text of the user.
-        if let Some(err) = &app.prompt_error {
-            let msg = format!(" ✕ {err}");
-            let mw = text::width(&msg).min(area.width as usize / 2);
-            if mw > 4 {
-                let mx = area.right() - mw as u16;
-                buf.set_stringn(mx, area.y, text::truncate(&msg, mw), mw, p.on(t.error, t.bg));
-            }
+        if let Some(msg) = &err
+            && err_w > 0
+        {
+            let mx = area.right() - err_w as u16;
+            buf.set_stringn(mx, area.y, text::truncate(msg, err_w), err_w, p.on(t.error, t.bg));
         }
 
-        return Some(Position::new(
-            (vx + app.input.cursor_col() as u16).min(area.right() - 1),
-            area.y,
-        ));
+        return Some(Position::new(cursor_x.min(area.right() - 1), area.y));
     }
 
     if let Some(s) = &app.status {
@@ -492,10 +558,15 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App, p: &Paint) {
     // loss of the note costs the user the reason for a slow jump.
     let note = (!app.seekable && !app.indexing && app.mode == Mode::Normal)
         .then(|| {
-            format!(
-                "{}: press I to index for instant jumps",
-                app.source.format.to_string().to_uppercase()
-            )
+            let fmt = app.source.format.to_string().to_uppercase();
+            // The long form costs the hints for the filter, the undo and the
+            // record on a terminal of 80 columns. A narrow terminal therefore
+            // gets the short form, and the key is still in it.
+            if area.width >= 120 {
+                format!("{fmt}: press I to index for instant jumps")
+            } else {
+                format!("{fmt}: press I to index")
+            }
         })
         .filter(|n| text::width(n) + 12 < area.width as usize);
     let hint_budget = area.right() as usize
