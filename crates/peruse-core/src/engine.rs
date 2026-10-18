@@ -345,6 +345,20 @@ pub struct Engine {
     /// The statement that filled [`SORT_TABLE`], or `None` when that table
     /// holds no rows of the source now. Refer to [`Engine::sorted_window`].
     sort_table: Mutex<Option<String>>,
+    /// Open handles that keep the source files read-only for the session.
+    ///
+    /// This is Layer D of the read-only promise, on Windows only. Each handle
+    /// is open with a share mode that lets another program read the file but
+    /// not write it and not delete it, so no program can change the data under
+    /// Peruse while Peruse shows it. The handles close when the engine closes,
+    /// which is when the session ends or the user opens another file. Refer to
+    /// [`read_only_locks`]. On Linux and macOS the field is empty, because
+    /// those systems have no equivalent of this share mode. Refer to
+    /// `docs/read-only-guard.md`.
+    // The handles are held only for their effect on the file system, and never
+    // read, so the field is dead code to the compiler.
+    #[allow(dead_code)]
+    locks: Vec<std::fs::File>,
 }
 
 /// What the DuckDB CSV sniffer found about a file.
@@ -549,13 +563,17 @@ impl Engine {
     /// therefore gives an error here, and not at the first page request.
     pub fn open(input: &str, opts: &OpenOptions) -> Result<Engine> {
         let conn = Connection::open_in_memory().context("starting DuckDB")?;
-        configure(&conn, opts)?;
+        let tmp = configure(&conn, opts)?;
 
         let files = resolve_files(&conn, input)?;
         if files.is_empty() {
             bail!("no files matched {input:?}");
         }
         let (format, ext_delim, compressed) = source::detect(&files[0]);
+        // From here, the connection can reach these files and its own
+        // temporary directory, and nothing else. The function `glob()` stops
+        // when the lock is on, so the lock comes after `resolve_files`.
+        lock_down(&conn, &files, format == Format::DuckDb, &tmp)?;
         let bytes = files
             .iter()
             .filter_map(|f| std::fs::metadata(f).ok())
@@ -662,6 +680,8 @@ impl Engine {
         }
 
         let plain = build_read_expr(&src, opts);
+        // Layer D: keep the files read-only for the session, on a local disk.
+        let locks = read_only_locks(&src.files, false, &crate::remote::System);
         let mut engine = Engine {
             conn,
             source: src,
@@ -674,6 +694,7 @@ impl Engine {
             order_view: None,
             ordered: OnceLock::new(),
             sort_table: Mutex::new(None),
+            locks,
         };
 
         // A file of text and a file of JSON hold no schema. DuckDB therefore
@@ -735,6 +756,11 @@ impl Engine {
     /// statement.
     fn open_database(conn: Connection, mut src: Source, opts: &OpenOptions) -> Result<Engine> {
         attach_database(&conn, &src)?;
+        // Layer B of the read-only promise. A `.duckdb` file can hold a view or
+        // a macro whose SQL writes a file. DuckDB runs that SQL when Peruse
+        // reads the object, so the check comes before the first read, and a
+        // database with a failing object does not open at all.
+        check_stored_objects(&conn, &src.label)?;
         let tables = read_tables(&conn)
             .with_context(|| format!("reading the tables of {}", src.label))?;
         let table = choose_table(&src, &tables, opts.table.as_deref())?;
@@ -743,6 +769,9 @@ impl Engine {
         src.table = Some(table.label());
 
         let scan = table.qualified();
+        // Layer D: keep the database file and its log read-only for the
+        // session, on a local disk.
+        let locks = read_only_locks(&src.files, true, &crate::remote::System);
         let mut engine = Engine {
             read_expr: database_read_expr(&src, &table),
             conn,
@@ -755,6 +784,7 @@ impl Engine {
             order_view: None,
             ordered: OnceLock::new(),
             sort_table: Mutex::new(None),
+            locks,
         };
         // Read the schema now, in the same way as for a file. A name that the
         // database does not hold therefore gives an error here.
@@ -1131,6 +1161,10 @@ impl Engine {
 
     /// Reads the name and the type of each column from the database.
     fn read_schema(&self, view: &View) -> Result<Schema> {
+        self.read_schema_inner(view).map_err(explain_lock)
+    }
+
+    fn read_schema_inner(&self, view: &View) -> Result<Schema> {
         let sql = view.describe_sql();
         let mut stmt = self.conn.prepare(&sql)?;
         let mut rows = stmt.query([])?;
@@ -2052,7 +2086,10 @@ impl Engine {
 }
 
 /// Applies the options to the connection before the engine reads any data.
-fn configure(conn: &Connection, opts: &OpenOptions) -> Result<()> {
+///
+/// The function gives the temporary directory that it chose, because
+/// [`lock_down`] must let DuckDB write there and nowhere else.
+fn configure(conn: &Connection, opts: &OpenOptions) -> Result<PathBuf> {
     let threads = opts.threads.unwrap_or_else(|| {
         std::thread::available_parallelism()
             .map(|n| n.get())
@@ -2110,7 +2147,154 @@ fn configure(conn: &Connection, opts: &OpenOptions) -> Result<()> {
     let _ = conn.execute_batch(&format!(
         "SET late_materialization_max_rows = {LATE_MATERIALIZATION_ROWS};"
     ));
-    Ok(())
+    Ok(tmp)
+}
+
+/// The settings that the settings page of Peruse changes while the engine runs.
+///
+/// After [`lock_down`], DuckDB refuses a change to each other setting. Refer to
+/// [`Engine::apply_settings`].
+const ALLOWED_CONFIGS: &str = "['threads', 'memory_limit']";
+
+/// Gives the files that DuckDB can read for a source: each file, and the
+/// write-ahead log of a database.
+///
+/// DuckDB looks for the log of a database when it attaches the database, also
+/// when the log does not exist, so the path must be in the list in both cases.
+/// The attach is read-only, so DuckDB reads the log and never makes it.
+fn allowed_files(files: &[PathBuf], database: bool) -> Vec<PathBuf> {
+    let mut out = Vec::with_capacity(files.len() * 2);
+    for f in files {
+        out.push(f.clone());
+        if database {
+            out.push(PathBuf::from(format!("{}.wal", f.to_string_lossy())));
+        }
+    }
+    out
+}
+
+/// Opens a read-only handle on each source file on a local disk, for the whole
+/// session.
+///
+/// This is Layer D of the read-only promise, on Windows only. Each handle is
+/// open with the share mode `FILE_SHARE_READ`, with no `FILE_SHARE_WRITE` and
+/// no `FILE_SHARE_DELETE`. While Peruse holds it, another program can read the
+/// file but cannot write it or delete it, so the data cannot change under
+/// Peruse. The caller keeps the handles in the engine, and they close when the
+/// engine closes: at the end of the session, or when the user opens another
+/// file.
+///
+/// The function never locks a file on a network drive, because a coworker must
+/// still write the file. It uses the same test as the local copies, through
+/// `probe`. A file that it cannot open read-only, such as a log that DuckDB
+/// holds, is left out, because the lock is a safety net and not a necessity.
+///
+/// On Linux and macOS there is no equivalent of this share mode: a handle there
+/// does not stop another program from writing the file. The function gives an
+/// empty list, and the promise rests on the other layers. Refer to
+/// `docs/read-only-guard.md`.
+#[cfg(windows)]
+fn read_only_locks(files: &[PathBuf], database: bool, probe: &dyn crate::remote::Probe) -> Vec<std::fs::File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    // FILE_SHARE_READ only. No FILE_SHARE_WRITE (0x2), no FILE_SHARE_DELETE (0x4).
+    const FILE_SHARE_READ: u32 = 0x0000_0001;
+    let mut out = Vec::new();
+    for f in allowed_files(files, database) {
+        if !f.is_file() || probe.is_remote(&f) {
+            continue;
+        }
+        let mut o = std::fs::OpenOptions::new();
+        o.read(true).share_mode(FILE_SHARE_READ);
+        if let Ok(h) = o.open(&f) {
+            out.push(h);
+        }
+    }
+    out
+}
+
+/// The other systems have no share mode that stops a write. Refer to the
+/// Windows form of this function and to `docs/read-only-guard.md`.
+#[cfg(not(windows))]
+fn read_only_locks(
+    _files: &[PathBuf],
+    _database: bool,
+    _probe: &dyn crate::remote::Probe,
+) -> Vec<std::fs::File> {
+    Vec::new()
+}
+
+/// Locks the connection, so that it can read the source files and nothing else.
+///
+/// This is the layer of the read-only promise that does not depend on the words
+/// of a statement. Refer to `docs/read-only-guard.md`. The function sets, in
+/// this order:
+///
+/// 1. `allowed_paths`: the source files, and the log of a database.
+/// 2. `allowed_directories`: the temporary directory of this engine, where
+///    DuckDB puts the rows of a large sort.
+/// 3. `allowed_configs`: the two settings of the settings page.
+/// 4. `enable_external_access = false`. DuckDB then refuses each file outside
+///    the two lists above, for a read and for a write. It also refuses each
+///    function that writes a file of its own, such as a log or a profile, and
+///    each `ATTACH` of a second database.
+/// 5. `lock_configuration = true`. No statement can then change a setting
+///    that is not in the list of step 3, so no statement can undo steps 1 to 4.
+///
+/// The function `glob()` stops after this lock, so the caller must find the
+/// files first.
+fn lock_down(conn: &Connection, files: &[PathBuf], database: bool, tmp: &Path) -> Result<()> {
+    let paths: Vec<String> = allowed_files(files, database)
+        .iter()
+        .map(|f| quote_str(&db_path(f)))
+        .collect();
+    let mut dir = db_path(tmp);
+    if !dir.ends_with('/') {
+        dir.push('/');
+    }
+    let sql = format!(
+        "SET allowed_paths = [{}];\n\
+         SET allowed_directories = [{}];\n\
+         SET allowed_configs = {ALLOWED_CONFIGS};\n\
+         SET enable_external_access = false;\n\
+         SET lock_configuration = true;\n",
+        paths.join(", "),
+        quote_str(&dir)
+    );
+    conn.execute_batch(&sql)
+        .context("locking DuckDB to the files that Peruse reads")
+}
+
+/// Gives `true` when a message from DuckDB says that the lock of [`lock_down`]
+/// refused a file or a setting.
+fn refused_by_the_lock(message: &str) -> bool {
+    let m = message.to_ascii_lowercase();
+    m.contains("disabled by configuration")
+        || m.contains("enable_external_access")
+        || m.contains("cannot access file")
+        || m.contains("cannot access directory")
+        || m.contains("configuration has been locked")
+        || m.contains("lock_configuration")
+}
+
+/// Turns a refusal of the lock into a message that says what Peruse allows.
+///
+/// A statement in the SQL prompt or in `--query` can read the source, and the
+/// tables of an open database. It cannot read another file, because Peruse
+/// locks DuckDB to the files that the user opened. The words of DuckDB alone
+/// name a setting that the user never wrote.
+fn explain_lock(e: anyhow::Error) -> anyhow::Error {
+    let text = format!("{e:#}");
+    if !refused_by_the_lock(&text) {
+        return e;
+    }
+    anyhow::anyhow!(
+        "Peruse reads only the file that you opened, as the view `src`. \
+         A query cannot read, write or attach any other file, and it cannot \
+         change a setting of DuckDB. To read a second file, open it with \
+         Peruse, or name it in the glob that you open.\n\
+         DuckDB said: {}",
+        first_lines(&text, 2)
+    )
 }
 
 /// Gives a temporary directory that belongs to one engine only.
@@ -2229,7 +2413,8 @@ fn resolve_files(conn: &Connection, input: &str) -> Result<Vec<PathBuf>> {
 /// stop.
 pub fn database_tables(path: &Path, opts: &OpenOptions) -> Result<Vec<DbTable>> {
     let conn = Connection::open_in_memory().context("starting DuckDB")?;
-    configure(&conn, opts)?;
+    let tmp = configure(&conn, opts)?;
+    lock_down(&conn, &[path.to_path_buf()], true, &tmp)?;
     let label = path
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
@@ -2316,6 +2501,69 @@ fn storage_version(duck: &str) -> Option<String> {
         .take_while(|c| c.is_ascii_digit())
         .collect();
     (!digits.is_empty()).then_some(digits)
+}
+
+/// Checks the SQL of each view and each macro of the attached database, before
+/// Peruse reads any of them.
+///
+/// This is Layer B of the read-only promise. A hostile `.duckdb` file can hold
+/// a view whose query, or a macro whose body, calls a function that writes a
+/// file. DuckDB runs that SQL when Peruse reads the object. The function checks
+/// the stored text with [`crate::sql_guard`] first, so a failing object never
+/// runs. A database with such an object does not open, and the message names
+/// the object.
+///
+/// The function checks every view and macro, not only the one that the grid
+/// shows, because a statement in the SQL prompt can name any of them.
+fn check_stored_objects(conn: &Connection, label: &str) -> Result<()> {
+    let alias = quote_str(DB_ALIAS);
+    // The views. The column `sql` holds a `CREATE VIEW ... AS <query>`.
+    let sql = format!(
+        "SELECT view_name, sql FROM duckdb_views() \
+         WHERE database_name = {alias} AND NOT internal AND sql IS NOT NULL"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let mut rows = stmt.query([])?;
+    while let Some(r) = rows.next()? {
+        let name: String = r.get(0)?;
+        let text: String = r.get(1)?;
+        if let Err(e) = crate::sql_guard::ensure_view_body_read_only(&text) {
+            bail!(stored_object_message(label, "view", &name, &e));
+        }
+    }
+    drop(rows);
+    drop(stmt);
+
+    // The macros. The column `macro_definition` holds the body with no
+    // `CREATE` in front of it.
+    let sql = format!(
+        "SELECT function_name, macro_definition FROM duckdb_functions() \
+         WHERE database_name = {alias} AND macro_definition IS NOT NULL"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let mut rows = stmt.query([])?;
+    while let Some(r) = rows.next()? {
+        let name: String = r.get(0)?;
+        let text: String = r.get(1)?;
+        if let Err(e) = crate::sql_guard::ensure_macro_body_read_only(&text) {
+            bail!(stored_object_message(label, "macro", &name, &e));
+        }
+    }
+    Ok(())
+}
+
+/// Writes the message for a view or a macro that the guard refuses.
+fn stored_object_message(
+    label: &str,
+    kind: &str,
+    name: &str,
+    e: &crate::sql_guard::GuardError,
+) -> String {
+    format!(
+        "{label}: the {kind} {name:?} in this database is not read-only ({e}), \
+         so Peruse does not open the database. A viewer must not run SQL that \
+         changes the data, and a database can hide such SQL in a {kind}."
+    )
 }
 
 /// Reads the tables and the views of the attached database.
@@ -2726,6 +2974,13 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    /// Gives the size and the time of the last change of a file, so a test can
+    /// assert that a sentinel did not change.
+    fn stat_file(p: &Path) -> (u64, std::time::SystemTime) {
+        let m = std::fs::metadata(p).unwrap();
+        (m.len(), m.modified().unwrap())
     }
 
     fn write_csv(dir: &Path, name: &str, body: &str) -> PathBuf {
@@ -4027,9 +4282,11 @@ mod tests {
             ..Default::default()
         };
         let err = e.describe(&view).unwrap_err().to_string();
+        // The lock of `lock_down` refuses the path before DuckDB looks for an
+        // extension. Either refusal keeps the engine off the network.
         assert!(
-            err.contains("Extension") || err.contains("extension"),
-            "expected a missing extension error, got: {err}"
+            err.contains("Extension") || err.contains("extension") || err.contains("reads only"),
+            "expected a refusal, got: {err}"
         );
         assert!(
             !err.contains("HTTP"),
@@ -4124,6 +4381,163 @@ mod tests {
         // The alias is in the text that the panel shows, so the user can read
         // it there.
         assert!(e.read_expr().contains("__peruse_db"), "{}", e.read_expr());
+    }
+
+    #[test]
+    fn a_database_with_a_view_that_writes_does_not_open() {
+        // Gap 1, Layer B. A `.duckdb` file holds a view whose query calls a
+        // function that writes a file. Peruse must refuse the database before
+        // it reads the view, name the view, and never run its SQL. The
+        // sentinel beside the database must stay byte-for-byte the same.
+        let d = tmpdir("db-view-writes");
+        let sentinel = d.join("sentinel.txt");
+        std::fs::write(&sentinel, "keep me").unwrap();
+        let before = stat_file(&sentinel);
+        let out = db_path(&d.join("stolen.log"));
+        let p = write_db(
+            &d,
+            "evil.duckdb",
+            &format!(
+                "CREATE TABLE t AS SELECT 1 AS a;\n\
+                 CREATE VIEW v AS SELECT * FROM enable_logging(storage := 'file', \
+                 storage_path := '{out}');"
+            ),
+        );
+        // The view is named in the message, and the database does not open,
+        // whichever table the user asks for.
+        for opts in [OpenOptions::default(), with_table("t"), with_table("v")] {
+            let err = Engine::open(p.to_str().unwrap(), &opts)
+                .err()
+                .map(|e| format!("{e:#}"))
+                .expect("the database with a writing view opened");
+            assert!(err.contains("\"v\""), "{err}");
+            assert!(err.contains("not read-only"), "{err}");
+            assert!(err.contains("enable_logging"), "{err}");
+        }
+        assert!(!d.join("stolen.log").exists(), "the view wrote a file");
+        assert_eq!(stat_file(&sentinel), before, "the sentinel changed");
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"keep me");
+    }
+
+    #[test]
+    fn a_database_with_a_normal_view_still_opens() {
+        // Layer B must not refuse an ordinary view. A view that reads is the
+        // usual case, and the read-only test corpus keeps working.
+        let d = tmpdir("db-view-ok");
+        let p = write_db(
+            &d,
+            "shop.duckdb",
+            "CREATE TABLE t AS SELECT i AS a FROM range(3) t(i);\n\
+             CREATE VIEW v AS SELECT a, a * 2 AS b FROM t WHERE a > 0;\n\
+             CREATE MACRO plus(x) AS x + 1;",
+        );
+        let e = Engine::open(p.to_str().unwrap(), &with_table("v")).unwrap();
+        assert_eq!(e.count(&View::default()).unwrap(), 2);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_local_file_cannot_be_written_while_peruse_reads_it() {
+        // Layer D, Windows. While the engine is open on a local file, the
+        // handle that it holds must stop another program from writing the file
+        // or deleting it. When the engine closes, the write must work again.
+        use std::os::windows::fs::OpenOptionsExt;
+        let d = tmpdir("lock-in-place");
+        let p = write_csv(&d, "s.csv", SAMPLE);
+        let engine = Engine::open(p.to_str().unwrap(), &OpenOptions::default()).unwrap();
+        assert!(!engine.locks.is_empty(), "a local file is locked");
+        // A write to the file now fails, because the share mode of the lock
+        // denies write access to another handle.
+        let write_now = std::fs::OpenOptions::new().write(true).open(&p);
+        assert!(write_now.is_err(), "the file was writable while Peruse read it");
+        // DuckDB opened and read the file with the lock held.
+        assert_eq!(engine.count(&View::default()).unwrap(), 3);
+        drop(engine);
+        // With the engine closed, the file is writable again.
+        let mut w = std::fs::OpenOptions::new()
+            .write(true)
+            .share_mode(1)
+            .open(&p)
+            .expect("the lock did not release at the end of the session");
+        use std::io::Write as _;
+        w.write_all(b"x").unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_file_on_a_network_drive_is_never_locked() {
+        // The lock must never fall on a file on a network drive, or a coworker
+        // could not write it. The test uses a probe that calls one local
+        // directory a network drive.
+        struct Remote(PathBuf);
+        impl crate::remote::Probe for Remote {
+            fn is_remote(&self, path: &Path) -> bool {
+                let full =
+                    |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+                full(path).starts_with(full(&self.0))
+            }
+            fn free_bytes(&self, _dir: &Path) -> Option<u64> {
+                None
+            }
+        }
+        let d = tmpdir("lock-remote");
+        let p = write_csv(&d, "s.csv", SAMPLE);
+        let locks = read_only_locks(std::slice::from_ref(&p), false, &Remote(d.clone()));
+        assert!(locks.is_empty(), "a network file must not be locked");
+        // With no lock, another program can write the file.
+        assert!(std::fs::OpenOptions::new().write(true).open(&p).is_ok());
+    }
+
+    #[test]
+    fn the_lock_stops_a_write_to_a_file_outside_the_source() {
+        // Layer C, the backstop for gap 1. A statement that reaches the
+        // connection, past the guard, must still not write a file. This test
+        // goes around the guard and runs a `COPY ... TO` straight on the
+        // connection, in the same way as `the_read_only_flag_stops_a_write`.
+        // The lock must refuse the write, and the sentinel file beside the
+        // source must stay byte-for-byte the same, with the same time.
+        let d = tmpdir("lock-copy-out");
+        let p = write_csv(&d, "s.csv", SAMPLE);
+        let sentinel = d.join("sentinel.txt");
+        std::fs::write(&sentinel, "keep me").unwrap();
+        let before = stat_file(&sentinel);
+
+        let e = Engine::open(p.to_str().unwrap(), &OpenOptions::default()).unwrap();
+        for target in ["out.csv", "sentinel.txt"] {
+            let out = db_path(&d.join(target));
+            let err = e
+                .conn
+                .execute_batch(&format!("COPY (SELECT 1 AS a) TO '{out}' (FORMAT CSV)"))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.to_lowercase().contains("disabled by configuration")
+                    || err.to_lowercase().contains("cannot access"),
+                "COPY to {target} gave {err}"
+            );
+        }
+        assert!(!d.join("out.csv").exists(), "the engine wrote out.csv");
+        // The sentinel is byte-for-byte the same, with the same time.
+        assert_eq!(stat_file(&sentinel), before, "the sentinel changed");
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"keep me");
+    }
+
+    #[test]
+    fn a_query_that_reads_a_file_the_user_did_not_open_gets_a_clear_message() {
+        // Layer C changes what `-q` can do: a query can no longer read a file
+        // that the user did not open. The owner accepted that, so the message
+        // must say what Peruse allows and how to read the second file.
+        let d = tmpdir("q-other-file");
+        let p = write_csv(&d, "a.csv", SAMPLE);
+        let other = db_path(&write_csv(&d, "b.csv", SAMPLE));
+        let e = Engine::open(p.to_str().unwrap(), &OpenOptions::default()).unwrap();
+        let view = View {
+            base: crate::query::Base::Sql(format!("SELECT * FROM read_csv('{other}')")),
+            ..Default::default()
+        };
+        let err = e.describe(&view).unwrap_err().to_string();
+        assert!(err.contains("reads only"), "{err}");
+        assert!(err.contains("open it with"), "{err}");
     }
 
     #[test]
@@ -4683,7 +5097,10 @@ mod tests {
         }
 
         // A set of files with the same columns still gets its answer from the
-        // footer.
+        // footer. The engine holds a read-only handle on each file while it is
+        // open (Layer D), so close it before the file is replaced, as Peruse
+        // does when the user opens another source.
+        drop(e);
         std::fs::remove_file(d.join("a.parquet")).unwrap();
         conn.execute_batch(&format!(
             "COPY (SELECT i AS id FROM range(5) t(i)) TO '{}' (FORMAT parquet);",
