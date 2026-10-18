@@ -82,8 +82,11 @@ Four rules control the form of the SQL:
   the database and not a broken statement. The test of the characters comes
   before the test of the number, because `f64` reads the words `inf` and `NaN`,
   and those two words are names in a statement.
-- **A text column needs no cast.** Each other family needs `CAST(… AS VARCHAR)`
-  before `ILIKE`.
+- **Each family casts to `VARCHAR` before `ILIKE`.** `ILIKE` takes text only.
+  The cast is free for a `VARCHAR` column, because DuckDB removes a cast to the
+  same type. The cast is necessary for a column such as `UUID`, which the family
+  reads as text but which is not a `VARCHAR`: `ILIKE` with no cast gives an error
+  from the database, and the filter then fails for the whole column.
 - **The characters `%` and `_` lose their meaning.** The user types a value,
   and not a pattern.
 - **`does not contain` keeps the rows that hold NULL.** `NOT (NULL ILIKE …)`

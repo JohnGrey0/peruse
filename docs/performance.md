@@ -54,6 +54,16 @@ grid shows the new rows with no wait.
 The grid draws one character for each screen position. The cost of one frame
 follows the number of cells on the screen, and not the size of the file.
 
+A wide file follows the same rule for its columns. Each column of a statement
+costs time in DuckDB whatever the number of rows is, so a page of a file with
+more than 64 columns holds the columns near the screen only: the columns that
+the grid draws, and 32 columns at each side of them. On a Parquet file of 1000
+columns, one window of 550 rows of every column cost 392 ms, and the same window
+of 64 columns costs 41 ms. On a CSV file of 1000 columns the two cost 251 ms and
+60 ms. A move to the side past those columns asks for a new page, and each
+column gets its width when a page first holds it. The key that copies a row
+asks the engine for the complete row, because the page does not hold it.
+
 The detail band under the column names follows the same rule. One request
 covers each column that the grid draws, and the width of the terminal bounds
 that number. See [Decision 7](#decision-7-the-detail-band-reads-the-footer-first).
@@ -120,9 +130,28 @@ Two more gains come from that one call:
   cost four seconds, and the engine made that call for each request. The open
   operation reads the schema one time and keeps it in `base_schema`.
 
-A set of files keeps the call with `auto_detect`. A set needs `union_by_name`,
-and two files of one set can hold different columns, so one column list cannot
-serve them all.
+A set of CSV files gets the pinned call too, when the sniffer finds the same
+dialect and the same columns, in the same order and with the same types, in each
+file of the set. The open operation asks the sniffer about each file one time,
+on up to 8 threads at the same time. Without the pinned call, `union_by_name`
+examines each file of the set again for every statement: over 500 small CSV
+files, one window of 550 rows cost 494 ms, and it costs 42 ms with the pinned
+call. The count fell from 636 ms to 152 ms, and the open operation from 838 ms
+to 618 ms.
+
+A set whose files differ keeps the call with `auto_detect` and `union_by_name`,
+because one column list cannot serve files with different columns. A set of
+JSON files also keeps that call.
+
+A set of 100 Parquet files or more gets a plain `read_parquet` call with no
+`union_by_name`, when each file holds the same columns in the same order with
+the same types. With `union_by_name`, DuckDB reads the footer of each file again
+for every statement. The open operation compares the schema of each file one
+time, with one call of `parquet_schema`. Over 500 small Parquet files, each
+statement then costs about 12 ms less: a window of 550 rows fell from 66 ms to
+54 ms, and the open operation from 100 ms to 86 ms. A smaller set keeps
+`union_by_name`, because there the comparison costs more at the open operation
+than it saves.
 
 ## Decision 5: keep the user interface thread free
 
@@ -176,6 +205,14 @@ agree with the numbers of a page, so the statement needs that function. A
 window over the full table would number each row before the database could
 report the first match. On ten million rows, the user would wait some seconds
 and see nothing.
+
+The search reads only the columns whose text can hold the needle. The text of
+a number, of a truth value and of a date or a time uses few characters, such as
+`-12.5`, `1e+20`, `inf`, `true` and `0044-03-15 (BC)`. A needle with an ASCII
+character that such text never holds, as in a search for a name, skips those
+columns. On a Parquet file of 1000 columns, a search that finds nothing fell
+from 1398 ms to 125 ms. Over 250,000 rows of `sample.parquet` it fell from 51
+ms to 7 ms. The function `text_can_hold` in `query.rs` holds the rule.
 
 ## Decision 7: the detail band reads the footer first
 
@@ -242,6 +279,21 @@ fit. The index therefore becomes slower, but it does not fail.
 A table of a DuckDB database needs no index. The database holds its rows in
 blocks already, so `Engine::is_seekable` gives `true` for it, as it does for a
 Parquet file.
+
+## Decision 9: sort the positions one time for a deep sorted page
+
+A sorted page deep in the view made DuckDB sort each column of each row, and
+each scroll there asked for that sort again. On 10 million rows of Parquet one
+window at the middle cost 0.7 to 1.1 s. The engine now sorts the sort columns
+and the position of each row one time, into a table in memory, at the first
+sorted request past row 100,000. The first window there costs 0.1 to 0.2 s, and
+each later window costs 10 to 20 ms. A jump to the last row of a sorted view
+fell from 914 ms to 18 ms. Near the start of the view the direct sort keeps the
+first rows only and costs less than the table, so it stays. Refer to
+[engine.md](engine.md#a-sorted-page).
+
+The table costs about 11 bytes of memory for each row of the view: DuckDB
+reported 108 MB for 10 million rows. It holds one view at a time.
 
 ## The costs that stay
 

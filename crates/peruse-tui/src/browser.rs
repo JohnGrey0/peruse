@@ -210,12 +210,21 @@ impl Browser {
             if name.starts_with('.') {
                 continue;
             }
-            self.entries.push(entry_of(&path, false));
+            // The entry of the directory holds the facts of the file already
+            // on Windows, so `DirEntry::metadata` costs no call to the system
+            // there. A call for each path costs one round trip for each file
+            // on a network share, and a directory can hold thousands of
+            // files. A link needs the facts of the file that it points to, so
+            // a link takes the slow way, which follows it.
+            let meta = match e.file_type() {
+                Ok(kind) if !kind.is_symlink() => e.metadata().ok(),
+                _ => std::fs::metadata(&path).ok(),
+            };
+            let mut entry = entry_with(&path, meta, false);
             // Keep the name that the directory gave. A path with characters
             // that are not valid gives a different name from `file_name`.
-            if let Some(last) = self.entries.last_mut() {
-                last.name = name;
-            }
+            entry.name = name;
+            self.entries.push(entry);
         }
         // The directories come first, and each group follows the alphabet.
         // A user looks for a directory by its name, and for a file by its
@@ -512,7 +521,11 @@ impl Browser {
 
 /// Reads what the screen shows about one path.
 fn entry_of(path: &Path, is_recent: bool) -> Entry {
-    let meta = std::fs::metadata(path).ok();
+    entry_with(path, std::fs::metadata(path).ok(), is_recent)
+}
+
+/// Makes the entry of one path from the facts that the caller read.
+fn entry_with(path: &Path, meta: Option<std::fs::Metadata>, is_recent: bool) -> Entry {
     Entry {
         name: path
             .file_name()
@@ -530,11 +543,40 @@ fn entry_of(path: &Path, is_recent: bool) -> Entry {
 
 /// Writes a path in a short form, with the home directory as `~`.
 fn short_path(p: &Path) -> String {
-    let full = p.to_string_lossy().replace('\\', "/");
-    if let Some(home) = peruse_core::dirs::home_dir() {
-        let h = home.to_string_lossy().replace('\\', "/");
-        if let Some(rest) = full.strip_prefix(&h) {
-            return format!("~{rest}");
+    short_path_in(p, peruse_core::dirs::home_dir().as_deref())
+}
+
+/// Writes a path in a short form, with the directory `home` as `~`.
+///
+/// On Windows, `std::fs::canonicalize` gives a verbatim path, which starts with
+/// `\\?\`. The title must show the plain form, and `tidy_path` gives it. Each
+/// move into a directory goes through `canonicalize`, so without this rule the
+/// title showed `//?/C:/...` after the first move.
+///
+/// The home directory becomes `~` only at a separator. A directory whose name
+/// starts with the name of the home directory is not inside it: `/home/john`
+/// is not inside `/home/jo`.
+fn short_path_in(p: &Path, home: Option<&Path>) -> String {
+    let full = peruse_core::source::tidy_path(p);
+    if let Some(home) = home {
+        let h = peruse_core::source::tidy_path(home);
+        let h = h.trim_end_matches('/');
+        // Windows does not care about the case of the letters in a path, and
+        // the shell can give the current directory in another case than the
+        // environment gives the home directory.
+        let same = |a: &str, b: &str| {
+            if cfg!(windows) {
+                a.eq_ignore_ascii_case(b)
+            } else {
+                a == b
+            }
+        };
+        if !h.is_empty()
+            && full.is_char_boundary(h.len())
+            && same(&full[..h.len()], h)
+            && (full.len() == h.len() || full[h.len()..].starts_with('/'))
+        {
+            return format!("~{}", &full[h.len()..]);
         }
     }
     full
@@ -631,14 +673,21 @@ pub fn draw(f: &mut Frame, b: &mut Browser, theme: &Theme, depth: Depth) -> Opti
         y += 2;
     }
 
+    // The row of keys takes the last row of the screen. A message must stay
+    // above it, and it must never go below the screen: a write outside the
+    // buffer stops the program. A short screen with the find box open had its
+    // message on the row under the screen.
+    let last_free = area.bottom().saturating_sub(1);
     if let Some(e) = &b.error {
-        buf.set_stringn(
-            area.x + 1,
-            y,
-            text::truncate(e, area.width.saturating_sub(2) as usize),
-            area.width.saturating_sub(2) as usize,
-            p.on(t.error, t.bg),
-        );
+        if y < last_free {
+            buf.set_stringn(
+                area.x + 1,
+                y,
+                text::truncate(e, area.width.saturating_sub(2) as usize),
+                area.width.saturating_sub(2) as usize,
+                p.on(t.error, t.bg),
+            );
+        }
         y += 2;
     }
 
@@ -647,7 +696,7 @@ pub fn draw(f: &mut Frame, b: &mut Browser, theme: &Theme, depth: Depth) -> Opti
     let rows = b.rows();
     let list_h = area.bottom().saturating_sub(y + 2) as usize;
     let items = rows.iter().filter(|r| matches!(r, Row::Item(_))).count();
-    if items == 0 {
+    if items == 0 && y < last_free {
         let msg = if !b.find.is_empty() {
             "no name holds that text"
         } else if b.database.is_some() {
@@ -1151,6 +1200,50 @@ mod tests {
     }
 
     #[test]
+    fn a_short_path_puts_a_tilde_for_the_home_directory_at_a_separator_only() {
+        let home = Path::new("/home/jo");
+        assert_eq!(short_path_in(Path::new("/home/jo"), Some(home)), "~");
+        assert_eq!(short_path_in(Path::new("/home/jo/data"), Some(home)), "~/data");
+        // A directory whose name starts with the name of the home directory
+        // is not inside the home directory. The title showed `~hn/data`.
+        assert_eq!(
+            short_path_in(Path::new("/home/john/data"), Some(home)),
+            "/home/john/data"
+        );
+        assert_eq!(short_path_in(Path::new("/tmp"), None), "/tmp");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_short_path_drops_the_verbatim_start_that_canonicalize_gives() {
+        // On Windows, `std::fs::canonicalize` gives `\\?\C:\...`. The title
+        // bar showed `//?/C:/...` after each move into a directory, and the
+        // home directory never became `~` there.
+        let home = Path::new(r"C:\Users\jo");
+        assert_eq!(
+            short_path_in(Path::new(r"\\?\C:\Users\jo\data"), Some(home)),
+            "~/data"
+        );
+        assert_eq!(short_path_in(Path::new(r"\\?\D:\data"), Some(home)), "D:/data");
+        assert_eq!(short_path_in(Path::new(r"C:\Users\jo\data"), Some(home)), "~/data");
+        assert_eq!(
+            short_path_in(Path::new(r"\\?\UNC\host\share\data"), Some(home)),
+            "//host/share/data"
+        );
+    }
+
+    #[test]
+    fn the_title_never_shows_a_verbatim_path_after_a_move() {
+        // A move into a directory canonicalizes the path, and on Windows that
+        // gives a verbatim path. The title must show the plain form.
+        let d = sample_dir("verbatim");
+        let mut b = Browser::new(d, &Config::default());
+        b.on_key(&key(KeyCode::Char('h')));
+        let shown = b.where_text();
+        assert!(!shown.contains("?/"), "the title shows {shown}");
+    }
+
+    #[test]
     fn a_time_becomes_a_few_characters() {
         let now = SystemTime::now();
         assert_eq!(ago(now), "just now");
@@ -1159,6 +1252,39 @@ mod tests {
         assert_eq!(ago(now - std::time::Duration::from_secs(172800)), "2d ago");
         // A time in the future is not a fault that stops the program.
         assert_eq!(ago(now + std::time::Duration::from_secs(60)), "");
+    }
+
+    /// A tool for the developer. It prints the time that the two ways to read
+    /// the facts of each file need, in a directory of 5000 files.
+    ///
+    ///     cargo test -p peruse-tui time_to_read -- --ignored --nocapture
+    #[test]
+    #[ignore = "prints a time instead of asserting"]
+    fn time_to_read_a_directory_of_many_files() {
+        let d = std::env::temp_dir().join("peruse-browser-many");
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        for n in 0..5000 {
+            std::fs::write(d.join(format!("f{n:04}.csv")), b"a\n").unwrap();
+        }
+        let t = std::time::Instant::now();
+        for e in std::fs::read_dir(&d).unwrap().flatten() {
+            let _ = std::fs::metadata(e.path());
+        }
+        let by_path = t.elapsed();
+        let t = std::time::Instant::now();
+        for e in std::fs::read_dir(&d).unwrap().flatten() {
+            let _ = e.metadata();
+        }
+        let by_entry = t.elapsed();
+        let t = std::time::Instant::now();
+        let b = Browser::new(d, &Config::default());
+        let whole = t.elapsed();
+        println!(
+            "5000 files: metadata(path) {by_path:?}, DirEntry::metadata {by_entry:?}, \
+             Browser::new {whole:?} for {} entries",
+            b.items().len()
+        );
     }
 }
 
@@ -1546,6 +1672,36 @@ mod render_tests {
             })
             .unwrap();
             b.on_key(&key(KeyCode::Esc));
+        }
+    }
+
+    #[test]
+    fn a_find_box_with_no_match_draws_on_a_short_screen() {
+        // The find box takes two rows, and the message about a directory that
+        // Peruse cannot read takes two more. On a short screen, the row for
+        // the message "no name holds that text" was then the row under the
+        // screen, and a write there stops the program.
+        let d = sample("short-find");
+        let theme = peruse_core::theme::builtin("peruse-dark").unwrap();
+        for error in [false, true] {
+            let mut b = Browser::new(d.clone(), &Config::default());
+            if error {
+                b.error = Some("cannot read this directory".into());
+            }
+            b.on_key(&key(KeyCode::Char('/')));
+            for c in "zzz".chars() {
+                b.on_key(&key(KeyCode::Char(c)));
+            }
+            assert!(b.items().is_empty(), "the find box found a name");
+            for h in 4..=8u16 {
+                for w in [20u16, 40, 90] {
+                    let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+                    term.draw(|f| {
+                        draw(f, &mut b, &theme, Depth::True);
+                    })
+                    .unwrap();
+                }
+            }
         }
     }
 

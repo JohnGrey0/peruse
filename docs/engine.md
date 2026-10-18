@@ -19,9 +19,10 @@ file on the disk. The function `configure` then sends these settings:
 | `threads` | The option `--threads`, or one thread for each core | It controls the parallel work. |
 | `enable_progress_bar` | `false` | A progress bar would write to the terminal and break the frame. |
 | `preserve_insertion_order` | `true` | The rows must always come back in the order of the file. |
-| `temp_directory` | The temporary directory of the system, plus `peruse` | DuckDB writes here when the data does not fit in memory. |
+| `temp_directory` | The temporary directory of the system, plus `peruse`, plus a name for each engine | DuckDB writes here when the data does not fit in memory. Two engines must never share it, because DuckDB gives the same names to the files of each engine. A process that stops before the engine closes leaves its directory, so the first engine of each process removes the directory of each process that is not alive. |
 | `memory_limit` | The option `--memory-limit`, or the setting `memory_limit`, or one half of the memory of the machine, and three tenths of a machine of 8 GB or less | It limits the memory before DuckDB writes to the disk. |
 | `parquet_metadata_cache` | `true` | DuckDB then reads the footer of a Parquet file one time and keeps the result. |
+| `late_materialization_max_rows` | 4096 | DuckDB then reads a sorted page or a page of a filtered view in two steps: the sort column or the filter column first, and then the other columns of the page rows only. |
 
 The two extension settings are necessary for the read-only promise. The bundled
 DuckDB build sets them to `true`. A statement that names an `https://` path or
@@ -37,6 +38,13 @@ again when either one changes. With the cache, a page request costs 8
 milliseconds and not 12, and a count costs 1 and not 2. The setting arrived in a
 later version of DuckDB than the oldest one that Peruse builds against, so a
 failure there is not an error.
+
+The default of `late_materialization_max_rows` is 50 rows, and one request of
+the grid holds the screen and 250 rows on each side of it. Without the setting,
+a sorted window of 550 rows over 10 million rows of Parquet cost 153 ms, and a
+window deep in a filtered view cost 360 ms. With it, the two cost 50 ms and 115
+ms. Over a table of a database, the window deep in a filtered view fell from 515
+ms to 31 ms. A failure of this setting is also not an error.
 
 ## How Peruse opens a file
 
@@ -57,9 +65,14 @@ The function `Engine::open` does these steps:
 8. It runs `CREATE OR REPLACE VIEW src AS SELECT * FROM <read expression>`.
 9. It reads the schema, and it keeps that schema. An error therefore comes
    here, and not at the first scroll.
-10. For a CSV file or a JSON file of one file, it writes the columns into the
-    read call. See [One examination of a file of
-    text](#one-examination-of-a-file-of-text).
+10. For a CSV file, for a set of CSV files that agree, and for a JSON file of one
+    file, it writes the columns into the read call. See [One examination of a
+    file of text](#one-examination-of-a-file-of-text).
+
+A large file on a network drive arrives here as the path of a local copy. The
+engine reads the copy, and it does not know that the copy is a copy. The worker
+writes the path of the source into the source and into each message. See
+[local-copies.md](local-copies.md).
 
 The engine changes each backslash in a path to a forward slash. DuckDB accepts
 a forward slash on each platform. In a glob pattern, DuckDB reads a backslash
@@ -90,7 +103,8 @@ that holds a SQLite database therefore gets a message about SQLite, and not a
 parse failure from the CSV reader. The marks are `DUCK` after the eight bytes of
 the checksum for DuckDB, and `SQLite format 3` and one zero byte for SQLite.
 For the third test the marks are `PAR1` for Parquet, `ARROW1` for Arrow, and `{`
-or `[` for JSON, after any spaces.
+or `[` for JSON, after any spaces and after a byte order mark. The head for this
+test is 4096 bytes long, so a JSON file can start with some empty lines.
 
 The function reads the head of the file with a limit and `read_to_end`, and not
 with one call to `read`. One call can give fewer bytes than the caller asked
@@ -105,7 +119,10 @@ to change the file to Parquet.
 
 For a CSV file, the expression takes more options:
 
-- `delim`, when the user or the file extension gives a delimiter
+- `delim`, when the user or the file extension gives a delimiter. The
+  extensions `.tsv` and `.tab` give a tab, and `.psv` gives `|`. The extension
+  `.csv` gives none: a spreadsheet program in a country that writes a decimal
+  comma saves a `.csv` file with a semicolon, so the sniffer decides.
 - `header`, when the user gives the option `--no-header`
 - `all_varchar`, `ignore_errors` and `sample_size`, from the options
 - `union_by_name`, when the source holds more than one file
@@ -127,10 +144,26 @@ Two rules stop it:
 - The function `source::json_depth_over` counts the levels with a loop and a
   number, so it can never fill the stack itself. It stops at the first level
   above 128, so a file that is made to be deep costs almost nothing to refuse.
-  It reads 8 MB of the file at the most: a file that nests too deep does so at
-  its start, because each level is one character.
+  It reads twice the number of records that the reader examines, which is
+  `sample_size`, and 20480 when the user gives none. A limit in bytes is not
+  safe: a deep record can come after some megabytes of shallow records. The
+  check reads each file of a set, because the reader examines each of them.
+- The bytes of a compressed file (`.json.gz`, `.json.zst`) are not JSON, and a
+  file of 80 bytes can hold 3000 levels. Peruse holds no decompressor, but
+  DuckDB does. For such a file, `compressed_json_too_deep` reads the same
+  records with `read_json_objects`, which gives each record as text and finds
+  no columns. Then `source::json_text_depth_over` counts the levels of each
+  text with a loop.
 - The read call also holds `maximum_depth = 128`. The reader then stops at that
-  level and gives the value below it as text.
+  level and gives the value below it as text. This limit does not protect the
+  part of the reader that finds the columns, so the first rule is necessary.
+
+A JSON file that holds a list behind a byte order mark needs one more option.
+PowerShell 5 writes the mark in front of each file that it writes as UTF-8. The
+reader of DuckDB does not see the list behind the mark, and it reads the whole
+file as one row with one column `json`. The function
+`source::json_list_behind_bom` finds such a file, and the read call then holds
+`format = 'array'`.
 
 ## One examination of a file of text
 
@@ -166,9 +199,28 @@ the columns of the sniffer. `pin_json` points the view back at the call that
 worked in the same cases. The engine then uses the call with `auto_detect`,
 which is the call that Peruse used before this step existed.
 
-A set of files keeps the call with `auto_detect`. A set needs `union_by_name`,
-and two files of one set can hold different columns, so one column list cannot
-serve them all.
+A set of CSV files gets the pinned call too, when the sniffer finds the same
+dialect and the same columns, in the same order and with the same types, in each
+file of the set. The open operation asks the sniffer about each file one time,
+on up to 8 threads at the same time. Without the pinned call, `union_by_name`
+examines each file of the set again for every statement: over 500 small CSV
+files, one window of 550 rows cost 494 ms, and it costs 42 ms with the pinned
+call. The count fell from 636 ms to 152 ms, and the open operation from 838 ms
+to 618 ms.
+
+A set whose files differ keeps the call with `auto_detect` and `union_by_name`,
+because one column list cannot serve files with different columns. A set of
+JSON files also keeps that call.
+
+A set of 100 Parquet files or more gets a plain `read_parquet` call with no
+`union_by_name`, when each file holds the same columns in the same order with
+the same types. With `union_by_name`, DuckDB reads the footer of each file again
+for every statement. The open operation compares the schema of each file one
+time, with one call of `parquet_schema`. Over 500 small Parquet files, each
+statement then costs about 12 ms less: a window of 550 rows fell from 66 ms to
+54 ms, and the open operation from 100 ms to 86 ms. A smaller set keeps
+`union_by_name`, because there the comparison costs more at the open operation
+than it saves.
 
 ### The two read expressions
 
@@ -272,6 +324,29 @@ The function `substr` cuts each value at 4096 characters. One JSON value of 40
 megabytes can therefore not stop a redraw. For a BLOB column, the statement
 gives the size only, and not the bytes. The cell inspector asks for the
 complete value of one cell with `Engine::cell`.
+
+### A sorted page
+
+A sorted page over the file reads the view `src_ord`, which holds each column of
+`src` and the position of each row in the file. The sort ends with that
+position, so each row has one place in the sort. Refer to
+[query-generation.md](query-generation.md).
+
+A sorted page deep in the view is a different case. There DuckDB must sort each
+column of each row, and the next page sorts them again. A sorted request that
+ends after row 100,000 (`SORT_TABLE_ROWS`) therefore fills the table
+`__peruse_sorted` with the positions of the rows of the view, in the order of the
+view. That sort holds the sort columns and the position only. The row id of a
+position in the table is the number of its row in the view, so each page takes
+its positions from the table with `LIMIT` and `OFFSET`, and its rows from
+`src_ord` by position. The cell inspector and the record view read the same
+way.
+
+The table holds one view at a time. A request for another view below row
+100,000 sorts directly, and a request past it fills the table again. The engine
+drops the table when the view `src` changes, for example when it indexes a file
+of text. A source with no position, such as a file of text with no index, sorts
+directly at each depth.
 
 ## The counts
 

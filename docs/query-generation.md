@@ -32,10 +32,45 @@ Three private functions build the parts that each statement needs:
 |---|---|---|
 | `relation()` | `src AS q` | `(<statement>) AS q` |
 | `where_clause()` | `` (empty) `` or ` WHERE (<filter>)` | The same |
-| `order_clause()` | `` (empty) `` or ` ORDER BY "a" ASC, "b" DESC` | The same |
+| `order_clause()` | `` (empty) `` or ` ORDER BY "a" ASC, "b" DESC, "__peruse_row_order"` | `` (empty) `` or ` ORDER BY "a" ASC, "b" DESC, COLUMNS(*)` |
 
 The function `relation()` removes a semicolon at the end of a statement from
-the user. Each statement uses the same name `q` for its one relation.
+the user. Each statement uses the same name `q` for its one relation. A sorted
+statement over the file reads the view `src_ord AS q` and not `src AS q`.
+
+The last part of a sort is necessary. The sort of DuckDB is not stable, and it
+uses each thread, so two rows with the same sort value can come in a different
+order in each statement. Each page is one statement. Without the part, a sort on
+a column with repeated values showed some rows on two pages and other rows on
+none, and the same page changed when the user scrolled back to it.
+
+* Over the file, the sort ends with the position of each row in the file. The
+  view `src_ord` holds `src` and that position in the column
+  `__peruse_row_order`. Each row has its own position, so rows with the same
+  sort value keep the order of the file. The position comes from the metadata:
+  `file_row_number` of a Parquet file (with `file_index` for a set of files),
+  and `rowid` of a table of a database or of the index of a file of text. On a
+  Parquet file of 10 million rows, the first sorted window of 550 rows costs 77
+  milliseconds with it, and 667 with `COLUMNS(*)`.
+* A statement of the user, and a file of text with no index, have no position.
+  The sort then ends with `COLUMNS(*)`, and the database sorts such rows by each
+  of their values. Two rows that it still cannot put in order look the same. The
+  engine gives such a file to the functions here as the statement
+  `SELECT * FROM src`. On a CSV file the scan costs the most, so the part costs
+  almost nothing there. A number from `row_number()` would also be a position,
+  but on a CSV file of 1.4 GB it made the first sorted window cost 3.6 s and not
+  0.5 s.
+* A file with a column of the name `__peruse_row_order`, or of the name that
+  gives the position, gets no `src_ord`, and its sort ends with `COLUMNS(*)`.
+
+The part `COLUMNS(*)` at the end of a sort is necessary. The sort of DuckDB is
+not stable, and it uses each thread, so two rows with the same sort value can
+come in a different order in each statement. Each page is one statement. Without
+the part, a sort on a column with repeated values showed some rows on two pages
+and other rows on none, and the same page changed when the user scrolled back to
+it. With the part, the database sorts such rows by each of their values, and two
+rows that it still cannot put in order look the same. On a Parquet file of 20
+million rows, the first sorted page costs about 200 milliseconds and not 80.
 
 Two public functions join those parts:
 
@@ -152,13 +187,20 @@ The last four values follow the family of the column:
 
 | Family | Minimum and maximum | Mean and deviation |
 |---|---|---|
-| Number | `min()` and `max()` | `avg()` and `stddev_samp()` |
+| Number | `min()` and `max()` | `avg()` and `stddev_samp()`, over the value as a DOUBLE |
 | Text, Bool, Temporal | `min()` and `max()` | `NULL` |
 | Binary, Nested | `NULL` | `NULL` |
 
 The minimum and the maximum have a meaning for each type that has an order. The
 mean and the deviation do not. A call to `avg()` on a VARCHAR column gives an
 error, and not a NULL.
+
+The mean and the deviation read the value as a DOUBLE. The sum behind `avg()`
+over a HUGEINT is a HUGEINT, and three large values gave an overflow. The
+deviation also leaves out each value that is not finite. One NaN made
+`stddev_samp()` fail with "out of range", and pandas writes NaN for each missing
+value of a column of floating-point numbers. The mean keeps such a value, so the
+panel shows `nan` and the user sees that the column holds one.
 
 A column of numbers gets two more values at the end: the smallest value and the
 largest value as a DOUBLE. The histogram needs those two edges, and this
@@ -264,9 +306,14 @@ The function `search_sql` builds this statement. The design has a reason:
 
 The conditions use one item for each column:
 
-- For a text column: `contains(lower("c"), lower('needle'))`
 - For a BLOB column: no item, because the grid shows the size only
 - For each other column: `contains(lower(CAST("c" AS VARCHAR)), lower('needle'))`
+
+A text column is cast too. The cast is free for a `VARCHAR` column, because
+DuckDB removes a cast to the same type. The cast is necessary for a column such
+as `UUID`, which the schema reads as text but which `lower` does not take: with
+no cast the statement gives an error from the database, and the search then
+fails for the whole table.
 
 The function `contains` looks for a plain part of a text. `ILIKE` reads a
 pattern first, and it costs about three times as much for the same answer. Over
@@ -278,7 +325,6 @@ constant. Both sides of the test therefore follow the same rule for a letter,
 also for a letter that English does not use.
 
 The needle needs no escape character. A search for `50%` looks for the three
-characters, and `%` is not a wildcard here. A text column needs no cast, because
-a cast would copy each value for no gain.
+characters, and `%` is not a wildcard here.
 
 The statement is empty when the schema holds BLOB columns only.

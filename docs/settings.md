@@ -50,17 +50,28 @@ no value takes the value that Peruse builds in.
 | `band` | The rows of facts under the column names: `off`, `compact` or `detailed` | `off` |
 | `step` | The rows or columns that the keys `J`, `K`, `H` and `L` move, from 1 to 1000 | 10 |
 | `mouse` | `false` to make Peruse ignore the mouse | `true` |
+| `local_copy` | When Peruse copies a file to the local disk before it opens it: `auto`, `always` or `never` | `auto` |
+| `local_copy_min_mb` | The size in whole megabytes below which `auto` reads a file from a network drive in place | 32 |
+| `local_copy_max_gb` | The space in whole gigabytes that the local copies can take together | 20 |
 | `recent` | The files that the user opened, the newest first | an empty list |
 
-Two of those ten are not on the page:
+Four of those thirteen are not on the page:
 
 - `recent` is a list that Peruse writes for the chooser of files. A user does
   not edit it by hand. See [chooser.md](chooser.md).
 - `mouse` is on the command line as `--no-mouse` and in the file. A user who
   turns the mouse off wants it off at each start, and a page that the mouse
   itself can reach is a poor place for that switch.
+- `local_copy_min_mb` and `local_copy_max_gb` are limits that a user sets one
+  time, if at all. The page shows the policy `local_copy` and the space that the
+  copies take now. See [local-copies.md](local-copies.md).
 
-The page therefore shows eight settings, from the enumeration `Setting`, in
+The file also accepts the names `remote_cache`, `remote_cache_min_mb` and
+`remote_cache_max_gb` for the three settings of the local copies. Peruse
+always writes the names `local_copy`, which are the names that the screen
+uses.
+
+The page therefore shows nine settings, from the enumeration `Setting`, in
 this order:
 
 | Row | Setting | What the page says |
@@ -73,6 +84,7 @@ this order:
 | `panels` | `Setting::Panels` | keep at the side: none, meta, stats or both |
 | `column details` | `Setting::Band` | rows under the headers: off, compact or detailed. d cycles |
 | `step` | `Setting::Step` | rows or columns that J, K, H and L move |
+| `local copy` | `Setting::LocalCopy` | copy a file from a network drive first: auto, always, never |
 
 The row `index at open` takes `yes` or `no`, and it is the setting `no_index`
 the other way round. The page asks the question that the user has, and the file
@@ -105,12 +117,13 @@ again and changes one line of it, so a setting that the user is testing in this
 session does not go into the file without a request. The key `d` in the grid
 writes the band in the same way.
 
-**Six settings work now, and two work at the next file.** DuckDB changes its
+**Six settings work now, and three work at the next file.** DuckDB changes its
 threads and its memory limit while it runs, so the page shows the result of a
 change with no restart. The theme, the panels, the band and the step are all in
 the front end, and they change the next frame. The sniffer and the index do
 their work when a file opens, so the page says "takes effect at the next file"
-for the sample size and for the index. The function `Setting::at_next_file`
+for the sample size, for the index and for the local copy, which Peruse makes
+before it opens a file. The function `Setting::at_next_file`
 holds that rule.
 
 **A setting shows the built-in value when it has none.** The page writes that
@@ -160,6 +173,7 @@ The lower half of the page holds these facts:
 | `duckdb now` | The threads and the memory limit that DuckDB uses at this moment |
 | `spill to` | The directory that DuckDB writes to when a query needs more memory than its limit |
 | `file` | The path of the settings file |
+| `local copies` | The number of local copies of files from network drives, the space that they take, and their directory |
 
 A user who sets a memory limit needs to know how much memory the machine has,
 and a user who sets the threads needs to know how many cores it has. Without
@@ -186,6 +200,13 @@ opens.
 `Config` uses `deny_unknown_fields`, so `thread = 4` gives "unknown field". A
 name with a spelling mistake must not pass in silence: the user would then look
 for the reason that the setting does nothing.
+
+**Peruse never writes over a file that it cannot read.** A file with a fault
+gives the built-in settings and a message, and a write of those settings would
+remove each line that the user wrote. Each write therefore reads the file
+again first, and it stops when the file has a fault. That includes the list
+`recent`, which Peruse writes at each start: the function
+`Config::remember_file_at` changes the list in the file and nothing else.
 
 **A test never writes the settings of the user who runs it.** The functions
 `Config::load_from` and `Config::save_to` take a path, and the field

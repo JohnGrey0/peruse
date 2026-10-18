@@ -14,7 +14,7 @@ starts with a summary of one paragraph, and then gives short sections. Read
 | [filter.md](filter.md) | The list of conditions, the operators, and how the list becomes one expression |
 | [ddl.md](ddl.md) | How Peruse measures a file and writes a `CREATE TABLE` statement for another database |
 | [nested-values.md](nested-values.md) | A value that holds other values, and the tree that drills into it |
-| [read-only-guard.md](read-only-guard.md) | The two layers that stop a write, and the statements that pass |
+| [read-only-guard.md](read-only-guard.md) | The five layers that stop a write, and the statements that pass |
 | [worker-and-concurrency.md](worker-and-concurrency.md) | The worker thread, the combination of requests, the epoch and the cancellation |
 | [user-interface.md](user-interface.md) | The layout, the grid, the panels, the overlays and the prompt |
 | [keys-and-commands.md](keys-and-commands.md) | The table of commands, the mouse, and the help and the palette that come from it |
@@ -22,6 +22,7 @@ starts with a summary of one paragraph, and then gives short sections. Read
 | [settings.md](settings.md) | The settings that Peruse keeps, the settings page, and what the machine gives |
 | [themes.md](themes.md) | The model of the colors, the built-in themes, and how to write a theme file |
 | [performance.md](performance.md) | The measured times, and the decisions that give them |
+| [local-copies.md](local-copies.md) | The copy of a file from a network drive to the local disk, and the measurements behind it |
 | [releasing.md](releasing.md) | The forms that Peruse goes out in, the release script, and the steps by hand |
 
 ## The rules for this documentation
@@ -106,6 +107,10 @@ the code. The right column gives the words that these documents do not use.
 | give | To send a value back from a function | return, yield |
 | reject | To refuse a statement that writes | block, deny, forbid |
 | index | The table in memory that holds a file of text | cache, materialization |
+| network drive | A disk of another computer that Peruse reads through the network | share, remote drive, mount |
+| local copy | A copy of a file from a network drive on the local disk, which the engine reads in place of the source | cache, mirror, snapshot |
+| source | The file that the user gave, when Peruse reads a local copy of it | original, remote file |
+| lease | The open file that marks a local copy that a Peruse reads now | lock, pin |
 | position | A number that selects an item in a list | index, offset |
 | offset | The number of a row in the view, from 0 | index, position |
 | sniffer | The part of DuckDB that finds the format of a CSV file | detector, parser |

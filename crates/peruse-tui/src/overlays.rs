@@ -277,7 +277,9 @@ pub fn draw_help(buf: &mut Buffer, area: Rect, app: &App, p: &Paint) -> OverlayH
     }
     // The help holds text and no list. A click inside it therefore selects
     // nothing, and a click outside it closes the overlay.
-    OverlayHit::new(app.mode, outer)
+    let mut hit = OverlayHit::new(app.mode, outer);
+    hit.scroll_max = Some(max_scroll);
+    hit
 }
 
 /// The width of the marker column of the palette, in screen columns.
@@ -696,7 +698,17 @@ pub fn draw_cell(buf: &mut Buffer, area: Rect, app: &App, p: &Paint) -> OverlayH
     let t = &app.theme;
 
     let value = app.cell_value.as_deref().unwrap_or("…");
-    let lines = text::wrap(value, inner.width as usize);
+    // The grid writes a control character as a visible mark, and the
+    // inspector must say the same. The terminal library drops such a
+    // character, so `a<tab>b` read as `ab` here, and an escape sequence lost
+    // its first character and read as a plain `[31m`. A line end keeps its
+    // work: it starts a new line.
+    let shown: String = value
+        .split('\n')
+        .map(|line| text::sanitize(line.trim_end_matches('\r')))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let lines = text::wrap(&shown, inner.width as usize);
     let max_scroll = lines.len().saturating_sub(inner.height as usize) as u16;
     let scroll = app.cell_scroll.min(max_scroll);
 
@@ -728,9 +740,9 @@ pub fn draw_cell(buf: &mut Buffer, area: Rect, app: &App, p: &Paint) -> OverlayH
     }
 
     let footer = format!(
-        " {} chars · {} lines{} · y copies · Esc closes ",
-        value.chars().count(),
-        lines.len(),
+        " {} · {}{} · y copies · Esc closes ",
+        plural(value.chars().count(), "char"),
+        plural(lines.len(), "line"),
         if max_scroll > 0 { " · j/k scrolls" } else { "" }
     );
     buf.set_stringn(
@@ -742,7 +754,21 @@ pub fn draw_cell(buf: &mut Buffer, area: Rect, app: &App, p: &Paint) -> OverlayH
     );
     // The inspector holds one value and no list. A click inside it therefore
     // selects nothing.
-    OverlayHit::new(app.mode, outer)
+    let mut hit = OverlayHit::new(app.mode, outer);
+    hit.scroll_max = Some(max_scroll);
+    hit
+}
+
+/// Writes a count with its noun: `1 line`, `2 lines`.
+///
+/// A count of one with the plural form reads as a mistake, and the user sees
+/// this text on each value that fits on one line.
+fn plural(n: usize, noun: &str) -> String {
+    if n == 1 {
+        format!("1 {noun}")
+    } else {
+        format!("{n} {noun}s")
+    }
 }
 
 /// Writes the keys along the bottom edge of an overlay.
@@ -1504,6 +1530,17 @@ pub fn draw_settings(buf: &mut Buffer, area: Rect, app: &App, p: &Paint) -> Draw
         ),
     ));
     facts.push(("spill to".into(), r.temp_dir.display().to_string()));
+    // The copies of files from a network drive take space on this disk, so
+    // the page says how much, and where. The command "clear the local copies"
+    // gives it back. The page reads the directory one time when it opens,
+    // because a walk of the directory at each frame would read the disk ten
+    // times each second.
+    if let (Some(dir), Some((n, bytes))) = (peruse_core::cache::copies_dir(), app.copies_usage) {
+        facts.push((
+            "local copies".into(),
+            format!("{n}  ·  {}  ·  {}", human_bytes(bytes), dir.display()),
+        ));
+    }
     facts.push((
         "file".into(),
         match peruse_core::config::Config::path() {
@@ -1708,6 +1745,14 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn a_count_of_one_takes_the_singular_form() {
+        assert_eq!(plural(1, "line"), "1 line");
+        assert_eq!(plural(2, "line"), "2 lines");
+        assert_eq!(plural(0, "char"), "0 chars");
+        assert_eq!(plural(600, "char"), "600 chars");
     }
 
     #[test]

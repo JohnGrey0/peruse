@@ -9,6 +9,7 @@ mod browser;
 mod clip;
 mod colors;
 mod commands;
+mod copying;
 mod grid;
 mod input;
 mod overlays;
@@ -27,7 +28,10 @@ use clap::{CommandFactory, Parser};
 use crossbeam_channel::{select, unbounded};
 use peruse_core::query::Base;
 use peruse_core::{sql_guard, OpenOptions, View, Worker};
-use ratatui::crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event};
+use ratatui::crossterm::event::{
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event,
+};
 use ratatui::crossterm::execute;
 
 use crate::app::App;
@@ -124,6 +128,14 @@ struct Cli {
     /// Ignore the mouse, so the terminal selects text with it as usual
     #[arg(long)]
     no_mouse: bool,
+
+    /// Copy the file to the local disk first, from any drive and of any size
+    #[arg(long, conflicts_with = "no_local")]
+    local: bool,
+
+    /// Read the file in place, also from a network drive
+    #[arg(long)]
+    no_local: bool,
 }
 
 /// Reads the argument of the option `--delimiter`.
@@ -146,7 +158,26 @@ fn parse_delimiter(s: &str) -> Result<char> {
     Ok(c)
 }
 
-fn main() -> Result<()> {
+/// Runs the program, and writes an error in a form that is safe for the
+/// terminal.
+///
+/// The message of an error can hold the data of the file: the CSV reader of
+/// DuckDB quotes the line that it cannot read. A file can therefore put an
+/// escape sequence into the message, and the terminal would obey it. It could
+/// clear the screen, change the title of the window, or write to the clipboard.
+/// The usual `main` that gives a `Result` writes the message as it is, so this
+/// function writes it through [`text::for_terminal`].
+fn main() -> std::process::ExitCode {
+    match run_main() {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("Error: {}", text::for_terminal(&format!("{e:?}")));
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+fn run_main() -> Result<()> {
     let cli = Cli::parse();
 
     if cli.list_themes {
@@ -243,9 +274,34 @@ fn main() -> Result<()> {
         table: cli.table.clone(),
     };
 
+    // A large file on a network drive opens from a copy on the local disk.
+    // The options of the command line win over the setting, as for each
+    // other setting.
+    let policy = if cli.local {
+        Some(peruse_core::cache::Policy::Always)
+    } else if cli.no_local {
+        Some(peruse_core::cache::Policy::Never)
+    } else {
+        None
+    };
+    let copy_settings = peruse_core::cache::Settings::from_config(&config, policy);
+
     // The option --ddl writes to the standard output and stops. The terminal
     // never starts, so the result goes into a file or into another program.
+    //
+    // A copy from an earlier session makes the measurement fast. The option
+    // makes no new copy: the measurement reads the whole file one time, and a
+    // copy would read it one time more.
     if let Some(name) = &cli.ddl {
+        let probe = peruse_core::remote::System;
+        if let peruse_core::cache::Plan::Ready(copy) =
+            peruse_core::cache::plan(&file, &copy_settings, &probe)
+        {
+            let rw = copy.rewrite();
+            let (table, query, filter) = (cli.table.clone(), cli.query.clone(), cli.filter.clone());
+            return print_ddl(&copy.input, &opts, name, table, query, filter)
+                .map_err(|e| rw.apply_error(&e));
+        }
         return print_ddl(&file, &opts, name, cli.table.clone(), cli.query.clone(), cli.filter.clone());
     }
 
@@ -260,17 +316,52 @@ fn main() -> Result<()> {
         );
     }
 
+    // A large file on a network drive gets a copy on the local disk first,
+    // with a screen that shows the progress. The copy stays for the next
+    // session, and it holds a lease until this session ends. Refer to
+    // `peruse_core::cache`.
+    let mut note = None;
+    let local = match copying::prepare(&file, &copy_settings, &theme)? {
+        copying::Outcome::Local(c) => Some(c),
+        copying::Outcome::InPlace(why) => {
+            note = why;
+            None
+        }
+        copying::Outcome::Quit => return Ok(()),
+    };
+    let read = local.as_ref().map_or(file.as_str(), |c| c.input.as_str());
+
     // A database holds many tables, and the grid shows one of them. The user
     // chooses it here, in front of the grid, in the same way as the chooser
     // chooses a file.
-    match pick_table(&file, cli.query.is_some(), &opts, &theme)? {
+    // The picker reads the tables of the copy. A message about it names the
+    // source, as each other message does.
+    let picked = pick_table(read, cli.query.is_some(), &opts, &theme)
+        .map_err(|e| match &local {
+            Some(c) => c.rewrite().apply_error(&e),
+            None => e,
+        });
+    match picked? {
         Picked::Table(name) => opts.table = Some(name),
         Picked::NoChoice => {}
         // The user left the picker without a table.
         Picked::Left => return Ok(()),
     }
 
-    let (worker, opened) = Worker::spawn(&file, opts)?;
+    let (worker, opened) = match &local {
+        // A copy that does not open goes back to the source. The source then
+        // gives its own message, or it opens.
+        Some(c) => match Worker::spawn_local(c, opts.clone()) {
+            Ok(w) => w,
+            Err(e) => {
+                note = Some(format!(
+                    "the local copy did not open ({e:#}). Peruse reads the file in place"
+                ));
+                Worker::spawn(&file, opts)?
+            }
+        },
+        None => Worker::spawn(&file, opts)?,
+    };
 
     // Remember the file, so that the chooser can offer it at the next start.
     // The list holds the full path: a name by itself does not say which file
@@ -279,12 +370,11 @@ fn main() -> Result<()> {
     if !peruse_core::source::looks_like_glob(&file)
         && let Ok(full) = std::fs::canonicalize(&file)
     {
-        config.remember_file(&peruse_core::source::tidy_path(&full));
-        if let Some(p) = Config::path() {
-            // A list that Peruse cannot write is not a reason to stop. The
-            // user came here to look at a file.
-            let _ = config.save_to(&p);
-        }
+        remember_recent(
+            &mut config,
+            &peruse_core::source::tidy_path(&full),
+            Config::path().as_deref(),
+        );
     }
 
     let auto_index = !(cli.no_index || config.no_index.unwrap_or(false));
@@ -292,12 +382,28 @@ fn main() -> Result<()> {
     // the mouse in the usual way. A user who copies out of the grid with the
     // mouse each day can therefore turn the mouse off.
     let mouse = !cli.no_mouse && config.mouse.unwrap_or(true);
-    let mut application = App::new(worker, opened, theme, auto_index);
+    // The view of the command line goes in before the first request. Refer to
+    // `App::idle`.
+    let mut application = App::idle(worker, opened, theme);
     application.config = config;
     // The user asked for these panels in an earlier session. Put them on the
     // screen, and ask for what they need.
     if let Some(name) = application.config.panels.clone() {
         application.set_panel_from_setting(&name);
+    }
+    if application.source.local_copy.is_some()
+        && let Some(c) = &local
+    {
+        application.info(match c.copied {
+            Some(t) => format!(
+                "reading a local copy: {} copied in {}",
+                peruse_core::source::human_bytes(c.bytes),
+                copying::human_time(t.as_secs_f64())
+            ),
+            None => "reading the local copy from an earlier session".to_string(),
+        });
+    } else if let Some(n) = note {
+        application.info(n);
     }
     if let Some(e) = config_error {
         application.error(format!("settings: {e}"));
@@ -309,11 +415,29 @@ fn main() -> Result<()> {
     if let Some(f) = cli.filter {
         application.set_raw_filter(&f);
     }
-    if application.view != View::default() {
-        application.run_startup_view();
-    }
+    application.start(auto_index);
 
     run(&mut application, mouse)
+}
+
+/// Puts a file at the top of the list of recent files, and keeps the list in
+/// the settings file when that file has no fault.
+///
+/// A settings file that Peruse cannot read gives the built-in settings. A write
+/// of those settings replaces the whole file, so one typing mistake in it would
+/// cost the user each setting and each note, at the next file that the user
+/// opens. The file therefore stays as it is, as for each other write. Refer to
+/// `app::write_blocked`.
+///
+/// A list that Peruse cannot write is not a reason to stop. The user came here
+/// to look at a file.
+fn remember_recent(config: &mut Config, file: &str, path: Option<&std::path::Path>) {
+    config.remember_file(file);
+    // The function reads the file again and changes the list only, so a
+    // setting that another window of Peruse wrote since the start stays.
+    if let Some(p) = path {
+        let _ = Config::remember_file_at(p, file);
+    }
 }
 
 /// What the table picker gave back.
@@ -417,7 +541,16 @@ fn print_ddl(
     let profile = engine
         .profile(&view, &name)
         .with_context(|| format!("measuring {file}"))?;
-    print!("{}", peruse_core::ddl::render(&profile, d));
+    let text = peruse_core::ddl::render(&profile, d);
+    // A name of a column can hold an escape sequence. The statement keeps it
+    // when it goes into a file or a pipe, because the name is part of the
+    // data. A terminal would obey the sequence, so the terminal gets a visible
+    // form of it.
+    if std::io::IsTerminal::is_terminal(&std::io::stdout()) {
+        print!("{}", text::for_terminal(&text));
+    } else {
+        print!("{text}");
+    }
     Ok(())
 }
 
@@ -472,11 +605,33 @@ fn enable_mouse() -> bool {
     true
 }
 
+/// Asks the terminal to send a paste as one event, and makes sure that a panic
+/// turns that mode off again.
+///
+/// The hook of `ratatui::init` knows nothing about this mode. A shell after a
+/// panic would otherwise get marks around each paste, as text.
+fn enable_paste() -> bool {
+    if execute!(std::io::stdout(), EnableBracketedPaste).is_err() {
+        return false;
+    }
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = execute!(std::io::stdout(), DisableBracketedPaste);
+        previous(info);
+    }));
+    true
+}
+
 /// Draws the frames and reads the events until the user quits.
 fn run(application: &mut App, mouse: bool) -> Result<()> {
     let depth = Depth::detect();
     let mut terminal = ratatui::init();
     let mouse = mouse && enable_mouse();
+    // The terminal then sends a paste as one event. Without it, a statement in
+    // more than one line arrives as keys, and its first line break runs the
+    // prompt. Refer to `App::on_paste`. A terminal that does not know the
+    // request ignores it, and the paste then arrives as keys, as before.
+    let paste = enable_paste();
 
     // A read from the terminal blocks. The reads therefore run on their own
     // thread, and each event arrives as a message. The engine responses
@@ -526,7 +681,11 @@ fn run(application: &mut App, mouse: bool) -> Result<()> {
                 }
             }
             recv(resp_rx) -> resp => {
-                let Ok(resp) = resp else { break Ok(()) };
+                // The engine thread stopped while the program runs. That is
+                // a fault, and the exit code must say so.
+                let Ok(resp) = resp else {
+                    break Err(anyhow::anyhow!("the engine stopped unexpectedly"));
+                };
                 dirty |= application.on_response(resp);
                 while let Ok(resp) = resp_rx.try_recv() {
                     dirty |= application.on_response(resp);
@@ -535,6 +694,9 @@ fn run(application: &mut App, mouse: bool) -> Result<()> {
         }
     };
 
+    if paste {
+        let _ = execute!(std::io::stdout(), DisableBracketedPaste);
+    }
     if mouse {
         let _ = execute!(std::io::stdout(), DisableMouseCapture);
     }
@@ -555,6 +717,7 @@ fn handle_event(application: &mut App, ev: Event) -> bool {
             true
         }
         Event::Mouse(m) => application.on_mouse(&m),
+        Event::Paste(text) => application.on_paste(&text),
         Event::Resize(_, _) => true,
         _ => false,
     }
@@ -563,6 +726,33 @@ fn handle_event(application: &mut App, ev: Event) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_settings_file_with_a_fault_is_not_written_over_by_the_list_of_recent_files() {
+        let dir = std::env::temp_dir().join("peruse-recent-blocked");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+
+        // One typing mistake. The load gives the built-in settings.
+        let bad = "theme = \"nord\"\nstep = 25\nthheme = \"x\"\n";
+        std::fs::write(&path, bad).unwrap();
+        let (mut config, why) = Config::load_from(&path);
+        assert!(why.is_some(), "the file must have a fault for this test");
+        remember_recent(&mut config, "/data/a.csv", Some(&path));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), bad, "the file was written over");
+        assert_eq!(config.recent.first().map(String::as_str), Some("/data/a.csv"));
+
+        // A file with no fault gets the list, and keeps its settings.
+        std::fs::write(&path, "theme = \"nord\"\nstep = 25\n").unwrap();
+        let (mut config, why) = Config::load_from(&path);
+        assert!(why.is_none());
+        remember_recent(&mut config, "/data/a.csv", Some(&path));
+        let (back, _) = Config::load_from(&path);
+        assert_eq!(back.recent, vec!["/data/a.csv".to_string()]);
+        assert_eq!(back.step, Some(25));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn the_ddl_name_comes_from_the_table_of_a_database() {

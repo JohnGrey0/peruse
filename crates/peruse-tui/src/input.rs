@@ -20,6 +20,20 @@ pub fn plain(key: &KeyEvent) -> bool {
         .intersects(KeyModifiers::CONTROL.union(KeyModifiers::ALT))
 }
 
+/// Gives `true` when a character key comes from the key `AltGr`.
+///
+/// A European keyboard gives many characters with `AltGr`: `@`, `[`, `{`, `|`
+/// and `\` on a German keyboard, `#` on a French keyboard, and the letters
+/// with a tail or a stroke on a Polish keyboard. Windows reports that key as
+/// Ctrl and Alt together. Such a key is a character to type, and not a chord:
+/// without this test, the prompt would refuse each of those characters.
+pub fn is_altgr(key: &KeyEvent) -> bool {
+    matches!(key.code, KeyCode::Char(_))
+        && key
+            .modifiers
+            .contains(KeyModifiers::CONTROL.union(KeyModifiers::ALT))
+}
+
 /// What the editor did with a key.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Action {
@@ -120,6 +134,29 @@ impl LineInput {
         self.chars.splice(start..self.cursor, text.chars());
         self.cursor = start + text.chars().count();
         self.hist_pos = None;
+    }
+
+    /// Puts a pasted text in the line at the cursor, and gives `Changed` when
+    /// the line changed.
+    ///
+    /// The line holds one line only. A statement that the user copies from an
+    /// editor holds line breaks and tabs, so each control character becomes
+    /// one space. A Windows line break is two characters, and it gives one
+    /// space.
+    pub fn insert_str(&mut self, text: &str) -> Action {
+        let clean = text.replace("\r\n", "\n");
+        let added: Vec<char> = clean
+            .chars()
+            .map(|c| if c.is_control() { ' ' } else { c })
+            .collect();
+        if added.is_empty() {
+            return Action::Ignored;
+        }
+        let n = added.len();
+        self.chars.splice(self.cursor..self.cursor, added);
+        self.cursor += n;
+        self.hist_pos = None;
+        Action::Changed
     }
 
     /// Gives the position of the start of the name in front of the cursor.
@@ -241,8 +278,10 @@ impl LineInput {
 
     /// Applies one key to the line and gives the result.
     pub fn handle(&mut self, key: &KeyEvent) -> Action {
-        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        // A character from AltGr is a character to type. Refer to `is_altgr`.
+        let altgr = is_altgr(key);
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL) && !altgr;
+        let alt = key.modifiers.contains(KeyModifiers::ALT) && !altgr;
         match key.code {
             KeyCode::Enter => Action::Submit,
             KeyCode::Esc => Action::Cancel,
@@ -366,6 +405,38 @@ mod tests {
             i.handle(&key(KeyCode::Char(c)));
         }
         i
+    }
+
+    #[test]
+    fn a_character_from_the_altgr_key_goes_into_the_line() {
+        // Windows reports AltGr as Ctrl and Alt together. A German keyboard
+        // gives `@`, `[` and `|` with it, and a Polish keyboard gives the
+        // letter l with a stroke.
+        let altgr = KeyModifiers::CONTROL | KeyModifiers::ALT;
+        let mut i = typed("a ");
+        for c in ['|', '|', '[', '@', 'ł', '€'] {
+            assert_eq!(
+                i.handle(&KeyEvent::new(KeyCode::Char(c), altgr)),
+                Action::Changed,
+                "{c}"
+            );
+        }
+        assert_eq!(i.text(), "a ||[@ł€");
+        // Ctrl alone and Alt alone still give the keys of the editor.
+        i.handle(&ctrl('w'));
+        assert_eq!(i.text(), "a ");
+    }
+
+    #[test]
+    fn a_pasted_text_goes_in_at_the_cursor_as_one_line() {
+        let mut i = typed("SELECT  FROM src");
+        for _ in 0..9 {
+            i.handle(&key(KeyCode::Left));
+        }
+        assert_eq!(i.insert_str("a,\r\n\tb"), Action::Changed);
+        assert_eq!(i.text(), "SELECT a,  b FROM src");
+        assert_eq!(i.cursor_col(), 12, "the cursor is after the pasted text");
+        assert_eq!(i.insert_str(""), Action::Ignored);
     }
 
     #[test]

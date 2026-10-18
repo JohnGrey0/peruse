@@ -163,6 +163,19 @@ pub struct View {
 /// The name that each generated statement gives to its one relation.
 const ALIAS: &str = "q";
 
+/// The view that a sorted statement over the file reads.
+///
+/// The view holds each column of `src` and one more, [`ORDER_COLUMN`]. The
+/// engine makes it. Refer to [`View::order_by`] for the reason.
+pub const ORDER_VIEW: &str = "src_ord";
+
+/// The column of [`ORDER_VIEW`] that gives the position of each row in the file.
+///
+/// The value is different for each row, so a sort that ends with it puts each
+/// row in one position. The page statement names each column that it shows, so
+/// the grid never shows this one.
+pub const ORDER_COLUMN: &str = "__peruse_row_order";
+
 impl View {
     /// Gives `true` when the view reads the file, and not a statement from the
     /// user.
@@ -179,10 +192,39 @@ impl View {
     }
 
     /// Gives the one relation that each generated statement reads from.
+    ///
+    /// The statement from the user goes inside parentheses, and the name `q`
+    /// comes after them on a new line. The new line is not for looks: a
+    /// statement that ends with a line comment, such as `SELECT * FROM src --
+    /// note`, would otherwise put `) AS q` on the same line as the comment, and
+    /// the comment would hide the parenthesis. The guard accepts such a
+    /// statement, so the generated SQL must not break on it.
+    ///
+    /// The trailing semicolons and the trailing spaces come off first, so a
+    /// statement such as `SELECT 1;` does not leave a semicolon inside the
+    /// parentheses.
     fn relation(&self) -> String {
         match &self.base {
             Base::Source => format!("src AS {ALIAS}"),
-            Base::Sql(sql) => format!("({}) AS {ALIAS}", sql.trim().trim_end_matches(';')),
+            Base::Sql(sql) => {
+                let inner = sql
+                    .trim()
+                    .trim_end_matches(|c: char| c == ';' || c.is_whitespace());
+                format!("({inner}\n) AS {ALIAS}")
+            }
+        }
+    }
+
+    /// Gives the relation of a statement that holds the `ORDER BY` part.
+    ///
+    /// A sorted view over the file reads [`ORDER_VIEW`], because its sort ends
+    /// with [`ORDER_COLUMN`]. Each other statement reads `src`, so a count or a
+    /// statistic does not pay for a column that it does not need.
+    fn sorted_relation(&self) -> String {
+        if self.is_source() && !self.sort.is_empty() {
+            format!("{ORDER_VIEW} AS {ALIAS}")
+        } else {
+            self.relation()
         }
     }
 
@@ -206,6 +248,28 @@ impl View {
 
     /// Gives `ORDER BY ...` with no space in front, or an empty text when the
     /// view has no sort.
+    ///
+    /// The sort of DuckDB is not stable, and it uses each thread. Two rows with
+    /// the same sort value can therefore come in a different order in each
+    /// statement. Each page is one statement, so a sort on a column with
+    /// repeated values showed some rows on two pages and other rows on none,
+    /// and the same page changed when the user scrolled back to it.
+    ///
+    /// A view over the file therefore ends its sort with [`ORDER_COLUMN`], the
+    /// position of the row in the file. Each row has its own position, so each
+    /// row has one place in the sort, and rows with the same sort value keep the
+    /// order of the file. A Parquet file and a table give that position from
+    /// their metadata, so it costs almost nothing: a sorted window of 550 rows
+    /// over 10 million rows of Parquet costs 77 ms with it, and 667 ms with
+    /// `COLUMNS(*)`.
+    ///
+    /// A statement of the user has no position of a row. Its sort ends with
+    /// `COLUMNS(*)`, which sorts such rows by each of their values. Two rows
+    /// that it cannot put in order hold the same values, so the user cannot see
+    /// which of the two comes first. A file of text with no index has no
+    /// position either, and the engine gives it to this function as the
+    /// statement `SELECT * FROM src`. There the scan of the text costs the most,
+    /// and `COLUMNS(*)` adds almost nothing.
     fn order_by(&self) -> String {
         if self.sort.is_empty() {
             return String::new();
@@ -215,7 +279,11 @@ impl View {
             .iter()
             .map(|k| format!("{} {}", quote_ident(&k.column), k.dir.sql()))
             .collect();
-        format!("ORDER BY {}", keys.join(", "))
+        if self.is_source() {
+            format!("ORDER BY {}, {}", keys.join(", "), quote_ident(ORDER_COLUMN))
+        } else {
+            format!("ORDER BY {}, COLUMNS(*)", keys.join(", "))
+        }
     }
 
     /// Gives the same text as [`View::order_by`], with a space in front.
@@ -232,7 +300,7 @@ impl View {
     pub fn select(&self, projection: &str) -> String {
         format!(
             "SELECT {projection} FROM {}{}{}",
-            self.relation(),
+            self.sorted_relation(),
             self.where_clause(),
             self.order_clause()
         )
@@ -292,7 +360,11 @@ impl View {
                 let id = quote_ident(&c.name);
                 let value = match c.kind {
                     CellKind::Binary => format!("('blob ' || octet_length({id}) || ' B')"),
-                    CellKind::Text => format!("substr({id}, 1, {MAX_CELL_CHARS})"),
+                    // The cast is free for a VARCHAR column, and it is
+                    // necessary for a column such as UUID that the family reads
+                    // as text but that substr() does not take. Refer to
+                    // [`View::search_sql`].
+                    CellKind::Text => format!("substr(CAST({id} AS VARCHAR), 1, {MAX_CELL_CHARS})"),
                     _ => id,
                 };
                 format!("{}: {value}", quote_str(&c.name))
@@ -329,7 +401,7 @@ impl View {
         format!(
             "SELECT CAST({} AS VARCHAR) FROM {}{}{} LIMIT 1 OFFSET {offset}",
             quote_ident(column),
-            self.relation(),
+            self.sorted_relation(),
             self.where_clause(),
             self.order_clause()
         )
@@ -363,8 +435,19 @@ impl View {
             CellKind::Number => {
                 parts.push(format!("CAST(min({c}) AS VARCHAR) AS v_min"));
                 parts.push(format!("CAST(max({c}) AS VARCHAR) AS v_max"));
-                parts.push(format!("CAST(avg({c}) AS VARCHAR) AS v_avg"));
-                parts.push(format!("CAST(stddev_samp({c}) AS VARCHAR) AS v_std"));
+                // The mean is a DOUBLE for each type of number. The sum behind
+                // it is not: over a HUGEINT it is a HUGEINT, and three large
+                // values made the whole statement fail with an overflow.
+                parts.push(format!("CAST(avg({c}::DOUBLE) AS VARCHAR) AS v_avg"));
+                // One NaN or one infinite value makes `stddev_samp` fail with
+                // "out of range", and the panel then showed no statistics at
+                // all for the column. A writer such as pandas stores a missing
+                // value of a floating-point column as NaN, so the deviation
+                // leaves those values out. The mean keeps them, so the panel
+                // still shows that such values exist.
+                parts.push(format!(
+                    "CAST(stddev_samp({c}::DOUBLE) FILTER (WHERE isfinite({c}::DOUBLE)) AS VARCHAR) AS v_std"
+                ));
                 parts.push(format!("min({c})::DOUBLE AS lo"));
                 parts.push(format!("max({c})::DOUBLE AS hi"));
             }
@@ -488,10 +571,14 @@ impl View {
         let width = (hi - lo) / bins as f64;
         let wh = self.where_clause();
         let conj = if wh.is_empty() { " WHERE" } else { " AND" };
+        // The group and the order are by position, and not by the alias `b`.
+        // A column of the file can be named `b` or `n`, the same as the two
+        // aliases here, and DuckDB then refuses `GROUP BY b` because the name
+        // is ambiguous. The position cannot clash with a column name.
         format!(
             "SELECT least({bins} - 1, floor(({c}::DOUBLE - {lo:?}) / {width:?}))::BIGINT AS b, \
              count(*)::BIGINT AS n FROM {}{wh}{conj} {c} IS NOT NULL AND isfinite({c}::DOUBLE) \
-             GROUP BY b ORDER BY b",
+             GROUP BY 1 ORDER BY 1",
             self.relation()
         )
     }
@@ -536,15 +623,20 @@ impl View {
         let any: Vec<String> = schema
             .columns
             .iter()
+            .filter(|c| text_can_hold(c, needle))
             .map(|c| {
                 let id = quote_ident(&c.name);
                 match c.kind {
-                    // The column is text already. A cast would copy each
-                    // value and give no gain.
-                    CellKind::Text => format!("contains(lower({id}), {low})"),
                     // The grid shows the size of a BLOB value, and not its
                     // bytes. A match on those bytes would confuse the user.
                     CellKind::Binary => String::new(),
+                    // Each other column goes through CAST(... AS VARCHAR). For
+                    // a VARCHAR column the cast is free: DuckDB removes a cast
+                    // to the same type, so the plan is the same as a bare
+                    // column. For a column such as UUID, which the family reads
+                    // as text but which is not a VARCHAR, the cast is
+                    // necessary: lower() and contains() take text only, and a
+                    // UUID with no cast gives a binder error.
                     _ => format!("contains(lower(CAST({id} AS VARCHAR)), {low})"),
                 }
             })
@@ -560,6 +652,40 @@ impl View {
             self.select("*"),
             any.join(" OR ")
         )
+    }
+}
+
+/// Gives `false` when the text of no value of `column` can hold `needle`.
+///
+/// The search compares the needle with the text that DuckDB writes for each
+/// value. The text of a number, of a truth value and of a date or a time uses
+/// few characters, so a search for a name or a word can skip such a column.
+/// The cast of each value to text is the cost of a search, and on a file of
+/// 1000 columns a search for a word that the file does not hold cost 1.7 s.
+///
+/// Only a character of ASCII in the needle can cause a skip. DuckDB and Rust
+/// put such a character in lower case in the same way, and the text of these
+/// values holds ASCII only. Each set of characters below holds the characters
+/// that DuckDB writes, and some letters more as a margin.
+pub(crate) fn text_can_hold(column: &Column, needle: &str) -> bool {
+    let only = |chars: &str| {
+        needle
+            .chars()
+            .all(|c| !c.is_ascii() || chars.contains(c.to_ascii_lowercase()))
+    };
+    match column.kind {
+        // For example `-12.5`, `1e+20`, `inf` and `nan`.
+        CellKind::Number => only("0123456789+-.aefinty"),
+        CellKind::Bool => {
+            let n = needle.to_ascii_lowercase();
+            "true".contains(&n) || "false".contains(&n)
+        }
+        // For example `2024-01-01 12:00:00.5+00`, `0044-03-15 (BC)` and
+        // `infinity`. The text of an interval holds words, such as `days`.
+        CellKind::Temporal if !column.sql_type.trim().to_ascii_uppercase().starts_with("INTERVAL") => {
+            only("0123456789 ()+-.:abcdfinty")
+        }
+        _ => true,
     }
 }
 
@@ -604,6 +730,79 @@ mod tests {
                 Column::new("name", "VARCHAR", true),
                 Column::new("payload", "BLOB", true),
             ],
+        }
+    }
+
+    #[test]
+    fn a_search_for_a_word_skips_the_columns_whose_text_cannot_hold_it() {
+        let s = Schema {
+            columns: vec![
+                Column::new("id", "BIGINT", true),
+                Column::new("name", "VARCHAR", true),
+                Column::new("flag", "BOOLEAN", true),
+                Column::new("at", "TIMESTAMP", true),
+                Column::new("span", "INTERVAL", true),
+            ],
+        };
+        let searched = |needle: &str| -> Vec<&str> {
+            let sql = View::default().search_sql(&s, needle, 0, 100, 10);
+            ["id", "name", "flag", "at", "span"]
+                .into_iter()
+                .filter(|c| sql.contains(&format!("\"{c}\"")))
+                .collect()
+        };
+        assert_eq!(searched("Carol"), ["name", "span"]);
+        assert_eq!(searched("12"), ["id", "name", "at", "span"]);
+        assert_eq!(searched("TRU"), ["name", "flag", "span"]);
+        assert_eq!(searched("inf"), ["id", "name", "at", "span"]);
+        assert_eq!(searched("(bc)"), ["name", "at", "span"]);
+        // A character that is not ASCII does not cause a skip.
+        assert_eq!(searched("\u{212a}"), ["id", "name", "at", "span"]);
+        assert_eq!(searched(""), ["id", "name", "flag", "at", "span"]);
+    }
+
+    #[test]
+    fn the_text_of_each_value_that_a_search_can_skip_uses_the_known_characters() {
+        // A search skips a column when the needle holds a character that the
+        // text of no value of the column holds. Each character of the text of
+        // these values must therefore keep the column in the search. A change
+        // in a later version of DuckDB shows here.
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        let values = [
+            ("DOUBLE", "1.5e308, -2.2e-308, 'nan', 'inf', '-inf', -0.0, 5e-324, 0.1, 1e20, 1e-7"),
+            ("FLOAT", "3.4e38, 'nan', '-inf', 1e-40, -1.25"),
+            ("HUGEINT", "-170141183460469231731687303715884105727, 170141183460469231731687303715884105727"),
+            ("UHUGEINT", "340282366920938463463374607431768211455"),
+            ("DECIMAL(38,2)", "-12345678901234567.89, 0.01"),
+            ("DECIMAL(4,0)", "-1, 9999"),
+            ("TINYINT", "-128, 127"),
+            ("UBIGINT", "18446744073709551615"),
+            ("BOOLEAN", "true, false"),
+            ("DATE", "'infinity', '-infinity', '0044-03-15 (BC)', '294247-01-10', '2024-02-29'"),
+            ("TIMESTAMP", "'infinity', '-infinity', '2024-01-01 12:34:56.789012', '0044-03-15 (BC) 10:00:00'"),
+            ("TIMESTAMP_NS", "'2024-01-01 12:34:56.123456789'"),
+            ("TIMESTAMP_MS", "'2024-01-01 12:34:56.1'"),
+            ("TIMESTAMP_S", "'2024-01-01 12:34:56'"),
+            ("TIMESTAMPTZ", "'2024-01-01 12:34:56+05:30', 'infinity', '-infinity'"),
+            ("TIME", "'12:34:56.123456', '24:00:00'"),
+            ("TIMETZ", "'12:34:56+05:30', '01:02:03-05:45'"),
+        ];
+        for (ty, list) in values {
+            let column = Column::new("v", ty, true);
+            let sql = format!(
+                "SELECT DISTINCT unnest(string_split(lower(CAST(v AS VARCHAR)), '')) \
+                 FROM (SELECT unnest([{list}]::{ty}[]) AS v)"
+            );
+            let mut stmt = conn.prepare(&sql).unwrap();
+            let chars: Vec<String> = stmt
+                .query_map([], |r| r.get::<_, String>(0))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect();
+            assert!(!chars.is_empty(), "{ty}");
+            for c in chars {
+                assert!(text_can_hold(&column, &c), "{ty} writes {c:?}");
+            }
         }
     }
 
@@ -657,9 +856,27 @@ mod tests {
         };
         assert_eq!(
             v.select("*"),
-            "SELECT * FROM src AS q WHERE (amount > 100) ORDER BY \"amount\" DESC, \"id\" ASC"
+            "SELECT * FROM src_ord AS q WHERE (amount > 100) ORDER BY \"amount\" DESC, \"id\" ASC, \"__peruse_row_order\""
         );
         assert!(!v.is_unfiltered_source());
+        // A count and a statistic do not sort, so they read `src`.
+        assert_eq!(v.count_sql(), "SELECT count(*) FROM src AS q WHERE (amount > 100)");
+    }
+
+    #[test]
+    fn a_sorted_statement_of_the_user_sorts_its_ties_by_each_value() {
+        // A statement of the user has no position of a row, so the sort ends
+        // with each of its columns.
+        let v = View {
+            base: Base::Sql("SELECT 1 AS x".into()),
+            sort: vec![SortKey { column: "x".into(), dir: SortDir::Asc }],
+            ..Default::default()
+        };
+        assert_eq!(
+            v.select("*"),
+            "SELECT * FROM (SELECT 1 AS x
+) AS q ORDER BY \"x\" ASC, COLUMNS(*)"
+        );
     }
 
     #[test]
@@ -678,8 +895,31 @@ mod tests {
             base: Base::Sql("SELECT 1 AS x;".into()),
             ..Default::default()
         };
-        assert_eq!(v.select("*"), "SELECT * FROM (SELECT 1 AS x) AS q");
+        assert_eq!(v.select("*"), "SELECT * FROM (SELECT 1 AS x\n) AS q");
         assert!(!v.is_source());
+    }
+
+    #[test]
+    fn a_user_statement_that_ends_with_a_line_comment_still_wraps() {
+        // The guard accepts a statement that ends with a line comment, so the
+        // generated SQL must not break on it. The name `q` comes on a new
+        // line, below the comment, and not on the same line after it.
+        let v = View {
+            base: Base::Sql("SELECT * FROM src -- note".into()),
+            ..Default::default()
+        };
+        let sql = v.count_sql();
+        assert!(
+            sql.ends_with("-- note\n) AS q"),
+            "the comment would hide `) AS q`: {sql}"
+        );
+        // A statement that ends with a semicolon leaves no semicolon inside
+        // the parentheses, which would be a second, empty statement.
+        let semi = View {
+            base: Base::Sql("SELECT 1 AS x ;  ".into()),
+            ..Default::default()
+        };
+        assert_eq!(semi.select("*"), "SELECT * FROM (SELECT 1 AS x\n) AS q");
     }
 
     #[test]
@@ -724,7 +964,7 @@ mod tests {
     fn stats_do_not_average_strings() {
         let v = View::default();
         let numeric = v.stats_sql("id", CellKind::Number);
-        assert!(numeric.contains("avg(\"id\")"));
+        assert!(numeric.contains("avg(\"id\"::DOUBLE)"));
         let text = v.stats_sql("name", CellKind::Text);
         assert!(text.contains("NULL AS v_avg"), "no avg() over VARCHAR");
         assert!(text.contains("min(\"name\")"), "but min/max still apply");
@@ -871,7 +1111,10 @@ mod tests {
         // The database must fold the case of the needle and of the value with
         // the same rule. It therefore calls lower() on both.
         let sql = View::default().search_sql(&schema(), "Carol", 0, 1000, 10);
-        assert!(sql.contains("contains(lower(\"name\"), lower('Carol'))"), "got {sql}");
+        assert!(
+            sql.contains("contains(lower(CAST(\"name\" AS VARCHAR)), lower('Carol'))"),
+            "got {sql}"
+        );
     }
 
     #[test]
@@ -882,14 +1125,42 @@ mod tests {
     }
 
     #[test]
-    fn search_does_not_cast_text_or_probe_blobs() {
-        let sql = View::default().search_sql(&schema(), "x", 0, 100, 10);
-        assert!(sql.contains("contains(lower(\"name\")"), "VARCHAR should not be cast: {sql}");
+    fn search_casts_every_searched_column_and_skips_blobs() {
+        // Each searched column goes through CAST(... AS VARCHAR). The cast is
+        // free for a VARCHAR column and necessary for a type such as UUID that
+        // the family reads as text but that lower() does not take.
+        let sql = View::default().search_sql(&schema(), "1", 0, 100, 10);
+        assert!(
+            sql.contains("contains(lower(CAST(\"name\" AS VARCHAR))"),
+            "text column is cast: {sql}"
+        );
         assert!(
             sql.contains("contains(lower(CAST(\"id\" AS VARCHAR))"),
             "BIGINT needs a cast: {sql}"
         );
         assert!(!sql.contains("\"payload\""), "blobs are not searched: {sql}");
+    }
+
+    #[test]
+    fn search_and_record_view_work_over_a_column_that_is_not_varchar() {
+        // A UUID column reads as text, but it is not a VARCHAR. The string
+        // functions lower(), contains() and substr() take text only, so the
+        // builders must cast such a column. Without the cast DuckDB gives a
+        // binder error, and search and the record view fail for the whole
+        // table.
+        let s = Schema {
+            columns: vec![Column::new("ref", "UUID", true)],
+        };
+        let search = View::default().search_sql(&s, "0001", 0, 100, 10);
+        assert!(
+            search.contains("CAST(\"ref\" AS VARCHAR)"),
+            "a UUID must be cast for search: {search}"
+        );
+        let json = View::default().row_json_sql(&s, 0);
+        assert!(
+            json.contains("substr(CAST(\"ref\" AS VARCHAR)"),
+            "a UUID must be cast for the record view: {json}"
+        );
     }
 
     #[test]
@@ -900,9 +1171,21 @@ mod tests {
         };
         let sql = v.search_sql(&schema(), "x", 0, 100, 10);
         assert!(
-            sql.contains("ORDER BY \"id\" DESC LIMIT 100 OFFSET 0"),
+            sql.contains("ORDER BY \"id\" DESC, \"__peruse_row_order\" LIMIT 100 OFFSET 0"),
             "slice must be taken from the sorted view: {sql}"
         );
+    }
+
+    #[test]
+    fn the_histogram_groups_by_position_so_a_column_name_cannot_clash() {
+        // The aliases are `b` and `n`. A column of the file can carry either
+        // name, and a group by the alias would then be ambiguous and DuckDB
+        // would refuse the statement. A group by the position cannot clash.
+        for col in ["n", "b", "amount"] {
+            let sql = View::default().histogram_sql(col, 0.0, 10.0, 24);
+            assert!(sql.contains("GROUP BY 1 ORDER BY 1"), "got {sql}");
+            assert!(!sql.contains("GROUP BY b"), "a named group can clash: {sql}");
+        }
     }
 
     #[test]

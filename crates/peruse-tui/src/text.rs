@@ -37,6 +37,31 @@ pub fn sanitize(s: &str) -> String {
         .collect()
 }
 
+/// Makes a text safe to write to the terminal outside the frame, as a message
+/// on the standard error.
+///
+/// The function keeps a line end and a tab, because a message uses them. A
+/// message of Windows ends its lines with `\r\n`, and that pair becomes one
+/// line end. The function writes each other control character as an escape,
+/// such as `\u{1b}`. The terminal then shows the character, and it does not
+/// obey it.
+pub fn for_terminal(s: &str) -> String {
+    let unsafe_char = |c: char| c.is_control() && c != '\n' && c != '\t';
+    if !s.chars().any(unsafe_char) {
+        return s.to_string();
+    }
+    let s = s.replace("\r\n", "\n");
+    let mut out = String::with_capacity(s.len() + 16);
+    for c in s.chars() {
+        if unsafe_char(c) {
+            out.push_str(&format!("\\u{{{:x}}}", c as u32));
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 /// Cuts a text to `max` screen columns. The character `...` shows the cut.
 pub fn truncate(s: &str, max: usize) -> String {
     if max == 0 {
@@ -75,6 +100,33 @@ pub fn width_capped(s: &str, cap: usize) -> usize {
         }
     }
     used
+}
+
+/// Gives the first screen column of the line that a prompt shows.
+///
+/// A line that is longer than the prompt scrolls, so the cursor and the text
+/// in front of it stay on the screen. The cursor is then on the last column of
+/// the prompt at the most. Without this rule, the user types with no sight of
+/// the line as soon as it is longer than the screen.
+pub fn scroll_start(cursor_col: usize, width: usize) -> usize {
+    cursor_col.saturating_sub(width.saturating_sub(1))
+}
+
+/// Removes the first `n` screen columns of a text.
+///
+/// The function gives the rest of the text, and the number of blank screen
+/// columns that go in front of it. A character of two screen columns can sit
+/// across the cut. The function then removes that character, and gives one
+/// blank column for the half of it that was after the cut.
+pub fn drop_cols(s: &str, n: usize) -> (&str, usize) {
+    let mut used = 0usize;
+    for (i, c) in s.char_indices() {
+        if used >= n {
+            return (&s[i..], used - n);
+        }
+        used += c.width().unwrap_or(0);
+    }
+    ("", 0)
 }
 
 /// Cuts a text and then adds spaces, until the text has the width `w`.
@@ -154,11 +206,21 @@ pub fn wrap(s: &str, w: usize) -> Vec<String> {
         }
         let mut cur = String::new();
         let mut cur_w = 0;
+        // Ends the line that is in `cur`. A line that holds spaces only goes
+        // away: it is the space after a word that filled the line before it,
+        // and as a line of its own it reads as a blank line in the value.
+        let flush = |out: &mut Vec<String>, cur: &mut String, cur_w: &mut usize| {
+            if cur.trim().is_empty() {
+                cur.clear();
+            } else {
+                out.push(std::mem::take(cur));
+            }
+            *cur_w = 0;
+        };
         for word in line.split_inclusive(' ') {
             let ww = width(word);
             if cur_w + ww > w && !cur.is_empty() {
-                out.push(std::mem::take(&mut cur));
-                cur_w = 0;
+                flush(&mut out, &mut cur, &mut cur_w);
             }
             // A word that is longer than one line must break in the
             // middle of the word.
@@ -166,8 +228,7 @@ pub fn wrap(s: &str, w: usize) -> Vec<String> {
                 for c in word.chars() {
                     let cw = c.width().unwrap_or(0);
                     if cur_w + cw > w {
-                        out.push(std::mem::take(&mut cur));
-                        cur_w = 0;
+                        flush(&mut out, &mut cur, &mut cur_w);
                     }
                     cur.push(c);
                     cur_w += cw;
@@ -198,6 +259,25 @@ mod tests {
         assert_eq!(sanitize("a\tb"), "a␉b");
         assert_eq!(sanitize("plain"), "plain");
         assert_eq!(width(&sanitize("a\nb")), 3, "stays one column per char");
+    }
+
+    #[test]
+    fn a_message_for_the_terminal_shows_an_escape_and_does_not_send_it() {
+        // A CSV file can put these into an error message of DuckDB.
+        let msg = "Original Line: 2,\x1b[2J\x1b]0;PWNED\x07\u{9b}31m\r\rnext\tline";
+        let safe = for_terminal(msg);
+        assert!(
+            !safe.chars().any(|c| c.is_control() && c != '\n' && c != '\t'),
+            "{safe:?}"
+        );
+        assert_eq!(
+            safe,
+            "Original Line: 2,\\u{1b}[2J\\u{1b}]0;PWNED\\u{7}\\u{9b}31m\\u{d}\\u{d}next\tline"
+        );
+        assert_eq!(for_terminal("plain\ntext"), "plain\ntext");
+        // A message of Windows ends its lines with a carriage return and a
+        // line feed. That pair is a line end, and not a character to show.
+        assert_eq!(for_terminal("in use.\r\nnext \x1b"), "in use.\nnext \\u{1b}");
     }
 
     #[test]
@@ -288,10 +368,46 @@ mod tests {
     }
 
     #[test]
+    fn a_line_scrolls_so_that_the_cursor_is_on_the_screen() {
+        // A cursor inside the width needs no scroll.
+        assert_eq!(scroll_start(0, 10), 0);
+        assert_eq!(scroll_start(9, 10), 0);
+        // The cursor on the column after the last one moves the line by one.
+        assert_eq!(scroll_start(10, 10), 1);
+        assert_eq!(scroll_start(25, 10), 16);
+        // A prompt with no room puts the cursor on its first column.
+        assert_eq!(scroll_start(7, 0), 7);
+        assert_eq!(scroll_start(7, 1), 7);
+    }
+
+    #[test]
+    fn dropping_columns_keeps_the_rest_and_says_how_many_blanks_go_first() {
+        assert_eq!(drop_cols("hello", 0), ("hello", 0));
+        assert_eq!(drop_cols("hello", 2), ("llo", 0));
+        assert_eq!(drop_cols("hello", 5), ("", 0));
+        assert_eq!(drop_cols("hello", 9), ("", 0));
+        // A character of two columns across the cut goes away, and one blank
+        // column stands for its second half.
+        assert_eq!(drop_cols("日本語", 1), ("本語", 1));
+        assert_eq!(drop_cols("日本語", 2), ("本語", 0));
+        assert_eq!(drop_cols("a日b", 2), ("b", 1));
+    }
+
+    #[test]
     fn wrapping_splits_a_word_longer_than_the_line() {
         let lines = wrap(&"x".repeat(25), 10);
         assert_eq!(lines.len(), 3);
         assert!(lines.iter().all(|l| width(l) <= 10));
         assert_eq!(lines.concat(), "x".repeat(25));
+    }
+
+    #[test]
+    fn wrapping_never_gives_a_line_of_spaces_only() {
+        // The space after `hello` filled the line, and the next word started a
+        // new line. The space then stood on a line of its own, and it read as
+        // a blank line inside the value.
+        assert_eq!(wrap("hello world", 5), vec!["hello", "world"]);
+        assert_eq!(wrap("hello world", 6), vec!["hello ", "world"]);
+        assert_eq!(wrap("ab cdefghij", 5), vec!["ab ", "cdefg", "hij"]);
     }
 }

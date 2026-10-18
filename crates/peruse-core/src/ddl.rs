@@ -389,17 +389,39 @@ pub fn map_type(d: Dialect, c: &ColumnProfile) -> String {
 
     match base.as_str() {
         "BOOLEAN" | "BOOL" => pick("NUMBER(1)", "TINYINT(1)", "boolean", "BOOLEAN", "BOOL", "BIT"),
-        "TINYINT" | "UTINYINT" => pick(
+        "TINYINT" => pick(
             "NUMBER(3)", "TINYINT", "smallint", "NUMBER(3,0)", "INT64", "TINYINT",
         ),
-        "SMALLINT" | "USMALLINT" => pick(
+        "SMALLINT" => pick(
             "NUMBER(5)", "SMALLINT", "smallint", "NUMBER(5,0)", "INT64", "SMALLINT",
         ),
-        "INTEGER" | "INT" | "UINTEGER" => {
+        "INTEGER" | "INT" => {
             pick("NUMBER(10)", "INT", "integer", "NUMBER(10,0)", "INT64", "INT")
         }
-        "BIGINT" | "UBIGINT" => pick(
+        "BIGINT" => pick(
             "NUMBER(19)", "BIGINT", "bigint", "NUMBER(19,0)", "INT64", "BIGINT",
+        ),
+        // An unsigned type holds values above the signed type of the same
+        // width: a UBIGINT reaches 18446744073709551615, and a signed BIGINT
+        // stops at about half of that. Each unsigned type therefore maps to a
+        // type that holds its full range, so a value does not overflow on the
+        // way into the warehouse.
+        "UTINYINT" => pick(
+            "NUMBER(3)", "SMALLINT", "smallint", "NUMBER(3,0)", "INT64", "SMALLINT",
+        ),
+        "USMALLINT" => pick(
+            "NUMBER(5)", "INT", "integer", "NUMBER(5,0)", "INT64", "INT",
+        ),
+        "UINTEGER" => pick(
+            "NUMBER(10)", "BIGINT", "bigint", "NUMBER(10,0)", "INT64", "BIGINT",
+        ),
+        "UBIGINT" => pick(
+            "NUMBER(20)",
+            "DECIMAL(20,0)",
+            "numeric(20,0)",
+            "NUMBER(20,0)",
+            "BIGNUMERIC",
+            "DECIMAL(20,0)",
         ),
         "HUGEINT" | "UHUGEINT" => pick(
             "NUMBER(38)",
@@ -425,6 +447,18 @@ pub fn map_type(d: Dialect, c: &ColumnProfile) -> String {
             "INTERVAL DAY(0) TO SECOND(6)",
             "TIME(6)",
             "time",
+            "TIME",
+            "TIME",
+            "TIME",
+        ),
+        // A time with a time zone. Only PostgreSQL has a type for it. The
+        // other dialects have no time-zone time, so the value maps to the plain
+        // time of the dialect and loses the zone. Without this arm, the type
+        // fell through to the text branch and became a VARCHAR, which is worse.
+        "TIME WITH TIME ZONE" => pick(
+            "INTERVAL DAY(0) TO SECOND(6)",
+            "TIME(6)",
+            "timetz",
             "TIME",
             "TIME",
             "TIME",
@@ -819,6 +853,29 @@ mod tests {
     }
 
     #[test]
+    fn an_unsigned_type_maps_to_a_type_that_holds_its_range() {
+        // An unsigned type reaches values above the signed type of the same
+        // width. A UBIGINT reaches 18446744073709551615, which a signed BIGINT
+        // cannot hold, so the value would overflow on load. Each unsigned type
+        // therefore maps to a wider type.
+        let ub = col("x", "UBIGINT", 0, 5, None);
+        assert_eq!(map_type(Dialect::Postgres, &ub), "numeric(20,0)");
+        assert_eq!(map_type(Dialect::MySql, &ub), "DECIMAL(20,0)");
+        assert_eq!(map_type(Dialect::SqlServer, &ub), "DECIMAL(20,0)");
+        assert_eq!(map_type(Dialect::Snowflake, &ub), "NUMBER(20,0)");
+
+        let ui = col("x", "UINTEGER", 0, 5, None);
+        assert_eq!(map_type(Dialect::Postgres, &ui), "bigint");
+        assert_eq!(map_type(Dialect::MySql, &ui), "BIGINT");
+
+        let us = col("x", "USMALLINT", 0, 5, None);
+        assert_eq!(map_type(Dialect::Postgres, &us), "integer");
+
+        let utiny = col("x", "UTINYINT", 0, 5, None);
+        assert_eq!(map_type(Dialect::MySql, &utiny), "SMALLINT");
+    }
+
+    #[test]
     fn a_decimal_keeps_its_precision_and_its_scale() {
         let c = col("d", "DECIMAL(18,3)", 0, 5, None);
         assert_eq!(map_type(Dialect::Oracle, &c), "NUMBER(18,3)");
@@ -834,6 +891,20 @@ mod tests {
         assert_eq!(map_type(Dialect::Postgres, &zoned), "timestamptz");
         assert_eq!(map_type(Dialect::Snowflake, &plain), "TIMESTAMP_NTZ");
         assert_eq!(map_type(Dialect::Snowflake, &zoned), "TIMESTAMP_TZ");
+    }
+
+    #[test]
+    fn a_time_with_a_time_zone_maps_to_a_time_type_not_text() {
+        // DuckDB writes this type as "TIME WITH TIME ZONE". It must map to a
+        // time type, and not fall through to a VARCHAR. Only PostgreSQL has a
+        // type for the zone; the others keep the plain time.
+        let tz = col("t", "TIME WITH TIME ZONE", 0, 5, None);
+        assert_eq!(map_type(Dialect::Postgres, &tz), "timetz");
+        assert_eq!(map_type(Dialect::MySql, &tz), "TIME(6)");
+        assert_eq!(map_type(Dialect::SqlServer, &tz), "TIME");
+        // The plain time still maps as before.
+        let plain = col("t", "TIME", 0, 5, None);
+        assert_eq!(map_type(Dialect::Postgres, &plain), "time");
     }
 
     #[test]

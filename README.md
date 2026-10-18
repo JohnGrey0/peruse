@@ -37,6 +37,7 @@ refuses a write.
   - [SQL](#sql)
   - [Search](#search)
   - [DuckDB databases](#duckdb-databases)
+  - [Files on a network drive](#files-on-a-network-drive)
   - [The mouse](#the-mouse)
   - [Themes](#themes)
 - [Completion](#completion)
@@ -573,6 +574,62 @@ A SQLite file is not a DuckDB database. Peruse knows one from its first bytes
 and says how to write a table out with `sqlite3` instead of failing on binary
 data.
 
+### Files on a network drive
+
+```sh
+peruse \\server\team\sales.parquet
+peruse S:\sales.parquet
+```
+
+A Parquet file on a share is slow to browse: DuckDB reads it in many small
+pieces, and every piece waits for the network. One long read is much faster. So
+when a file of 32 MB or more is on a network drive, Peruse copies it to your
+local disk once, with a progress screen, and then reads the copy:
+
+```
+ peruse  a local copy of a file from a network drive
+
+   sales.parquet
+   Peruse copies it to this computer one time. Each step after that is fast.
+
+   from  \\server\team\sales.parquet
+   to    C:\Users\you\AppData\Local\peruse\cache\copies\3f9a…\data
+
+   ████████████████████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░  27%
+   278 MB of 1.0 GB  ·  940 MB/s  ·  1 s left
+
+   Esc  read it on the network instead      Ctrl+C  quit
+```
+
+The copy stays. The next time you open the same file, the grid opens at once,
+and Peruse copies it again only when the file on the share changes (its size or
+its modification time). On a file of 1 GB, a sort took 1.1 s in place and 0.2 s
+from the copy, and a whole session of browsing was 3.7 times faster. The
+measurements are in [docs/local-copies.md](docs/local-copies.md).
+
+You always know which one you are reading. The title bar says `local copy`,
+the metadata panel shows the source and the copy on two rows, and every message,
+the `reads as` line and the list of files name the file on the share, not the
+copy. Peruse never writes to the share.
+
+- `Esc` on the progress screen stops the copy and reads the file in place.
+- A glob copies each file it matches and keeps the subdirectories, so a Hive
+  layout such as `year=2024/` still works. A DuckDB database brings its `.wal`
+  file along.
+- Peruse checks the free space first and keeps 1 GB free. The copies take 20 GB
+  at most; the copy that you used the longest ago goes first, and a copy that
+  another Peruse has open is never removed.
+- `C` clears the copies. It asks first, and a second `C` within 5 seconds
+  clears them. The settings page shows how many there are and how much space
+  they take.
+- `--local` copies the file whatever its size or disk, and `--no-local` reads
+  it in place. The setting `local_copy` (`auto`, `always` or `never`) does the
+  same every time.
+
+Peruse finds a network drive with `GetDriveTypeW` and UNC paths on Windows,
+with `/proc/self/mountinfo` on Linux (NFS, SMB/CIFS, 9p, sshfs, rclone and
+others), and with `statfs` on macOS.
+
 ### The mouse
 
 The wheel scrolls the rows. `Ctrl` or `Shift` with the wheel moves across the
@@ -668,6 +725,7 @@ one once.
 | panels | `panels` | `none`, `meta`, `stats` or `both` | `none` |
 | column details | `band` | the band under the names: `off`, `compact` or `detailed` | `off` |
 | step | `step` | rows or columns that `J`, `K`, `H` and `L` move, 1 to 1000 | 10 |
+| local copy | `local_copy` | copy a file from a network drive first: `auto`, `always` or `never`. See [Files on a network drive](#files-on-a-network-drive) | `auto` |
 
 The row `index at open` takes `yes` or `no`, and the file holds `no_index` the
 other way round: the page asks the question that you have, and the file carries
@@ -678,6 +736,8 @@ Two more settings live in the file and not on the page:
 | In `config.toml` | What it does | With no value |
 |---|---|---|
 | `mouse = false` | make Peruse ignore the mouse | the mouse is on |
+| `local_copy_min_mb` | below this size, `auto` reads a file on a network drive in place | 32 |
+| `local_copy_max_gb` | the space that all the local copies may take | 20 |
 | `recent` | the files you opened, for the chooser. Peruse writes it | empty |
 
 The page also shows what your machine gives: the cores, the processor, the free
@@ -688,8 +748,8 @@ Inside the page: `j` `k` move, `Enter` or `e` edits, `d` goes back to the
 built-in value, `m` takes the value of your machine for the threads and the
 memory, `T` opens the theme picker, and `Esc` closes.
 
-Six settings take effect immediately. The sample size and the index apply to
-the next file you open, and the page says so.
+Six settings take effect immediately. The sample size, the index and the local
+copy apply to the next file you open, and the page says so.
 
 Command-line options always win over the file, so you can try something once
 without changing anything permanently.
@@ -843,6 +903,7 @@ its name, so no command is behind a key that you must know first.
 | `o`, `Ctrl-Home` | back to the start: first row and first column |
 | `O`, `Ctrl-End` | the far corner: last row and last column |
 | `#` | jump to a row number |
+| `c` | jump to a column by name. The prompt completes the name, and a part of the name is enough |
 
 Many laptops have no `Home`, `End`, `PgUp` or `PgDn` key, so every movement
 also has a letter or a chord. `Home` and `End` reach the two ends of the row,
@@ -862,6 +923,7 @@ is 10 rows or columns, and the setting `step` changes it.
 | `!` | remove the rows with the value in this cell |
 | `F` | clear the filter |
 | `e` | edit the SQL behind the grid |
+| `v` | each value of this column, with the number of rows that hold it. The counts follow the filter, and `u` goes back |
 | `u` | undo the last filter, sort or query |
 | `U` | redo what `u` undid |
 | `R` | reset to the whole file |
@@ -900,9 +962,10 @@ is 10 rows or columns, and the setting `step` changes it.
 | `t` | next theme |
 | `T` | choose a theme |
 | `,` | settings, and what this machine gives |
+| `C` | clear the local copies of files from network drives (press it twice) |
 | `?`, `F1` | the help |
 | `:`, `p` | run a command by name |
-| `Esc` | stop the query that runs now |
+| `Esc` | stop the query that runs now, or close the side panels |
 | `q`, `Ctrl-C` | quit |
 
 `Ctrl-P` is deliberately not the palette: Visual Studio Code takes that chord
@@ -974,6 +1037,8 @@ does not expand it first. With no `FILE`, Peruse opens the
 | `--memory-limit` | `SIZE` | The memory ceiling before DuckDB writes to the disk, for example `4GB`. |
 | `--no-index` | | Never index a file of text when Peruse opens it. See [File formats](#file-formats). |
 | `--no-mouse` | | Ignore the mouse, so the terminal selects text with it as usual. |
+| `--local` | | Copy the file to the local disk first, from any drive and of any size. See [Files on a network drive](#files-on-a-network-drive). |
+| `--no-local` | | Read the file in place, also from a network drive. |
 | `-h`, `--help` | | Print the help. |
 | `-V`, `--version` | | Print the version. |
 
@@ -990,7 +1055,7 @@ a database and not a parse failure.
 | Format | Extensions | Notes |
 |---|---|---|
 | Parquet | `.parquet` `.parq` `.pq` | Full footer metadata. Jumps are instant. |
-| CSV and friends | `.csv` `.tsv` `.tab` `.psv` | The extension gives the delimiter. The sniffer finds the rest. |
+| CSV and friends | `.csv` `.tsv` `.tab` `.psv` | `.tsv`, `.tab` and `.psv` give the delimiter. The sniffer finds the rest, and the delimiter of a `.csv` file too. |
 | JSON | `.json` `.ndjson` `.jsonl` | One object for each row, one list of objects, or one object with a list inside it. The reader finds the form. |
 | DuckDB database | `.duckdb` `.ddb`, or any name | Opened read-only. Peruse shows one table of it. Jumps are instant. See [DuckDB databases](#duckdb-databases). |
 
@@ -1132,49 +1197,73 @@ peruse data.parquet --theme ~/.config/peruse/themes/midnight.toml
 
 ## Peruse only reads
 
-Peruse gives you one promise: it does not change your data. Two layers keep
-that promise.
+Peruse gives you one promise: it does not change your data. Five layers keep
+that promise. Each layer stops a write on its own, and the layers do not
+depend on each other.
 
-**The structure of the connection.** The database is always in memory. Peruse
-reaches your data files only through the table functions `read_parquet`,
-`read_csv`, `read_json` and `read_json_auto`. These functions read, and they
-cannot write.
-Peruse never opens a data file for write access, and it never installs or loads
-an extension, so it cannot reach the network.
+**The lock on the connection.** After Peruse finds the files that you open, it
+locks DuckDB to those files. The lock allows a read of the files that you
+opened and of the engine's own temporary directory, and nothing else. It then
+sets `enable_external_access = false` and `lock_configuration = true`. DuckDB
+then refuses each read and each write of any other file, each new attached
+database, and each function that writes a file of its own. No statement can
+change this, because the configuration is locked.
 
-A DuckDB database is the one file that DuckDB itself opens, and Peruse attaches
-it with `ATTACH … (READ_ONLY)`. The promise is stronger there than anywhere
-else: the storage engine refuses the write, so the promise does not rest on the
-words of a statement at all. A test writes through the connection, past the
-guard, and the database refuses it.
+**The guard on the words of the statement.** A statement from you must be one
+statement. It must start with a word that only reads, and it must hold no word
+that writes, at any position. This stops `WITH … INSERT`, `EXPLAIN COPY …`,
+`COPY … TO`, `ATTACH`, `EXPORT DATABASE` and `INSTALL`. The guard also refuses
+a call to a function that writes a file, changes the state, or runs SQL from a
+text value, such as `enable_logging(…)`, `enable_profiling(…)` or `query(…)`.
+It matches a function name only when a `(` follows it, so a column named
+`query` still works. Peruse removes the comments, the values in quotation marks
+and the identifiers in quotation marks before it looks, so a column with the
+real name `"update"`, or a value `'drop table'`, still works. A test reads the
+catalogue of DuckDB and fails when a new version adds a function that writes
+and this list does not classify it.
 
-**The words of the statement.** A statement from you must be one statement. It
-must start with a word that only reads, and it must hold no word that writes,
-at any position. This second rule is what stops `WITH … INSERT`,
-`EXPLAIN COPY …`, `COPY … TO`, `ATTACH`, `EXPORT DATABASE` and `INSTALL`.
-Peruse removes the comments, the values in quotation marks and the identifiers
-in quotation marks before it looks for a word, so a column with the real name
-`"update"`, or a value `'drop table'`, still works.
+**The check on a stored view or macro.** A DuckDB database file can hold a view
+or a macro whose SQL writes a file. Before Peruse reads any view or macro of a
+database, it runs the stored SQL through the guard. A database with a view or a
+macro that writes does not open, and the message names the object.
+
+**The read-only handle (Windows).** While Peruse shows a file from a local
+disk, it holds the file open with a share mode that lets another program read
+the file but not write it and not delete it. Your data cannot change while you
+look at it. Peruse never takes this handle on a file on a network drive, so a
+coworker can still write that file. The handle releases when you close the file
+or quit. Linux and macOS have no equivalent share mode, so this layer is empty
+there, and the promise rests on the other four layers.
+
+**The guard on the writes of Peruse.** Peruse writes only its settings file,
+its themes directory, its cache of local copies, and its own temporary
+directory. The function that removes an old local copy deletes a directory tree,
+so it deletes a directory only when the directory holds a marker file that
+Peruse wrote, is a true directory and not a link, and sits inside the cache. It
+never follows a link or a junction out of the cache.
+
+A DuckDB database is a file that DuckDB itself opens, and Peruse attaches it
+with `ATTACH … (READ_ONLY)`. The storage engine then refuses each write to the
+file, so the promise there does not rest on the words of a statement. A test
+writes through the connection, past the guard, and the database refuses it.
 
 A `WHERE` expression gets one more test: its parentheses must balance. Without
 that test, an expression could close the condition that Peruse builds and
-change the rest of the statement.
+change the rest of the statement. The filter builder writes its own SQL, with a
+quoting function for each name and each value, so a value that you type cannot
+change the shape of the statement.
 
 ```
 $ peruse data.parquet -q "COPY src TO 'out.csv'"
 Error: --query: `COPY` is not a query — Peruse is read-only, start with SELECT / WITH / FROM / DESCRIBE / SUMMARIZE
 ```
 
-The filter builder writes its own SQL. Each column name and each value goes
-through a quoting function, and the parentheses always balance, so a value that
-you type cannot change the shape of the statement. A test feeds injection
-strings through every operator and every type to prove it.
-
-**One thing to know.** The promise is about writing. A statement that you type
-yourself can still *read* another file on your machine, for example with
-`read_csv('/etc/passwd')` inside a subquery. Peruse runs your SQL with your own
-permissions. That matters only if you paste a statement that somebody else
-wrote.
+**One thing to know.** The lock keeps a statement to the files that you opened.
+A statement from `-q` can therefore no longer read a file that you did not
+open, such as `read_csv('/etc/passwd')`. This is a change from earlier
+versions. To read a second file, open it with Peruse, or name it in the glob
+that you open. Peruse runs your SQL with your own permissions, but only on the
+files that you chose.
 
 ---
 

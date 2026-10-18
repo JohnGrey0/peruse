@@ -212,14 +212,14 @@ impl Term {
                 value2,
             } => {
                 let c = quote_ident(column);
-                // A text column is text already. A cast would copy each value
-                // and give no gain. Each other family needs the cast, because
-                // ILIKE takes text only.
-                let as_text = if *kind == CellKind::Text {
-                    c.clone()
-                } else {
-                    format!("CAST({c} AS VARCHAR)")
-                };
+                // ILIKE takes text only, so the target goes through
+                // CAST(... AS VARCHAR). The cast is free for a VARCHAR column:
+                // DuckDB removes a cast to the same type, so the plan is the
+                // same as a bare column. The cast is necessary for a column
+                // such as UUID, which the family reads as text but which is
+                // not a VARCHAR, because ILIKE with no cast gives a binder
+                // error and the filter fails for the whole column.
+                let as_text = format!("CAST({c} AS VARCHAR)");
                 let lit = |v: &str| literal(*kind, v);
                 match op {
                     Op::IsNull => format!("({c} IS NULL)"),
@@ -484,18 +484,33 @@ mod tests {
         let sql = cmp("name", CellKind::Text, Op::Contains, "50%_off").to_sql();
         assert_eq!(
             sql,
-            "(\"name\" ILIKE '%50\\%\\_off%' ESCAPE '\\')"
+            "(CAST(\"name\" AS VARCHAR) ILIKE '%50\\%\\_off%' ESCAPE '\\')"
         );
     }
 
     #[test]
-    fn a_text_column_needs_no_cast_and_each_other_family_needs_one() {
-        assert!(cmp("name", CellKind::Text, Op::Contains, "a")
-            .to_sql()
-            .starts_with("(\"name\" ILIKE"));
-        assert!(cmp("n", CellKind::Number, Op::Contains, "a")
-            .to_sql()
-            .starts_with("(CAST(\"n\" AS VARCHAR) ILIKE"));
+    fn every_family_casts_to_varchar_before_ilike() {
+        // ILIKE takes text only. The cast is free for a VARCHAR column and
+        // necessary for a type such as UUID that the family reads as text but
+        // that ILIKE does not take. Each family therefore casts.
+        for kind in [CellKind::Text, CellKind::Number, CellKind::Temporal, CellKind::Nested] {
+            assert!(
+                cmp("c", kind, Op::Contains, "a")
+                    .to_sql()
+                    .starts_with("(CAST(\"c\" AS VARCHAR) ILIKE"),
+                "{kind:?} does not cast before ILIKE"
+            );
+        }
+    }
+
+    #[test]
+    fn a_uuid_column_can_be_searched_with_contains() {
+        // A UUID reads as text, but it is not a VARCHAR. Without the cast,
+        // `"ref" ILIKE ...` gives a binder error and the filter fails. The
+        // column name does not say the type, so the fix is to cast each text
+        // target, and the cast is free for a true VARCHAR.
+        let sql = cmp("ref", CellKind::Text, Op::StartsWith, "0000").to_sql();
+        assert_eq!(sql, "(CAST(\"ref\" AS VARCHAR) ILIKE '0000%' ESCAPE '\\')");
     }
 
     #[test]
@@ -503,7 +518,7 @@ mod tests {
         let sql = cmp("name", CellKind::Text, Op::NotContains, "x").to_sql();
         assert_eq!(
             sql,
-            "(NOT coalesce(\"name\" ILIKE '%x%' ESCAPE '\\', false))"
+            "(NOT coalesce(CAST(\"name\" AS VARCHAR) ILIKE '%x%' ESCAPE '\\', false))"
         );
     }
 

@@ -77,13 +77,18 @@ pub fn layout(app: &mut App, area: Rect) -> Layout {
         app.left_col = cursor_at;
     }
 
+    // The last screen column stays free. The scroll bar and the sign for the
+    // columns outside the screen both sit there, and a column that reached
+    // that screen column lost its last character under them: the number 900
+    // read as 90. The width of one column has the same limit, one line above.
+    //
     // Move the first column to the right until the cursor column fits.
     loop {
         let mut used = 0u16;
         let mut last = app.left_col;
         for (n, &ci) in vis.iter().enumerate().skip(app.left_col) {
             let w = app.widths[ci].min(avail.saturating_sub(1).max(1));
-            if used + w > avail && n > app.left_col {
+            if used + w >= avail && n > app.left_col {
                 break;
             }
             used += w + GAP;
@@ -95,11 +100,31 @@ pub fn layout(app: &mut App, area: Rect) -> Layout {
         app.left_col += 1;
     }
 
+    // Move the first column back to the left while each column from there to
+    // the last one fits. The screen then has no empty room at the right side
+    // when it shows the last column. A column of a wide file gets its width
+    // when a page first holds it, so the widths can become smaller after the
+    // loop above moved the first column.
+    let width_of = |ci: usize| app.widths[ci].min(avail.saturating_sub(1).max(1));
+    let mut rest: u32 = vis
+        .iter()
+        .skip(app.left_col)
+        .map(|&ci| u32::from(width_of(ci)) + u32::from(GAP))
+        .sum();
+    while app.left_col > 0 {
+        let more = rest + u32::from(width_of(vis[app.left_col - 1])) + u32::from(GAP);
+        if more - u32::from(GAP) > u32::from(avail) {
+            break;
+        }
+        rest = more;
+        app.left_col -= 1;
+    }
+
     let mut drawn = Vec::new();
     let mut x = gutter;
     for &ci in vis.iter().skip(app.left_col) {
         let w = app.widths[ci].min(avail.saturating_sub(1).max(1));
-        if x + w > area.width && !drawn.is_empty() {
+        if x + w >= area.width && !drawn.is_empty() {
             break;
         }
         drawn.push((ci, x, w));
@@ -158,6 +183,11 @@ pub fn draw(buf: &mut Buffer, area: Rect, app: &mut App, p: &Paint) {
         height: area.height - 1 - band,
     };
     app.viewport_rows = body.height as usize;
+    // The grid can lose rows with no movement of the cursor: the terminal
+    // gets smaller, the band or the prompt takes rows, or a panel opens under
+    // the grid. A cursor in the lost rows would then be off the screen until
+    // the next key that moves it.
+    app.follow_cursor();
     // Keep where the grid is on the screen. A click of the mouse arrives as a
     // row and a column of the terminal, and only the code that draws the grid
     // knows which cell is at that position.
@@ -241,10 +271,11 @@ pub fn draw(buf: &mut Buffer, area: Rect, app: &mut App, p: &Paint) {
                 t.bg
             };
 
-            if !in_page {
+            if !in_page || !app.page.holds_col(ci) {
                 // The row is not in the current page. A row of points
                 // keeps the grid steady. Without it, the grid becomes
-                // empty and full again during a fast scroll.
+                // empty and full again during a fast scroll. A page of a
+                // wide file can also lack a column after a move to the side.
                 let dots = waiting(w as usize);
                 buf.set_stringn(area.x + x, y, &dots, w as usize, p.on(t.dim, bg));
                 continue;

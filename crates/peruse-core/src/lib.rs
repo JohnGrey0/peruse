@@ -11,10 +11,11 @@
 //!
 //! let (worker, opened) = Worker::spawn("trips.parquet", OpenOptions::default())?;
 //! println!("{} columns", opened.schema.len());
-//! worker.send(Request::SetView { epoch: 1, view: View::default(), limit: 50 });
+//! worker.send(Request::SetView { epoch: 1, view: View::default(), limit: 50, cols: None });
 //! # Ok::<(), anyhow::Error>(())
 //! ```
 
+pub mod cache;
 pub mod config;
 pub mod ddl;
 pub mod dirs;
@@ -23,6 +24,7 @@ pub mod filter;
 pub mod meta;
 pub mod model;
 pub mod query;
+pub mod remote;
 pub mod source;
 pub mod sql_guard;
 pub mod stats;

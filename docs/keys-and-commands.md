@@ -46,6 +46,7 @@ The five groups come in this order: `Move`, `Query`, `Inspect`, `Columns` and
 | `o`, `Ctrl-Home` | `Origin` | back to the start: first row and first column |
 | `O`, `Ctrl-End` | `LastCell` | the far corner: last row and last column |
 | `#` | `GotoRow` | jump to row number |
+| `c` | `GotoColumn` | jump to a column by name |
 
 Many laptop keyboards have no Home key, no End key, no PgUp key and no PgDn
 key. Peruse must stay complete on such a keyboard, so each command that moves
@@ -70,6 +71,11 @@ Four rules give the letters:
   [settings.md](settings.md).
 - **A chord moves by a page.** `Ctrl-F` and `Ctrl-B` move a full page, and
   `Ctrl-D` and `Ctrl-U` move half a page.
+- **A name finds a column.** The key `c` opens a prompt for the name of a
+  column, with the same ghost completion as the filter prompt. The exact name
+  wins, then a name that starts with the text, then a name that holds it. A
+  column that the grid hides comes back, because the user asked for it by
+  name.
 
 ### The group Query
 
@@ -83,6 +89,7 @@ Four rules give the letters:
 | `!` | `FilterExcludeValue` | remove the rows with the value in this cell |
 | `F` | `FilterClear` | clear the filter |
 | `e` | `Sql` | edit the SQL query behind the grid |
+| `v` | `ValueCounts` | count the rows of each value in this column (u goes back) |
 | `u` | `Undo` | undo the last filter, sort or query |
 | `U` | `Redo` | redo the change that u undid |
 | `R` | `ResetView` | reset to the whole file |
@@ -95,6 +102,15 @@ first thing that a new user finds, and it needs no knowledge of SQL. The prompt
 that takes a `WHERE` expression is on the key `E`. The three commands all build
 the same list of conditions. The document [filter.md](filter.md) describes that
 list.
+
+The key `v` runs one statement over the view of the moment: each value of the
+column under the cursor, with the number of rows that hold it, the largest
+count first. The statistics panel shows the eight most frequent values; this
+grid shows each of them, and the user can sort it and search it. The statement
+holds the filter of the moment, so the counts describe the rows that the user
+looks at. The statement replaces the grid in the same way as the key `e`, so
+the title says `query`, the key `e` shows the statement, and the key `u` gives
+the view back.
 
 ### The group Inspect
 
@@ -134,9 +150,10 @@ moves the cursor, and the plain letter changes the band.
 | `t` | `ThemeNext` | next theme |
 | `T` | `ThemePicker` | choose a theme |
 | `,` | `Settings` | settings, and what this machine gives |
+| `C` | `ClearCopies` | clear the local copies of files from network drives. The first `C` asks, and a second `C` in 5 seconds clears |
 | `?`, `F1` | `Help` | this help |
 | `:`, `p` | `Palette` | run a command by name |
-| `Esc` | `Cancel` | cancel the running query |
+| `Esc` | `Cancel` | cancel the running query, or close the side panels |
 | `q`, `Ctrl-C` | `Quit` | quit |
 
 The palette has no chord. Visual Studio Code takes `Ctrl-P` for its own file
@@ -154,6 +171,18 @@ character that the terminal can print holds its own shift state: the character
 `G` is the shift key and the key `g`. Some terminals send the shift key with
 the capital letter, and some terminals do not. Peruse must accept the two
 forms.
+
+The function also removes two other modifier states that the user did not
+choose:
+
+- The key `AltGr` of a European keyboard gives characters such as `#`, `@`
+  and `[`. Windows reports that key as `Ctrl` and `Alt` together, so a French
+  keyboard sends `#` as `Ctrl-Alt-#`. A character with both modifier keys is
+  therefore the character alone. The editor of the prompt uses the same rule,
+  in `input::is_altgr`: without it, the prompt refuses each of those
+  characters, and a Polish user cannot type `ł`.
+- The terminal library sends `Shift-Tab` as the key `BackTab` with the shift
+  key, on each system. The name of the key holds the shift state already.
 
 A modifier key of a key that is not a character stays. The pair `Ctrl-F` is
 therefore different from the key `f`, and `Ctrl-Home` is different from `Home`.
@@ -296,6 +325,19 @@ A third test, `every_footer_hint_has_a_short_form` in `ui.rs`, makes sure that
 each command in `FOOTER_HINTS` has a short form. Without a short form, the
 function `short_desc` gives the first word of the description, and that word is
 frequently the wrong one: `build a filter from menus` would give "build".
+
+## A paste
+
+Peruse asks the terminal to send a paste as one event, with the mode that the
+terminals call "bracketed paste". `App::on_paste` puts the text into the box
+that takes text now, and each line break and tab becomes one space, because a
+prompt holds one line. A paste over the grid, or over a list, does nothing.
+
+Without that mode, a paste arrives as keys. The line break of a statement in
+more than one line is then the key `Enter`: the prompt runs the first line
+alone, and each character after it reaches the grid as a command. The letter
+`R` resets the view, `t` changes the theme, and `q` stops the program. The
+console of Windows sends a paste as keys in all cases.
 
 ## The keys inside an overlay
 

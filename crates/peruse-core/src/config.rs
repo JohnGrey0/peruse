@@ -73,6 +73,25 @@ pub struct Config {
     /// the mouse in the usual way. A user who copies text out of the grid with
     /// the mouse each day can turn the mouse off here.
     pub mouse: Option<bool>,
+    /// When Peruse copies a file from a network drive to the local disk
+    /// before it opens it: `auto`, `always` or `never`.
+    ///
+    /// The value `auto` copies a file from a network drive when it is at
+    /// least [`Config::local_copy_min_mb`] large. The value `always` copies
+    /// each file, also from a local disk. Refer to [`crate::cache`].
+    ///
+    /// The file also accepts the name `remote_cache`, and the same for the
+    /// two limits below. Peruse writes the names `local_copy`.
+    #[serde(alias = "remote_cache")]
+    pub local_copy: Option<String>,
+    /// The size in whole megabytes below which `auto` reads a file from a
+    /// network drive in place.
+    #[serde(alias = "remote_cache_min_mb")]
+    pub local_copy_min_mb: Option<u64>,
+    /// The space in whole gigabytes that the local copies can take together.
+    /// The copies that were used the least recently go first.
+    #[serde(alias = "remote_cache_max_gb")]
+    pub local_copy_max_gb: Option<u64>,
     /// The files that the user opened, the newest first.
     ///
     /// The chooser of files puts these at the top of its list. A user opens
@@ -139,6 +158,39 @@ impl Config {
         self.recent.truncate(MAX_RECENT);
     }
 
+    /// Puts a file at the top of the list in the settings file at `p`.
+    ///
+    /// The function reads the file again, changes the list, and writes the
+    /// file. It does not write the settings of this session, so a setting that
+    /// another window of Peruse wrote since the start stays in the file.
+    ///
+    /// A file that Peruse cannot read stays as it is, and the function gives
+    /// the reason. The load of such a file gives the built-in settings, and a
+    /// write of those would replace each setting that the user wrote in the
+    /// file. One character wrong in the file would then cost the user the rest
+    /// of it, at the next start, with no request.
+    pub fn remember_file_at(p: &std::path::Path, file: &str) -> Result<(), String> {
+        let (mut on_disk, why) = Config::load_from(p);
+        if let Some(why) = why {
+            return Err(format!("the file has a fault, so nothing was written: {why}"));
+        }
+        if on_disk.recent.first().map(String::as_str) == Some(file) {
+            return Ok(());
+        }
+        on_disk.remember_file(file);
+        on_disk.save_to(p).map(|_| ())
+    }
+
+    /// Gives the policy of the local copies. A value that Peruse does not
+    /// know gives `auto`, because a word in the file must not stop the
+    /// program.
+    pub fn local_copy_policy(&self) -> crate::cache::Policy {
+        self.local_copy
+            .as_deref()
+            .and_then(crate::cache::Policy::parse)
+            .unwrap_or_default()
+    }
+
     /// Gives the memory limit in the form that DuckDB takes.
     ///
     /// The text says `GiB`, and the screen says `GB`. The two are the same
@@ -188,8 +240,30 @@ impl Config {
         if let Some(dir) = p.parent() {
             std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
         }
-        std::fs::write(p, self.to_toml()).map_err(|e| format!("{}: {e}", p.display()))?;
-        Ok(p.to_path_buf())
+        // Write to a temporary file beside the target, and then rename it over
+        // the target. The rename is one step on the file system, so a crash in
+        // the middle of a write cannot leave a half-written settings file: the
+        // old file stays until the new file is whole. The key `d` and the key
+        // `t` write the file often, so a torn write is a real risk without
+        // this step.
+        //
+        // The temporary file holds the number of the process in its name. Two
+        // instances that write at the same time therefore write to two
+        // different temporary files, and neither one reads a file that the
+        // other is still writing. The last rename wins, which is the same
+        // result as two writes in a row.
+        let text = self.to_toml();
+        let tmp = p.with_extension(format!("toml.{}.tmp", std::process::id()));
+        std::fs::write(&tmp, &text).map_err(|e| format!("{}: {e}", tmp.display()))?;
+        match std::fs::rename(&tmp, p) {
+            Ok(()) => Ok(p.to_path_buf()),
+            Err(e) => {
+                // The rename failed, so the old file is still whole. Remove the
+                // temporary file, so it does not stay behind.
+                let _ = std::fs::remove_file(&tmp);
+                Err(format!("{}: {e}", p.display()))
+            }
+        }
     }
 
     /// Writes the settings as the text of the file.
@@ -241,6 +315,19 @@ impl Config {
         s.push_str("# the wheel to peruse, and it does not select text in the usual way.\n");
         push_opt(&mut s, "mouse", self.mouse.map(|v| v.to_string()));
 
+        s.push_str("\n# Copy a file from a network drive to the local disk before peruse opens it:\n");
+        s.push_str("# auto, always or never. With auto, peruse copies a file of local_copy_min_mb\n");
+        s.push_str("# or more from a network drive, and it uses the copy again until the file\n");
+        s.push_str("# changes. With always, it copies each file, also from a local disk.\n");
+        push_opt(&mut s, "local_copy", self.local_copy.as_deref().map(quote));
+
+        s.push_str("\n# The size in megabytes below which auto reads a file in place.\n");
+        push_opt(&mut s, "local_copy_min_mb", self.local_copy_min_mb.map(|v| v.to_string()));
+
+        s.push_str("\n# The space in gigabytes that the local copies can take together.\n");
+        s.push_str("# The copy that was used the least recently goes first.\n");
+        push_opt(&mut s, "local_copy_max_gb", self.local_copy_max_gb.map(|v| v.to_string()));
+
         s.push_str("\n# The files that you opened, the newest first.\n");
         s.push_str("# The chooser of files puts these at the top of its list.\n");
         if self.recent.is_empty() {
@@ -284,13 +371,18 @@ where
         Raw::Number(n) => n.max(1) as u32,
         Raw::Text(s) => {
             let t = s.trim().to_ascii_uppercase();
-            let (digits, factor) = if let Some(v) = t.strip_suffix("TB") {
+            // The forms `GiB` and `GB` read the same way here: the number is a
+            // count of gibibytes, and Peruse gives DuckDB `GiB`. A user who
+            // copies the value that the settings page shows, such as `8GiB`,
+            // must not get an error. The function reads the two-letter form and
+            // the three-letter form of each size.
+            let (digits, factor) = if let Some(v) = t.strip_suffix("TIB").or(t.strip_suffix("TB")) {
                 (v, 1024.0)
-            } else if let Some(v) = t.strip_suffix("GB") {
+            } else if let Some(v) = t.strip_suffix("GIB").or(t.strip_suffix("GB")) {
                 (v, 1.0)
-            } else if let Some(v) = t.strip_suffix("MB") {
+            } else if let Some(v) = t.strip_suffix("MIB").or(t.strip_suffix("MB")) {
                 (v, 1.0 / 1024.0)
-            } else if let Some(v) = t.strip_suffix("KB") {
+            } else if let Some(v) = t.strip_suffix("KIB").or(t.strip_suffix("KB")) {
                 (v, 1.0 / (1024.0 * 1024.0))
             } else {
                 (t.as_str(), 1.0)
@@ -449,6 +541,9 @@ mod tests {
             band: Some("detailed".into()),
             step: Some(25),
             mouse: Some(false),
+            local_copy: Some("always".into()),
+            local_copy_min_mb: Some(64),
+            local_copy_max_gb: Some(50),
             recent: vec!["/data/a.parquet".into(), "C:/data/b.csv".into()],
         };
         let back: Config = toml::from_str(&c.to_toml()).unwrap();
@@ -473,6 +568,38 @@ mod tests {
         }
         assert_eq!(c.recent.len(), MAX_RECENT);
         assert_eq!(c.recent[0], format!("file{}.csv", MAX_RECENT + 4));
+    }
+
+    #[test]
+    fn a_settings_file_with_a_fault_is_not_replaced_when_a_file_opens() {
+        // Before this test, the start of the program loaded the built-in
+        // settings for a file with one wrong name, and then wrote them back
+        // with the new file in the list. Every other line of the file of the
+        // user was gone.
+        let dir = std::env::temp_dir().join("peruse-config-fault");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("config.toml");
+        let text = "theme = \"nord\"\nthread = 4\nmemory_limit = 8\n";
+        std::fs::write(&p, text).unwrap();
+        let err = Config::remember_file_at(&p, "C:/data/a.csv").unwrap_err();
+        assert!(err.contains("nothing was written"), "{err}");
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), text, "the file changed");
+
+        // A correct file keeps each setting, and the list grows.
+        let text = "theme = \"nord\"\nthreads = 4\n";
+        std::fs::write(&p, text).unwrap();
+        Config::remember_file_at(&p, "C:/data/a.csv").unwrap();
+        let (back, why) = Config::load_from(&p);
+        assert_eq!(why, None);
+        assert_eq!(back.theme.as_deref(), Some("nord"));
+        assert_eq!(back.threads, Some(4));
+        assert_eq!(back.recent, ["C:/data/a.csv"]);
+
+        // A file that is not there becomes a new file.
+        let p = dir.join("new").join("config.toml");
+        Config::remember_file_at(&p, "/data/b.csv").unwrap();
+        assert_eq!(Config::load_from(&p).0.recent, ["/data/b.csv"]);
     }
 
     #[test]
@@ -592,6 +719,36 @@ mod tests {
     }
 
     #[test]
+    fn save_to_writes_whole_and_leaves_no_temporary_file() {
+        // The write goes to a temporary file and then renames it over the
+        // target, so a crash cannot leave a half-written file. After a clean
+        // write, the file reads back as the same settings and no temporary
+        // file stays behind.
+        let dir = std::env::temp_dir().join("peruse-save-atomic");
+        let _ = std::fs::remove_dir_all(&dir);
+        let p = dir.join("config.toml");
+        let c = Config {
+            theme: Some("nord".into()),
+            step: Some(25),
+            recent: vec!["/data/a.parquet".into()],
+            ..Config::default()
+        };
+        c.save_to(&p).expect("the write must succeed");
+        let (back, err) = Config::load_from(&p);
+        assert_eq!(err, None);
+        assert_eq!(back, c);
+        // The temporary file is renamed away, so the directory holds the
+        // settings file and nothing else.
+        let names: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["config.toml"], "a temporary file stayed behind");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn a_size_from_an_older_file_still_reads() {
         // An older version wrote a text such as "32GB". A user must not lose
         // a setting because a later version changed the form of the file.
@@ -601,12 +758,36 @@ mod tests {
             ("memory_limit = \"2TB\"", 2048),
             ("memory_limit = \"512MB\"", 1),
             ("memory_limit = \"16\"", 16),
+            // The IEC forms that the settings page shows read the same way, so
+            // a user who copies `8GiB` back into the file does not get an error.
+            ("memory_limit = \"8GiB\"", 8),
+            ("memory_limit = \"2TiB\"", 2048),
+            ("memory_limit = \"1024MiB\"", 1),
         ] {
             let c: Config = toml::from_str(text).unwrap_or_else(|e| panic!("{text}: {e}"));
             assert_eq!(c.memory_limit_gb, Some(want), "{text}");
         }
         // A value that is not a size says so.
         assert!(toml::from_str::<Config>("memory_limit = \"lots\"").is_err());
+    }
+
+    #[test]
+    fn a_word_for_the_local_copies_that_peruse_does_not_know_gives_auto() {
+        use crate::cache::Policy;
+        let c: Config = toml::from_str("local_copy = \"never\"").unwrap();
+        assert_eq!(c.local_copy_policy(), Policy::Never);
+        let c: Config = toml::from_str("local_copy = \"sometimes\"").unwrap();
+        assert_eq!(c.local_copy_policy(), Policy::Auto);
+        assert_eq!(Config::default().local_copy_policy(), Policy::Auto);
+        // The second name of each setting reads the same.
+        let c: Config = toml::from_str(
+            "remote_cache = \"always\"
+remote_cache_min_mb = 8
+remote_cache_max_gb = 2",
+        )
+        .unwrap();
+        assert_eq!(c.local_copy_policy(), Policy::Always);
+        assert_eq!((c.local_copy_min_mb, c.local_copy_max_gb), (Some(8), Some(2)));
     }
 
     #[test]

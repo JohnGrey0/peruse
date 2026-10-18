@@ -25,7 +25,9 @@ The crate `peruse-core` holds these modules:
 | `stats.rs` | The statistics of a column and the histogram |
 | `source.rs` | The format detection, and the text forms of a size and a count |
 | `theme.rs` | The colors, the built-in themes and the theme files |
-| `dirs.rs` | The directories for the settings and for the theme files |
+| `dirs.rs` | The directories for the settings, for the theme files and for the local copies |
+| `remote.rs` | The test for a file on a network drive, and the free space of a disk |
+| `cache.rs` | The local copies of files from a network drive: the decision, the copy, the test of a copy and the limit |
 
 The crate `peruse-tui` holds these modules:
 
@@ -34,6 +36,7 @@ The crate `peruse-tui` holds these modules:
 | `main.rs` | The options of the command line, the terminal, and the event loop |
 | `app.rs` | The state of the application and each change to that state |
 | `browser.rs` | The screen that a call with no file opens, and the picker of the tables of a database |
+| `copying.rs` | The screen that shows the copy of a file from a network drive |
 | `grid.rs` | The grid of rows and columns |
 | `panels.rs` | The metadata panel and the column statistics panel |
 | `overlays.rs` | The help, the palette, the theme picker, the cell inspector, the record view and the filter builder |
@@ -106,3 +109,4 @@ view and the schema with each request. The two threads therefore need no lock.
 - The statements: [query-generation.md](query-generation.md)
 - The worker: [worker-and-concurrency.md](worker-and-concurrency.md)
 - The screen: [user-interface.md](user-interface.md)
+- The files on a network drive: [local-copies.md](local-copies.md)

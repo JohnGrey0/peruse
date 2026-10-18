@@ -20,19 +20,36 @@
 use anyhow::{bail, Context, Result};
 use duckdb::types::Value;
 use duckdb::{Connection, InterruptHandle};
+use std::borrow::Cow;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::ddl::{ColumnProfile, TableProfile};
 use crate::meta::{ColumnFooterStats, CsvMeta, FileEntry, FileMeta, ParquetMeta};
 use crate::model::{CellKind, Column, RowPage, Schema};
-use crate::query::{quote_ident, quote_str, View};
+use crate::query::{quote_ident, quote_str, Base, View, ORDER_COLUMN, ORDER_VIEW};
 use crate::source::{self, Format, Source};
 use crate::stats::{CellKindWrapper, ColumnStats, Histogram};
 
 /// The name of the table in memory that holds an indexed CSV file. The
 /// function [`Engine::materialize`] makes this table.
 const MAT_TABLE: &str = "__peruse_indexed";
+
+/// The name of the table in memory that holds the position of each row of one
+/// sorted view, in the order of the view. Refer to [`Engine::sorted_window`].
+const SORT_TABLE: &str = "__peruse_sorted";
+
+/// A sorted request that ends after this row reads the view through
+/// [`SORT_TABLE`].
+///
+/// A sorted window deep in the view costs a sort of each column of each row:
+/// 550 rows at row 5,000,000 of 10 million rows of Parquet cost 1.2 s, and
+/// each later window costs the same. The table sorts the sort columns and the
+/// position only, one time, in 0.2 s, and each window from it costs 20 ms.
+/// Near the start of the view the sort keeps the first rows only, and it costs
+/// less than the table: 59 ms at row 10,000 and 119 ms at row 50,000.
+const SORT_TABLE_ROWS: u64 = 100_000;
 
 /// The name that Peruse gives to an attached database.
 ///
@@ -75,6 +92,34 @@ const TOP_VALUES_MIN_ROWS: u64 = 100_000;
 /// the usual search, and the search does not read the rest of the part. Refer to
 /// [`Engine::search`].
 const SEARCH_WINDOW: u64 = 8192;
+
+/// The largest page, in rows, that DuckDB reads in two steps.
+///
+/// With a sort or a filter, DuckDB can find the rows of a page from the sort
+/// column or the filter column alone, and then read the other columns of those
+/// rows only. The default of DuckDB permits that for 50 rows. One request of
+/// the grid holds the screen and 250 rows on each side of it, so it is above
+/// that default on each terminal. This value covers a terminal of some
+/// thousand rows.
+const LATE_MATERIALIZATION_ROWS: u64 = 4096;
+
+/// The largest number of threads that examine the files of a set of CSV files
+/// at the open operation.
+///
+/// One call of the sniffer of DuckDB costs about 8 ms on a small file, and most
+/// of that time is not work of the processor. A set of 500 files therefore
+/// costs four seconds on one thread. Refer to [`Engine::pin_csv`].
+const SNIFF_THREADS: usize = 8;
+
+/// The smallest set of Parquet files that the engine reads without
+/// `union_by_name`. Refer to [`Engine::pin_parquet_set`].
+///
+/// The comparison of the schemas costs some milliseconds and more for each
+/// file, and `union_by_name` costs less than one millisecond for each file in
+/// each statement. At 100 files of 2000 rows, the open operation costs the same
+/// with the comparison and without it, and each later statement costs about 20
+/// percent less. A smaller set would wait longer for its first screen.
+const PIN_PARQUET_FILES: usize = 100;
 
 /// The options that control how the engine opens a file.
 #[derive(Clone, Debug, Default)]
@@ -226,6 +271,13 @@ pub fn footer_briefs(meta: &FileMeta, columns: &[Column]) -> Option<Vec<ColumnBr
     let mut out = Vec::with_capacity(columns.len());
     for c in columns {
         let f = meta.columns.iter().find(|f| f.name == c.name)?;
+        // A set of files with `union_by_name` can hold a column in one file and
+        // not in another. The rows of the other file are NULL in the view, and
+        // the footer of that file counts none of them. The NULL count of the
+        // footer is then too small, so the footer cannot answer.
+        if f.rows != n_total {
+            return None;
+        }
         let nulls = f.null_count?;
         out.push(ColumnBrief {
             column: c.name.clone(),
@@ -276,13 +328,37 @@ pub struct Engine {
     /// The metadata panel shows these values. With this copy, the panel needs
     /// no second sniffer call, and that call costs 50 milliseconds on a file of
     /// 258 MB. The value is `None` for a format that has no dialect, and for a
-    /// set of CSV files.
+    /// set of CSV files whose files differ. Refer to [`Engine::pin_csv`].
     csv_dialect: Option<CsvMeta>,
     /// The table that the view `src` reads, for a database source.
     ///
     /// The value is `None` for a file. A file holds one table, and that table
     /// has no name of its own.
     table: Option<DbTable>,
+    /// The statement of the view [`ORDER_VIEW`], or `None` when the source
+    /// gives no position of a row. Refer to [`Engine::define_order_view`].
+    order_view: Option<String>,
+    /// True when the view [`ORDER_VIEW`] gives the position of each row in the
+    /// file. The engine makes that view at the first sorted request. Refer to
+    /// [`Engine::ordered`].
+    ordered: OnceLock<bool>,
+    /// The statement that filled [`SORT_TABLE`], or `None` when that table
+    /// holds no rows of the source now. Refer to [`Engine::sorted_window`].
+    sort_table: Mutex<Option<String>>,
+    /// Open handles that keep the source files read-only for the session.
+    ///
+    /// This is Layer D of the read-only promise, on Windows only. Each handle
+    /// is open with a share mode that lets another program read the file but
+    /// not write it and not delete it, so no program can change the data under
+    /// Peruse while Peruse shows it. The handles close when the engine closes,
+    /// which is when the session ends or the user opens another file. Refer to
+    /// [`read_only_locks`]. On Linux and macOS the field is empty, because
+    /// those systems have no equivalent of this share mode. Refer to
+    /// `docs/read-only-guard.md`.
+    // The handles are held only for their effect on the file system, and never
+    // read, so the field is dead code to the compiler.
+    #[allow(dead_code)]
+    locks: Vec<std::fs::File>,
 }
 
 /// What the DuckDB CSV sniffer found about a file.
@@ -297,12 +373,80 @@ struct CsvSniff {
     columns: Vec<(String, String)>,
 }
 
+impl CsvSniff {
+    /// Gives `true` when two files have the same dialect and the same columns,
+    /// in the same order and with the same types.
+    ///
+    /// The field `prompt` holds the name of the file, so the test leaves it
+    /// out. One read call with these values then reads each of the two files in
+    /// the same way as the sniffer of each file would.
+    fn same_as(&self, other: &CsvSniff) -> bool {
+        let (a, b) = (&self.meta, &other.meta);
+        a.delimiter == b.delimiter
+            && a.quote == b.quote
+            && a.escape == b.escape
+            && a.new_line == b.new_line
+            && a.skip_rows == b.skip_rows
+            && a.has_header == b.has_header
+            && a.date_format == b.date_format
+            && a.timestamp_format == b.timestamp_format
+            && self.comment == other.comment
+            && self.columns == other.columns
+    }
+}
+
 /// Changes each backslash in a path to a forward slash.
 ///
 /// DuckDB accepts a forward slash on each platform. In a glob pattern, DuckDB
 /// reads a backslash as an escape character and then removes it.
 fn db_path(p: &Path) -> String {
     p.to_string_lossy().replace('\\', "/")
+}
+
+/// Gives `true` when a compressed JSON file nests deeper than
+/// [`MAX_JSON_DEPTH`] in a record that the reader examines.
+///
+/// The test of [`source::json_depth_over`] reads the bytes of the file, and
+/// the bytes of a compressed file are not JSON. A file of 80 bytes can then
+/// hold 3000 levels, and it stops the program. Peruse holds no decompressor,
+/// but DuckDB does. The function `read_json_objects` gives each record as
+/// text, and it finds no columns, so it does not call itself for each level.
+/// Peruse then counts the levels of each text with a loop.
+///
+/// The function reads twice the records that the reader examines, as
+/// [`source::json_depth_over`] does. A record that DuckDB cannot read gives an
+/// error here. The reader then gives the same error, so the function gives
+/// `false` and lets the reader report it.
+fn compressed_json_too_deep(
+    conn: &Connection,
+    path: &Path,
+    records: Option<u64>,
+    ignore_errors: bool,
+) -> bool {
+    let mut sql = format!("SELECT json FROM read_json_objects({}", quote_str(&db_path(path)));
+    if ignore_errors {
+        // The reader then skips a bad record and examines the records after
+        // it. This read must examine the same records.
+        sql.push_str(", ignore_errors = true");
+    }
+    sql.push(')');
+    if let Some(n) = records {
+        sql.push_str(&format!(" LIMIT {}", n.saturating_mul(2).max(1)));
+    }
+    let Ok(mut stmt) = conn.prepare(&sql) else {
+        return false;
+    };
+    let Ok(mut rows) = stmt.query([]) else {
+        return false;
+    };
+    while let Ok(Some(row)) = rows.next() {
+        if let Ok(Some(text)) = row.get::<_, Option<String>>(0)
+            && source::json_text_depth_over(text.as_bytes(), MAX_JSON_DEPTH as usize)
+        {
+            return true;
+        }
+    }
+    false
 }
 
 /// Turns the message of a failed open into a message that names the options of
@@ -419,13 +563,17 @@ impl Engine {
     /// therefore gives an error here, and not at the first page request.
     pub fn open(input: &str, opts: &OpenOptions) -> Result<Engine> {
         let conn = Connection::open_in_memory().context("starting DuckDB")?;
-        configure(&conn, opts)?;
+        let tmp = configure(&conn, opts)?;
 
         let files = resolve_files(&conn, input)?;
         if files.is_empty() {
             bail!("no files matched {input:?}");
         }
         let (format, ext_delim, compressed) = source::detect(&files[0]);
+        // From here, the connection can reach these files and its own
+        // temporary directory, and nothing else. The function `glob()` stops
+        // when the lock is on, so the lock comes after `resolve_files`.
+        lock_down(&conn, &files, format == Format::DuckDb, &tmp)?;
         let bytes = files
             .iter()
             .filter_map(|f| std::fs::metadata(f).ok())
@@ -447,6 +595,7 @@ impl Engine {
             // `Engine::open_database` names the table as soon as it chooses
             // one. A file holds one table, and it keeps this value empty.
             table: None,
+            local_copy: None,
         };
 
         // A SQLite file is a database, and the reader for it is an extension
@@ -502,17 +651,37 @@ impl Engine {
         // level, and a stack that is full is not a fault that Rust can
         // catch. Peruse therefore counts the levels with a loop of its own
         // before it gives the file to that reader.
-        if src.format == Format::Json
-            && source::json_depth_over(&src.files[0], MAX_JSON_DEPTH as usize)
-        {
-            bail!(
-                "{}: this file nests deeper than {MAX_JSON_DEPTH} levels.\n\
-                 A file that deep stops the reader of DuckDB, so Peruse does not open it.",
-                src.label
-            );
+        //
+        // The reader examines each file of a set, so each file needs the
+        // check, and not the first file only. It examines `sample_size`
+        // records of each file, and the value -1 means the whole file.
+        if src.format == Format::Json {
+            let records = match opts.sample_size {
+                None => Some(source::JSON_SAMPLE_RECORDS),
+                Some(n) if n < 0 => None,
+                Some(n) => Some(n as u64),
+            };
+            if let Some(deep) = src.files.iter().find(|f| {
+                if source::is_compressed(f) {
+                    compressed_json_too_deep(&conn, f, records, opts.ignore_errors)
+                } else {
+                    source::json_depth_over(f, MAX_JSON_DEPTH as usize, records)
+                }
+            }) {
+                let name = deep
+                    .file_name()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| src.label.clone());
+                bail!(
+                    "{name}: this file nests deeper than {MAX_JSON_DEPTH} levels.\n\
+                     A file that deep stops the reader of DuckDB, so Peruse does not open it."
+                );
+            }
         }
 
         let plain = build_read_expr(&src, opts);
+        // Layer D: keep the files read-only for the session, on a local disk.
+        let locks = read_only_locks(&src.files, false, &crate::remote::System);
         let mut engine = Engine {
             conn,
             source: src,
@@ -522,6 +691,10 @@ impl Engine {
             base_schema: Schema::default(),
             csv_dialect: None,
             table: None,
+            order_view: None,
+            ordered: OnceLock::new(),
+            sort_table: Mutex::new(None),
+            locks,
         };
 
         // A file of text and a file of JSON hold no schema. DuckDB therefore
@@ -538,10 +711,10 @@ impl Engine {
         // A set of files needs `union_by_name`, and two files of one set can
         // hold different columns. One column list cannot serve them all, so a
         // set keeps the call that finds the columns for each file.
-        let pinned = if engine.source.format == Format::Csv && !engine.source.is_multi() {
-            engine.pin_csv(opts)
-        } else {
-            None
+        let pinned = match engine.source.format {
+            Format::Csv => engine.pin_csv(opts),
+            Format::Parquet => engine.pin_parquet_set(),
+            _ => None,
         };
 
         // Read the schema now, and keep it. An error message here is more
@@ -583,6 +756,11 @@ impl Engine {
     /// statement.
     fn open_database(conn: Connection, mut src: Source, opts: &OpenOptions) -> Result<Engine> {
         attach_database(&conn, &src)?;
+        // Layer B of the read-only promise. A `.duckdb` file can hold a view or
+        // a macro whose SQL writes a file. DuckDB runs that SQL when Peruse
+        // reads the object, so the check comes before the first read, and a
+        // database with a failing object does not open at all.
+        check_stored_objects(&conn, &src.label)?;
         let tables = read_tables(&conn)
             .with_context(|| format!("reading the tables of {}", src.label))?;
         let table = choose_table(&src, &tables, opts.table.as_deref())?;
@@ -591,6 +769,9 @@ impl Engine {
         src.table = Some(table.label());
 
         let scan = table.qualified();
+        // Layer D: keep the database file and its log read-only for the
+        // session, on a local disk.
+        let locks = read_only_locks(&src.files, true, &crate::remote::System);
         let mut engine = Engine {
             read_expr: database_read_expr(&src, &table),
             conn,
@@ -600,6 +781,10 @@ impl Engine {
             base_schema: Schema::default(),
             csv_dialect: None,
             table: Some(table),
+            order_view: None,
+            ordered: OnceLock::new(),
+            sort_table: Mutex::new(None),
+            locks,
         };
         // Read the schema now, in the same way as for a file. A name that the
         // database does not hold therefore gives an error here.
@@ -624,8 +809,141 @@ impl Engine {
         let schema = self
             .read_schema(&View::default())
             .map_err(|e| open_error(&input, &e.to_string()))?;
+        let position = if self.source.format == Format::Parquet {
+            // A set of files numbers the rows of each file from 0, so the
+            // position of a row also needs the position of its file.
+            Some(if self.source.is_multi() {
+                "(file_index::BIGINT << 40) + file_row_number"
+            } else {
+                "file_row_number"
+            })
+        } else if self.table.as_ref().is_some_and(|t| !t.is_view) {
+            Some("rowid")
+        } else {
+            None
+        };
+        self.define_order_view(&expr, position, &schema);
         self.scan_expr = expr;
         Ok(schema)
+    }
+
+    /// Prepares the view [`ORDER_VIEW`]: each column of `src`, and the
+    /// position of each row in the file. A sorted view over the file reads it,
+    /// and its sort ends with that position. Refer to [`View::order_by`].
+    ///
+    /// `position` is an expression over `from` that gives the position from
+    /// the metadata: the row number of a Parquet file, or the row id of a
+    /// table. It costs almost nothing, because DuckDB reads it only for the
+    /// rows that it sorts.
+    ///
+    /// A file of text has no such expression, and the engine then makes no
+    /// view. A sorted view over that file ends its sort with each of its
+    /// columns. A number from `row_number()` is also a position, but it costs
+    /// too much: on a CSV file of 1.4 GB, a sorted window of 550 rows costs 3.6
+    /// s with it, and 0.5 s with each column.
+    ///
+    /// The file can hold a column with the name of the position, or with the
+    /// name that the expression reads. Then that name does not give the
+    /// position, and the engine makes no view.
+    ///
+    /// The engine makes the view at the first sorted request, and not here.
+    /// The view reads the metadata of each file again, and on a set of 500
+    /// Parquet files that made the open operation 36 ms slower.
+    fn define_order_view(&mut self, from: &str, position: Option<&str>, schema: &Schema) {
+        // DuckDB compares names with no difference between upper case and
+        // lower case.
+        let taken = |p: &str| {
+            schema.columns.iter().any(|c| {
+                let name = c.name.to_ascii_lowercase();
+                name == ORDER_COLUMN
+                    || ["rowid", "file_row_number", "file_index"]
+                        .iter()
+                        .any(|n| name == *n && p.contains(n))
+            })
+        };
+        self.order_view = position
+            .filter(|p| !taken(p))
+            .map(|p| format!("SELECT *, {p} AS {} FROM {from}", quote_ident(ORDER_COLUMN)));
+        self.ordered = OnceLock::new();
+        // The positions of a sorted view belong to the old rows.
+        let held = self.sort_table.get_mut().unwrap_or_else(|e| e.into_inner());
+        if held.take().is_some() {
+            let _ = self
+                .conn
+                .execute_batch(&format!("DROP TABLE IF EXISTS {SORT_TABLE}"));
+        }
+    }
+
+    /// Gives `true` when the view [`ORDER_VIEW`] gives the position of each
+    /// row in the file. The first call makes that view.
+    fn ordered(&self) -> bool {
+        *self.ordered.get_or_init(|| {
+            self.order_view.as_ref().is_some_and(|body| {
+                self.conn
+                    .execute_batch(&format!(
+                        "CREATE OR REPLACE VIEW {} AS {body}",
+                        quote_ident(ORDER_VIEW)
+                    ))
+                    .is_ok()
+            })
+        })
+    }
+
+    /// Gives a statement that holds the rows `offset` to `offset + limit` of
+    /// a sorted view over the file, in the order of the view, when those rows
+    /// come from [`SORT_TABLE`]. Refer to [`SORT_TABLE_ROWS`].
+    ///
+    /// The table holds the position of each row of the view, in the order of
+    /// the view, so the row id of a position is the number of its row in the
+    /// view. The engine fills it at the first request past
+    /// [`SORT_TABLE_ROWS`], and each later request of the same view uses it.
+    /// The table holds one view at a time.
+    ///
+    /// The result is a view of the statement, with no filter and no sort. Its
+    /// rows start at its row 0. `None` tells the caller to use `view` itself.
+    fn sorted_window(&self, view: &View, limit: u64, offset: u64) -> Result<Option<View>> {
+        if !view.is_source() || view.sort.is_empty() || !self.ordered() {
+            return Ok(None);
+        }
+        let ord = quote_ident(ORDER_COLUMN);
+        let key = view.select(&ord);
+        let mut held = self.sort_table.lock().unwrap_or_else(|e| e.into_inner());
+        if held.as_deref() != Some(key.as_str()) {
+            if offset.saturating_add(limit) <= SORT_TABLE_ROWS {
+                return Ok(None);
+            }
+            *held = None;
+            self.conn
+                .execute_batch(&format!("CREATE OR REPLACE TEMP TABLE {SORT_TABLE} AS {key}"))?;
+            *held = Some(key);
+        }
+        // The page keeps the order of the row ids, from the `ORDER BY` part.
+        let rows = format!(
+            "SELECT q.* FROM (SELECT rowid AS __peruse_rank, {ord} FROM {SORT_TABLE} \
+             LIMIT {limit} OFFSET {offset}) AS p JOIN {ORDER_VIEW} AS q USING ({ord}) \
+             ORDER BY p.__peruse_rank"
+        );
+        Ok(Some(View {
+            base: Base::Sql(rows),
+            ..Default::default()
+        }))
+    }
+
+    /// Gives the view that a statement over the rows of `view` must use.
+    ///
+    /// A sorted view over the file ends its sort with the position of each
+    /// row, from [`ORDER_VIEW`]. A source with no such view becomes the
+    /// statement `SELECT * FROM src`, whose sort ends with each of its columns.
+    /// The two give the same rows, so the user sees no difference.
+    fn sorted_view<'a>(&self, view: &'a View) -> Cow<'a, View> {
+        if view.is_source() && !view.sort.is_empty() && !self.ordered() {
+            Cow::Owned(View {
+                base: Base::Sql("SELECT * FROM src".into()),
+                ..view.clone()
+            })
+        } else {
+            Cow::Borrowed(view)
+        }
     }
 
     /// Asks the CSV sniffer one time, and writes the dialect and the columns
@@ -636,8 +954,23 @@ impl Engine {
     /// new call fails, or when the new call gives columns that are not the
     /// columns of the sniffer. The caller then uses the call with `auto_detect`,
     /// which is the call that Peruse used before this step existed.
+    ///
+    /// A set of files gets the same call when the sniffer finds the same dialect
+    /// and the same columns, in the same order, in each file of the set. The
+    /// sniffer then examines each file one time at the open operation. Without
+    /// that, the call with `union_by_name` examines each file of the set again
+    /// for every statement: over 500 small CSV files, one page cost 640 ms, and
+    /// it costs 60 ms with the pinned call. A set whose files differ keeps the
+    /// call with `union_by_name`, which reads each file with its own columns.
+    ///
+    /// One call of the sniffer costs some milliseconds also on a small file, so
+    /// the sniffer examines the other files of a set on some threads at the
+    /// same time. Refer to [`SNIFF_THREADS`].
     fn pin_csv(&mut self, opts: &OpenOptions) -> Option<Schema> {
-        let sniff = self.sniff_csv(opts).ok()?;
+        let sniff = self.sniff_csv(&self.source.files[0], opts).ok()?;
+        if !self.set_agrees(&sniff, opts) {
+            return None;
+        }
         let expr = pinned_csv_expr(&self.source, opts, &sniff)?;
         let schema = self.use_scan_expr(expr).ok()?;
         // The sniffer and the read call share one piece of code inside DuckDB,
@@ -657,66 +990,122 @@ impl Engine {
         Some(schema)
     }
 
+    /// Reads a set of Parquet files without `union_by_name`, when each file
+    /// holds the same columns in the same order with the same types.
+    ///
+    /// With `union_by_name`, DuckDB reads the footer of each file of the set
+    /// again for every statement, to find the columns of the set. Over 500
+    /// small files that cost about 20 ms for each statement. The plain call
+    /// reads the columns of the first file, and each other file when it reads
+    /// its rows. The plain call is correct only for files that agree, so the
+    /// engine compares the schema of each file one time here, in one
+    /// statement. A set whose files differ keeps `union_by_name`.
+    ///
+    /// The function gives `None` for a set of fewer than
+    /// [`PIN_PARQUET_FILES`] files, and for a set that keeps the call with
+    /// `union_by_name`.
+    fn pin_parquet_set(&mut self) -> Option<Schema> {
+        if self.source.files.len() < PIN_PARQUET_FILES || !self.parquet_set_agrees() {
+            return None;
+        }
+        let list = file_list(&self.source.files);
+        self.use_scan_expr(format!("read_parquet({list})")).ok()
+    }
+
+    /// Gives `true` when each Parquet file of the set holds the same columns,
+    /// in the same order, with the same types.
+    fn parquet_set_agrees(&self) -> bool {
+        self.parquet_schemas().is_some_and(|mut schemas| {
+            let first = schemas.pop();
+            schemas.iter().all(|s| Some(s) == first.as_ref())
+        })
+    }
+
+    /// Reads the elements of the schema of each Parquet file of the set.
+    ///
+    /// Each list holds the position, the name, the type, and the count of the
+    /// elements inside a nested one, in the order of the positions.
+    fn parquet_schemas(&self) -> Option<Vec<Vec<(i64, String)>>> {
+        let list = file_list(&self.source.files);
+        // Each element of the schema of a file, with its position: the name,
+        // the type, and the count of the elements inside a nested one. The
+        // comparison is in Rust, because an aggregate in DuckDB costs some
+        // milliseconds more, also on a set of two files.
+        let sql = format!(
+            "SELECT file_name, column_id, name || chr(31) || coalesce(duckdb_type, '') || chr(31) \
+               || coalesce(repetition_type, '') || chr(31) || coalesce(num_children::VARCHAR, '') \
+             FROM parquet_schema({list})"
+        );
+        let mut files: HashMap<String, Vec<(i64, String)>> = HashMap::new();
+        let mut stmt = self.conn.prepare(&sql).ok()?;
+        let mut rows = stmt.query([]).ok()?;
+        while let Some(r) = rows.next().ok()? {
+            let element = (r.get(1).ok()?, r.get(2).ok()?);
+            files.entry(r.get(0).ok()?).or_default().push(element);
+        }
+        if files.len() != self.source.files.len() {
+            return None;
+        }
+        Some(
+            files
+                .into_values()
+                .map(|mut s| {
+                    s.sort_unstable();
+                    s
+                })
+                .collect(),
+        )
+    }
+
     /// Asks the DuckDB sniffer for the dialect and the columns of a CSV file.
     ///
     /// The sniffer gets the same options as the read call. The two therefore
     /// agree about the file.
-    fn sniff_csv(&self, opts: &OpenOptions) -> Result<CsvSniff> {
-        let mut args = vec![quote_str(&db_path(&self.source.files[0]))];
-        if let Some(d) = self.source.delimiter {
-            args.push(format!("delim = {}", delim_literal(d)));
-        }
-        if let Some(h) = opts.header {
-            args.push(format!("header = {h}"));
-        }
-        if opts.all_varchar {
-            args.push("all_varchar = true".into());
-        }
-        if opts.ignore_errors {
-            args.push("ignore_errors = true".into());
-        }
-        if let Some(n) = opts.sample_size {
-            args.push(format!("sample_size = {n}"));
-        }
-        let call = format!("sniff_csv({})", args.join(", "));
+    fn sniff_csv(&self, file: &Path, opts: &OpenOptions) -> Result<CsvSniff> {
+        sniff_csv_on(&self.conn, file, self.source.delimiter, opts)
+    }
 
-        // The field `Columns` holds one structure for each column. The call to
-        // unnest makes one row for each of them, and the dialect repeats on
-        // every row. One statement therefore runs the sniffer one time.
-        let mut stmt = self.conn.prepare(&format!(
-            "SELECT coalesce(Delimiter, ''), coalesce(Quote, ''), coalesce(Escape, ''), \
-                    coalesce(NewLineDelimiter, ''), coalesce(SkipRows, 0)::BIGINT, \
-                    coalesce(HasHeader, false), coalesce(DateFormat, ''), \
-                    coalesce(TimestampFormat, ''), coalesce(Prompt, ''), \
-                    coalesce(Comment, ''), col.name, col.type \
-             FROM (SELECT Delimiter, Quote, Escape, NewLineDelimiter, SkipRows, HasHeader, \
-                          DateFormat, TimestampFormat, Prompt, Comment, unnest(Columns) AS col \
-                   FROM {call})"
-        ))?;
-        let mut rows = stmt.query([])?;
-        let mut out: Option<CsvSniff> = None;
-        while let Some(r) = rows.next()? {
-            let sniff = match &mut out {
-                Some(s) => s,
-                None => out.insert(CsvSniff {
-                    meta: CsvMeta {
-                        delimiter: r.get(0)?,
-                        quote: r.get(1)?,
-                        escape: r.get(2)?,
-                        new_line: r.get(3)?,
-                        skip_rows: r.get(4)?,
-                        has_header: r.get(5)?,
-                        date_format: r.get(6)?,
-                        timestamp_format: r.get(7)?,
-                        prompt: r.get(8)?,
-                    },
-                    comment: r.get(9)?,
-                    columns: Vec::new(),
-                }),
-            };
-            sniff.columns.push((r.get(10)?, r.get(11)?));
+    /// Gives `true` when the sniffer finds the dialect and the columns of
+    /// `first` in each other file of the set.
+    ///
+    /// Each thread uses a connection of its own to the same database, and it
+    /// examines one part of the files. The first difference stops each thread.
+    fn set_agrees(&self, first: &CsvSniff, opts: &OpenOptions) -> bool {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let rest = &self.source.files[1..];
+        if rest.is_empty() {
+            return true;
         }
-        out.ok_or_else(|| anyhow::anyhow!("the CSV sniffer found no column"))
+        let cap = opts.threads.unwrap_or(SNIFF_THREADS).clamp(1, SNIFF_THREADS);
+        let chunk = rest.len().div_ceil(cap.min(rest.len()));
+        let delimiter = self.source.delimiter;
+        let differ = AtomicBool::new(false);
+        let mut conns = Vec::new();
+        for _ in rest.chunks(chunk) {
+            match self.conn.try_clone() {
+                Ok(c) => conns.push(c),
+                Err(_) => return false,
+            }
+        }
+        std::thread::scope(|scope| {
+            for (part, conn) in rest.chunks(chunk).zip(conns) {
+                let differ = &differ;
+                scope.spawn(move || {
+                    for f in part {
+                        if differ.load(Ordering::Relaxed) {
+                            return;
+                        }
+                        let same = sniff_csv_on(&conn, f, delimiter, opts)
+                            .is_ok_and(|other| first.same_as(&other));
+                        if !same {
+                            differ.store(true, Ordering::Relaxed);
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        !differ.load(Ordering::Relaxed)
     }
 
     /// Writes the columns that Peruse read into the `read_json` call.
@@ -772,6 +1161,10 @@ impl Engine {
 
     /// Reads the name and the type of each column from the database.
     fn read_schema(&self, view: &View) -> Result<Schema> {
+        self.read_schema_inner(view).map_err(explain_lock)
+    }
+
+    fn read_schema_inner(&self, view: &View) -> Result<Schema> {
         let sql = view.describe_sql();
         let mut stmt = self.conn.prepare(&sql)?;
         let mut rows = stmt.query([])?;
@@ -796,7 +1189,10 @@ impl Engine {
             return Ok(RowPage::new(offset, 0, Vec::new()));
         }
         let ncols = schema.len();
-        let sql = view.page_sql(schema, limit, offset);
+        let sql = match self.sorted_window(view, u64::from(limit), offset)? {
+            Some(window) => window.page_sql(schema, limit, 0),
+            None => self.sorted_view(view).page_sql(schema, limit, offset),
+        };
         let mut stmt = self.conn.prepare(&sql)?;
         let mut rows = stmt.query([])?;
         let mut cells: Vec<Option<String>> = Vec::with_capacity(limit as usize * ncols);
@@ -806,6 +1202,48 @@ impl Engine {
             }
         }
         Ok(RowPage::new(offset, ncols, cells))
+    }
+
+    /// Reads one page of rows, with the columns `cols` of the schema only.
+    ///
+    /// `cols` is a range of positions in the schema, from `cols.0` up to, and
+    /// not including, `cols.1`. The value `None` reads every column, in the
+    /// same way as [`Engine::page`]. The page then knows the position of its
+    /// first column. Refer to [`RowPage::first_col`].
+    ///
+    /// A wide file needs this. Each column of a statement costs time in
+    /// DuckDB whatever the number of rows is: on a Parquet file of 1000
+    /// columns, one page of 50 rows of each column cost 330 ms, and the same
+    /// page of 20 columns cost 20 ms. The grid shows some tens of columns.
+    ///
+    /// The range always holds one column at the minimum. A page of no columns
+    /// would hold no rows, and the grid would read that as the end of the view.
+    pub fn page_columns(
+        &self,
+        view: &View,
+        schema: &Schema,
+        cols: Option<(usize, usize)>,
+        limit: u32,
+        offset: u64,
+    ) -> Result<RowPage> {
+        let n = schema.len();
+        let Some((lo, hi)) = cols else {
+            return self.page(view, schema, limit, offset);
+        };
+        if n == 0 {
+            return self.page(view, schema, limit, offset);
+        }
+        let lo = lo.min(n - 1);
+        let hi = hi.min(n).max(lo + 1);
+        if lo == 0 && hi == n {
+            return self.page(view, schema, limit, offset);
+        }
+        let part = Schema {
+            columns: schema.columns[lo..hi].to_vec(),
+        };
+        let mut page = self.page(view, &part, limit, offset)?;
+        page.first_col = lo;
+        Ok(page)
     }
 
     /// Counts the rows in the view.
@@ -822,7 +1260,10 @@ impl Engine {
     /// A page holds a short form of a long value. This function gives the
     /// complete value.
     pub fn cell(&self, view: &View, column: &str, row: u64) -> Result<Option<String>> {
-        let sql = view.cell_sql(column, row);
+        let sql = match self.sorted_window(view, 1, row)? {
+            Some(window) => window.cell_sql(column, 0),
+            None => self.sorted_view(view).cell_sql(column, row),
+        };
         let mut stmt = self.conn.prepare(&sql)?;
         let mut rows = stmt.query([])?;
         match rows.next()? {
@@ -875,7 +1316,10 @@ impl Engine {
     ///
     /// The function gives `None` when the view holds no row at that offset.
     pub fn row_json(&self, view: &View, schema: &Schema, row: u64) -> Result<Option<String>> {
-        let sql = view.row_json_sql(schema, row);
+        let sql = match self.sorted_window(view, 1, row)? {
+            Some(window) => window.row_json_sql(schema, 0),
+            None => self.sorted_view(view).row_json_sql(schema, row),
+        };
         let mut stmt = self.conn.prepare(&sql)?;
         let mut rows = stmt.query([])?;
         match rows.next()? {
@@ -926,13 +1370,14 @@ impl Engine {
             scan_rows
         };
 
+        let sorted = self.sorted_view(view);
         let mut out: Vec<u64> = Vec::new();
         let mut done = 0u64;
         let mut window = first;
         while done < scan_rows && out.len() < limit as usize {
             let take = window.min(scan_rows - done);
             let need = limit - out.len() as u32;
-            let sql = view.search_sql(schema, needle, from_row + done, take, need);
+            let sql = sorted.search_sql(schema, needle, from_row + done, take, need);
             if sql.is_empty() {
                 // No column of the view holds text that a search can read.
                 return Ok(Vec::new());
@@ -1314,7 +1759,8 @@ impl Engine {
                     coalesce(sum(total_compressed_size), 0)::BIGINT, \
                     coalesce(sum(total_uncompressed_size), 0)::BIGINT, \
                     string_agg(DISTINCT compression, '/'), \
-                    string_agg(DISTINCT encodings, '/') \
+                    string_agg(DISTINCT encodings, '/'), \
+                    coalesce(sum(row_group_num_rows), 0)::BIGINT \
              FROM parquet_metadata({list}) GROUP BY 1"
         ))?;
         let mut rows = stmt.query([])?;
@@ -1329,6 +1775,7 @@ impl Engine {
                 uncompressed: r.get::<_, i64>(3)?.max(0) as u64,
                 compression: r.get::<_, Option<String>>(4)?.unwrap_or_default(),
                 encodings: r.get::<_, Option<String>>(5)?.unwrap_or_default(),
+                rows: r.get::<_, i64>(6)?.max(0) as u64,
             });
         }
         Ok(out)
@@ -1337,8 +1784,9 @@ impl Engine {
     /// Asks the DuckDB sniffer for the dialect of a CSV file.
     ///
     /// The open operation asks the sniffer already, and it keeps the answer. The
-    /// panel therefore waits for nothing. A set of CSV files has no such answer,
-    /// and this function then asks the sniffer about the first file of the set.
+    /// panel therefore waits for nothing. A set of CSV files whose files differ
+    /// has no such answer, and this function then asks the sniffer about the
+    /// first file of the set.
     fn csv_meta(&self) -> Result<CsvMeta> {
         if let Some(m) = &self.csv_dialect {
             return Ok(m.clone());
@@ -1389,6 +1837,10 @@ impl Engine {
              CREATE OR REPLACE VIEW src AS SELECT * FROM {MAT_TABLE};",
             self.scan_expr
         ))?;
+        // The table keeps the order of the file, so the row id of a row is its
+        // position in the file.
+        let schema = self.base_schema.clone();
+        self.define_order_view(MAT_TABLE, Some("rowid"), &schema);
         self.indexed = true;
         Ok(())
     }
@@ -1634,13 +2086,16 @@ impl Engine {
 }
 
 /// Applies the options to the connection before the engine reads any data.
-fn configure(conn: &Connection, opts: &OpenOptions) -> Result<()> {
+///
+/// The function gives the temporary directory that it chose, because
+/// [`lock_down`] must let DuckDB write there and nowhere else.
+fn configure(conn: &Connection, opts: &OpenOptions) -> Result<PathBuf> {
     let threads = opts.threads.unwrap_or_else(|| {
         std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(4)
     });
-    let tmp = std::env::temp_dir().join("peruse");
+    let tmp = temp_dir_for_engine();
     // The two extension options are necessary for the read-only promise.
     //
     // The bundled DuckDB build sets `autoinstall` and `autoload` to true. A
@@ -1678,7 +2133,238 @@ fn configure(conn: &Connection, opts: &OpenOptions) -> Result<()> {
     // Peruse builds against. A build without it must still open a file, so a
     // failure here is not an error.
     let _ = conn.execute_batch("SET parquet_metadata_cache = true;");
-    Ok(())
+
+    // A sorted page and a deep page of a filtered view read the rows in two
+    // steps when this setting permits it: first the sort column or the filter
+    // column alone, and then the other columns of the page rows only. DuckDB
+    // does that for a page of 50 rows at the most, and the grid asks for some
+    // hundred rows at a time. A sorted window of 550 rows over 10 million rows
+    // of Parquet then costs 35 ms and not 104, and a window deep in a filtered
+    // view costs 82 ms and not 190. Refer to [`LATE_MATERIALIZATION_ROWS`].
+    //
+    // The setting is not in each version of DuckDB, so a failure here is not
+    // an error.
+    let _ = conn.execute_batch(&format!(
+        "SET late_materialization_max_rows = {LATE_MATERIALIZATION_ROWS};"
+    ));
+    Ok(tmp)
+}
+
+/// The settings that the settings page of Peruse changes while the engine runs.
+///
+/// After [`lock_down`], DuckDB refuses a change to each other setting. Refer to
+/// [`Engine::apply_settings`].
+const ALLOWED_CONFIGS: &str = "['threads', 'memory_limit']";
+
+/// Gives the files that DuckDB can read for a source: each file, and the
+/// write-ahead log of a database.
+///
+/// DuckDB looks for the log of a database when it attaches the database, also
+/// when the log does not exist, so the path must be in the list in both cases.
+/// The attach is read-only, so DuckDB reads the log and never makes it.
+fn allowed_files(files: &[PathBuf], database: bool) -> Vec<PathBuf> {
+    let mut out = Vec::with_capacity(files.len() * 2);
+    for f in files {
+        out.push(f.clone());
+        if database {
+            out.push(PathBuf::from(format!("{}.wal", f.to_string_lossy())));
+        }
+    }
+    out
+}
+
+/// Opens a read-only handle on each source file on a local disk, for the whole
+/// session.
+///
+/// This is Layer D of the read-only promise, on Windows only. Each handle is
+/// open with the share mode `FILE_SHARE_READ`, with no `FILE_SHARE_WRITE` and
+/// no `FILE_SHARE_DELETE`. While Peruse holds it, another program can read the
+/// file but cannot write it or delete it, so the data cannot change under
+/// Peruse. The caller keeps the handles in the engine, and they close when the
+/// engine closes: at the end of the session, or when the user opens another
+/// file.
+///
+/// The function never locks a file on a network drive, because a coworker must
+/// still write the file. It uses the same test as the local copies, through
+/// `probe`. A file that it cannot open read-only, such as a log that DuckDB
+/// holds, is left out, because the lock is a safety net and not a necessity.
+///
+/// On Linux and macOS there is no equivalent of this share mode: a handle there
+/// does not stop another program from writing the file. The function gives an
+/// empty list, and the promise rests on the other layers. Refer to
+/// `docs/read-only-guard.md`.
+#[cfg(windows)]
+fn read_only_locks(files: &[PathBuf], database: bool, probe: &dyn crate::remote::Probe) -> Vec<std::fs::File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    // FILE_SHARE_READ only. No FILE_SHARE_WRITE (0x2), no FILE_SHARE_DELETE (0x4).
+    const FILE_SHARE_READ: u32 = 0x0000_0001;
+    let mut out = Vec::new();
+    for f in allowed_files(files, database) {
+        if !f.is_file() || probe.is_remote(&f) {
+            continue;
+        }
+        let mut o = std::fs::OpenOptions::new();
+        o.read(true).share_mode(FILE_SHARE_READ);
+        if let Ok(h) = o.open(&f) {
+            out.push(h);
+        }
+    }
+    out
+}
+
+/// The other systems have no share mode that stops a write. Refer to the
+/// Windows form of this function and to `docs/read-only-guard.md`.
+#[cfg(not(windows))]
+fn read_only_locks(
+    _files: &[PathBuf],
+    _database: bool,
+    _probe: &dyn crate::remote::Probe,
+) -> Vec<std::fs::File> {
+    Vec::new()
+}
+
+/// Locks the connection, so that it can read the source files and nothing else.
+///
+/// This is the layer of the read-only promise that does not depend on the words
+/// of a statement. Refer to `docs/read-only-guard.md`. The function sets, in
+/// this order:
+///
+/// 1. `allowed_paths`: the source files, and the log of a database.
+/// 2. `allowed_directories`: the temporary directory of this engine, where
+///    DuckDB puts the rows of a large sort.
+/// 3. `allowed_configs`: the two settings of the settings page.
+/// 4. `enable_external_access = false`. DuckDB then refuses each file outside
+///    the two lists above, for a read and for a write. It also refuses each
+///    function that writes a file of its own, such as a log or a profile, and
+///    each `ATTACH` of a second database.
+/// 5. `lock_configuration = true`. No statement can then change a setting
+///    that is not in the list of step 3, so no statement can undo steps 1 to 4.
+///
+/// The function `glob()` stops after this lock, so the caller must find the
+/// files first.
+fn lock_down(conn: &Connection, files: &[PathBuf], database: bool, tmp: &Path) -> Result<()> {
+    let paths: Vec<String> = allowed_files(files, database)
+        .iter()
+        .map(|f| quote_str(&db_path(f)))
+        .collect();
+    let mut dir = db_path(tmp);
+    if !dir.ends_with('/') {
+        dir.push('/');
+    }
+    let sql = format!(
+        "SET allowed_paths = [{}];\n\
+         SET allowed_directories = [{}];\n\
+         SET allowed_configs = {ALLOWED_CONFIGS};\n\
+         SET enable_external_access = false;\n\
+         SET lock_configuration = true;\n",
+        paths.join(", "),
+        quote_str(&dir)
+    );
+    conn.execute_batch(&sql)
+        .context("locking DuckDB to the files that Peruse reads")
+}
+
+/// Gives `true` when a message from DuckDB says that the lock of [`lock_down`]
+/// refused a file or a setting.
+fn refused_by_the_lock(message: &str) -> bool {
+    let m = message.to_ascii_lowercase();
+    m.contains("disabled by configuration")
+        || m.contains("enable_external_access")
+        || m.contains("cannot access file")
+        || m.contains("cannot access directory")
+        || m.contains("configuration has been locked")
+        || m.contains("lock_configuration")
+}
+
+/// Turns a refusal of the lock into a message that says what Peruse allows.
+///
+/// A statement in the SQL prompt or in `--query` can read the source, and the
+/// tables of an open database. It cannot read another file, because Peruse
+/// locks DuckDB to the files that the user opened. The words of DuckDB alone
+/// name a setting that the user never wrote.
+fn explain_lock(e: anyhow::Error) -> anyhow::Error {
+    let text = format!("{e:#}");
+    if !refused_by_the_lock(&text) {
+        return e;
+    }
+    anyhow::anyhow!(
+        "Peruse reads only the file that you opened, as the view `src`. \
+         A query cannot read, write or attach any other file, and it cannot \
+         change a setting of DuckDB. To read a second file, open it with \
+         Peruse, or name it in the glob that you open.\n\
+         DuckDB said: {}",
+        first_lines(&text, 2)
+    )
+}
+
+/// Gives a temporary directory that belongs to one engine only.
+///
+/// DuckDB names its temporary files with a counter that starts at zero in each
+/// database, such as `duckdb_temp_storage_S256K-0.tmp`. Two engines that share
+/// one directory therefore write their blocks into the same files, and each one
+/// reads the data of the other: the result is wrong rows, or a crash. When an
+/// engine closes, DuckDB also deletes each `duckdb_temp_` file in the
+/// directory, and the files of the other engine go with them. Two Peruse
+/// windows on two large files are enough to cause this.
+///
+/// Each engine therefore gets a directory of its own below the directory
+/// `peruse` in the temporary directory of the system. DuckDB makes that
+/// directory only when a query writes to the disk, and it deletes it when the
+/// engine closes. Peruse makes the parent, because DuckDB makes one level only.
+///
+/// A process that stops before the engine closes leaves its directory, with
+/// each block in it. A kill during a large sort can leave some gigabytes. The
+/// first engine of each process therefore removes each directory of a process
+/// that is not alive. Refer to [`remove_dirs_of_ended_engines`].
+fn temp_dir_for_engine() -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    static CLEAN: std::sync::Once = std::sync::Once::new();
+    let parent = std::env::temp_dir().join("peruse");
+    // A parent that Peruse cannot make is not a reason to stop. DuckDB then
+    // gives its own message when a query needs the disk.
+    let _ = std::fs::create_dir_all(&parent);
+    CLEAN.call_once(|| remove_dirs_of_ended_engines(&parent, std::process::id(), process_alive));
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    parent.join(format!("{}-{n}", std::process::id()))
+}
+
+/// Removes each directory `<pid>-<n>` below `parent` that no live engine uses.
+///
+/// The function runs before the first engine of this process gets its
+/// directory, so a directory with the number `me` is from an earlier process
+/// that had the same number. A directory of a live process stays: its engine
+/// can need each block in it. A name of another form is not a directory of
+/// Peruse, and it stays.
+fn remove_dirs_of_ended_engines(parent: &Path, me: u32, alive: impl Fn(u32) -> bool) {
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some((pid, n)) = name.to_str().and_then(|s| s.split_once('-')) else {
+            continue;
+        };
+        let (Ok(pid), Ok(_)) = (pid.parse::<u32>(), n.parse::<u64>()) else {
+            continue;
+        };
+        if (pid == me || !alive(pid)) && entry.path().is_dir() {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
+/// Gives `true` when a process with the number `pid` runs now.
+fn process_alive(pid: u32) -> bool {
+    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
+    let pid = Pid::from_u32(pid);
+    let mut sys = System::new();
+    sys.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&[pid]),
+        true,
+        ProcessRefreshKind::nothing(),
+    );
+    sys.process(pid).is_some()
 }
 
 /// Expands a glob pattern, or accepts a path to one file.
@@ -1727,7 +2413,8 @@ fn resolve_files(conn: &Connection, input: &str) -> Result<Vec<PathBuf>> {
 /// stop.
 pub fn database_tables(path: &Path, opts: &OpenOptions) -> Result<Vec<DbTable>> {
     let conn = Connection::open_in_memory().context("starting DuckDB")?;
-    configure(&conn, opts)?;
+    let tmp = configure(&conn, opts)?;
+    lock_down(&conn, &[path.to_path_buf()], true, &tmp)?;
     let label = path
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
@@ -1741,6 +2428,7 @@ pub fn database_tables(path: &Path, opts: &OpenOptions) -> Result<Vec<DbTable>> 
         delimiter: None,
         compressed: false,
         table: None,
+        local_copy: None,
     };
     attach_database(&conn, &src)?;
     read_tables(&conn).with_context(|| format!("reading the tables of {}", src.label))
@@ -1813,6 +2501,69 @@ fn storage_version(duck: &str) -> Option<String> {
         .take_while(|c| c.is_ascii_digit())
         .collect();
     (!digits.is_empty()).then_some(digits)
+}
+
+/// Checks the SQL of each view and each macro of the attached database, before
+/// Peruse reads any of them.
+///
+/// This is Layer B of the read-only promise. A hostile `.duckdb` file can hold
+/// a view whose query, or a macro whose body, calls a function that writes a
+/// file. DuckDB runs that SQL when Peruse reads the object. The function checks
+/// the stored text with [`crate::sql_guard`] first, so a failing object never
+/// runs. A database with such an object does not open, and the message names
+/// the object.
+///
+/// The function checks every view and macro, not only the one that the grid
+/// shows, because a statement in the SQL prompt can name any of them.
+fn check_stored_objects(conn: &Connection, label: &str) -> Result<()> {
+    let alias = quote_str(DB_ALIAS);
+    // The views. The column `sql` holds a `CREATE VIEW ... AS <query>`.
+    let sql = format!(
+        "SELECT view_name, sql FROM duckdb_views() \
+         WHERE database_name = {alias} AND NOT internal AND sql IS NOT NULL"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let mut rows = stmt.query([])?;
+    while let Some(r) = rows.next()? {
+        let name: String = r.get(0)?;
+        let text: String = r.get(1)?;
+        if let Err(e) = crate::sql_guard::ensure_view_body_read_only(&text) {
+            bail!(stored_object_message(label, "view", &name, &e));
+        }
+    }
+    drop(rows);
+    drop(stmt);
+
+    // The macros. The column `macro_definition` holds the body with no
+    // `CREATE` in front of it.
+    let sql = format!(
+        "SELECT function_name, macro_definition FROM duckdb_functions() \
+         WHERE database_name = {alias} AND macro_definition IS NOT NULL"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let mut rows = stmt.query([])?;
+    while let Some(r) = rows.next()? {
+        let name: String = r.get(0)?;
+        let text: String = r.get(1)?;
+        if let Err(e) = crate::sql_guard::ensure_macro_body_read_only(&text) {
+            bail!(stored_object_message(label, "macro", &name, &e));
+        }
+    }
+    Ok(())
+}
+
+/// Writes the message for a view or a macro that the guard refuses.
+fn stored_object_message(
+    label: &str,
+    kind: &str,
+    name: &str,
+    e: &crate::sql_guard::GuardError,
+) -> String {
+    format!(
+        "{label}: the {kind} {name:?} in this database is not read-only ({e}), \
+         so Peruse does not open the database. A viewer must not run SQL that \
+         changes the data, and a database can hide such SQL in a {kind}."
+    )
 }
 
 /// Reads the tables and the views of the attached database.
@@ -1982,6 +2733,74 @@ fn sniffed_char(v: &str) -> &str {
     if v == "(empty)" { "" } else { v }
 }
 
+/// Asks the DuckDB sniffer for the dialect and the columns of one CSV file.
+///
+/// The sniffer gets the same options as the read call. The two therefore agree
+/// about the file. The function takes the connection, because
+/// [`Engine::set_agrees`] calls it on more than one connection at a time.
+fn sniff_csv_on(
+    conn: &Connection,
+    file: &Path,
+    delimiter: Option<char>,
+    opts: &OpenOptions,
+) -> Result<CsvSniff> {
+    let mut args = vec![quote_str(&db_path(file))];
+    if let Some(d) = delimiter {
+        args.push(format!("delim = {}", delim_literal(d)));
+    }
+    if let Some(h) = opts.header {
+        args.push(format!("header = {h}"));
+    }
+    if opts.all_varchar {
+        args.push("all_varchar = true".into());
+    }
+    if opts.ignore_errors {
+        args.push("ignore_errors = true".into());
+    }
+    if let Some(n) = opts.sample_size {
+        args.push(format!("sample_size = {n}"));
+    }
+    let call = format!("sniff_csv({})", args.join(", "));
+
+    // The field `Columns` holds one structure for each column. The call to
+    // unnest makes one row for each of them, and the dialect repeats on
+    // every row. One statement therefore runs the sniffer one time.
+    let mut stmt = conn.prepare(&format!(
+        "SELECT coalesce(Delimiter, ''), coalesce(Quote, ''), coalesce(Escape, ''), \
+                coalesce(NewLineDelimiter, ''), coalesce(SkipRows, 0)::BIGINT, \
+                coalesce(HasHeader, false), coalesce(DateFormat, ''), \
+                coalesce(TimestampFormat, ''), coalesce(Prompt, ''), \
+                coalesce(Comment, ''), col.name, col.type \
+         FROM (SELECT Delimiter, Quote, Escape, NewLineDelimiter, SkipRows, HasHeader, \
+                      DateFormat, TimestampFormat, Prompt, Comment, unnest(Columns) AS col \
+               FROM {call})"
+    ))?;
+    let mut rows = stmt.query([])?;
+    let mut out: Option<CsvSniff> = None;
+    while let Some(r) = rows.next()? {
+        let sniff = match &mut out {
+            Some(s) => s,
+            None => out.insert(CsvSniff {
+                meta: CsvMeta {
+                    delimiter: r.get(0)?,
+                    quote: r.get(1)?,
+                    escape: r.get(2)?,
+                    new_line: r.get(3)?,
+                    skip_rows: r.get(4)?,
+                    has_header: r.get(5)?,
+                    date_format: r.get(6)?,
+                    timestamp_format: r.get(7)?,
+                    prompt: r.get(8)?,
+                },
+                comment: r.get(9)?,
+                columns: Vec::new(),
+            }),
+        };
+        sniff.columns.push((r.get(10)?, r.get(11)?));
+    }
+    out.ok_or_else(|| anyhow::anyhow!("the CSV sniffer found no column"))
+}
+
 /// Writes the `read_csv` call that reads the file with the dialect and the
 /// columns that the sniffer found.
 ///
@@ -2051,11 +2870,26 @@ fn pinned_json_expr(src: &Source, schema: &Schema) -> Option<String> {
         .iter()
         .map(|c| format!("{}: {}", quote_str(&c.name), quote_str(&c.sql_type)))
         .collect();
+    let format = json_format_option(src)
+        .map(|f| format!(", {f}"))
+        .unwrap_or_default();
     Some(format!(
-        "read_json({}, maximum_depth = {MAX_JSON_DEPTH}, columns = {{{}}})",
+        "read_json({}, maximum_depth = {MAX_JSON_DEPTH}{format}, columns = {{{}}})",
         file_list(&src.files),
         cols.join(", ")
     ))
+}
+
+/// Gives the option `format = 'array'` when each file of a JSON source holds a
+/// list behind a byte order mark.
+///
+/// The JSON reader of DuckDB does not see the list behind the mark, and it
+/// reads the whole file as one row. Refer to [`source::json_list_behind_bom`].
+/// A file with no mark keeps the reader that finds the form of the file itself.
+fn json_format_option(src: &Source) -> Option<&'static str> {
+    let all = !src.files.is_empty()
+        && src.files.iter().all(|f| source::json_list_behind_bom(f));
+    all.then_some("format = 'array'")
 }
 
 /// Builds the `read_parquet` call or the `read_csv` call for this source.
@@ -2108,6 +2942,9 @@ fn build_read_expr(src: &Source, opts: &OpenOptions) -> String {
             // view of a strange file, and it is much better than a program
             // that goes away.
             let mut args = vec![list, format!("maximum_depth = {MAX_JSON_DEPTH}")];
+            if let Some(f) = json_format_option(src) {
+                args.push(f.to_string());
+            }
             if let Some(n) = opts.sample_size {
                 // The reader looks at this number of rows before it decides
                 // the types. The value -1 reads the whole file.
@@ -2137,6 +2974,13 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    /// Gives the size and the time of the last change of a file, so a test can
+    /// assert that a sentinel did not change.
+    fn stat_file(p: &Path) -> (u64, std::time::SystemTime) {
+        let m = std::fs::metadata(p).unwrap();
+        (m.len(), m.modified().unwrap())
     }
 
     fn write_csv(dir: &Path, name: &str, body: &str) -> PathBuf {
@@ -2505,17 +3349,108 @@ mod tests {
     }
 
     #[test]
-    fn a_set_of_csv_files_keeps_the_read_call_that_finds_the_columns() {
-        // Two files of one set can hold different columns, and `union_by_name`
-        // reads each file with its own columns. One column list cannot serve
-        // them all.
+    fn a_set_of_csv_files_with_the_same_columns_gets_a_read_call_with_no_sniffer() {
+        // Each file of the set has the same dialect and the same columns, so one
+        // pinned call reads them all, and no statement examines the files again.
         let d = tmpdir("pin-csv-multi");
-        write_csv(&d, "a.csv", "id\n1\n2\n");
-        write_csv(&d, "b.csv", "id\n3\n");
+        write_csv(&d, "a.csv", "id,name\n1,x\n2,y\n");
+        write_csv(&d, "b.csv", "id,name\n3,z\n");
         let pattern = format!("{}/*.csv", d.to_string_lossy());
         let e = Engine::open(&pattern, &OpenOptions::default()).unwrap();
-        assert!(!e.scan_expr.contains("auto_detect = false"), "{}", e.scan_expr);
+        assert!(e.scan_expr.contains("auto_detect = false"), "{}", e.scan_expr);
+        assert!(!e.scan_expr.contains("union_by_name"), "{}", e.scan_expr);
         assert_eq!(e.count(&View::default()).unwrap(), 3);
+        let schema = e.base_schema().clone();
+        let page = e.page(&View::default(), &schema, 10, 0).unwrap();
+        let ids: Vec<&str> = (0..page.nrows).map(|r| page.cell(r, 0).unwrap()).collect();
+        assert_eq!(ids, ["1", "2", "3"]);
+        assert_eq!(page.cell(2, 1), Some("z"));
+        assert_eq!(e.file_meta().unwrap().csv.unwrap().delimiter, ",");
+    }
+
+    #[test]
+    fn a_set_of_csv_files_that_differ_keeps_the_read_call_that_finds_the_columns() {
+        // Two files of one set can hold different columns, a different order of
+        // the columns or a different type, and `union_by_name` reads each file
+        // with its own columns. One column list cannot serve them all.
+        for (tag, b) in [
+            ("names", "id,other\n3,z\n"),
+            ("order", "name,id\nz,3\n"),
+            ("types", "id,name\n3.5,z\n"),
+        ] {
+            let d = tmpdir(&format!("pin-csv-differ-{tag}"));
+            write_csv(&d, "a.csv", "id,name\n1,x\n2,y\n");
+            write_csv(&d, "b.csv", b);
+            let pattern = format!("{}/*.csv", d.to_string_lossy());
+            let e = Engine::open(&pattern, &OpenOptions::default()).unwrap();
+            assert!(!e.scan_expr.contains("auto_detect = false"), "{tag}: {}", e.scan_expr);
+            assert!(e.scan_expr.contains("union_by_name"), "{tag}: {}", e.scan_expr);
+            assert_eq!(e.count(&View::default()).unwrap(), 3, "{tag}");
+        }
+    }
+
+    #[test]
+    fn a_set_of_parquet_files_with_the_same_columns_gets_a_read_call_with_no_union() {
+        let d = tmpdir("pq-set-same");
+        let conn = Connection::open_in_memory().unwrap();
+        let files = PIN_PARQUET_FILES as u64;
+        let copies: String = (0..files)
+            .map(|i| {
+                format!(
+                    "COPY (SELECT {i} * 10 + n AS id, {{'a': n, 'b': 'x'}} AS s FROM range(10) t(n)) \
+                     TO '{}/p{i:03}.parquet' (FORMAT parquet);\n",
+                    db_path(&d)
+                )
+            })
+            .collect();
+        conn.execute_batch(&copies).unwrap();
+        let pattern = format!("{}/*.parquet", d.to_string_lossy());
+        let e = Engine::open(&pattern, &OpenOptions::default()).unwrap();
+        assert!(!e.scan_expr.contains("union_by_name"), "{}", e.scan_expr);
+        let view = View::default();
+        assert_eq!(e.count(&view).unwrap(), files * 10);
+        let schema = e.describe(&view).unwrap();
+        assert_eq!(schema.len(), 2);
+        let page = e.page(&view, &schema, 3, 19).unwrap();
+        assert_eq!(text_at(&page, 0, 0).as_deref(), Some("19"));
+        assert_eq!(text_at(&page, 1, 0).as_deref(), Some("20"));
+        assert_eq!(text_at(&page, 2, 1).as_deref(), Some("{'a': 1, 'b': x}"));
+
+        // A small set keeps the call with `union_by_name`. The comparison
+        // would cost more than it saves.
+        let small = format!("{}/p00*.parquet", d.to_string_lossy());
+        let e = Engine::open(&small, &OpenOptions::default()).unwrap();
+        assert!(e.scan_expr.contains("union_by_name"), "{}", e.scan_expr);
+        assert!(e.parquet_set_agrees());
+    }
+
+    #[test]
+    fn a_set_of_parquet_files_that_differ_keeps_the_read_call_with_the_union() {
+        // Each second file differs from the first file in one way. The plain
+        // call would read the columns of the first file only.
+        for (tag, second) in [
+            ("order", "SELECT 'y' AS name, 3 AS id"),
+            ("type", "SELECT 3.5 AS id, 'y' AS name"),
+            ("missing", "SELECT 3 AS id"),
+            ("more", "SELECT 3 AS id, 'y' AS name, true AS flag"),
+            ("nested", "SELECT 3 AS id, {'a': 1} AS name"),
+            ("name", "SELECT 3 AS ID, 'y' AS label"),
+        ] {
+            let d = tmpdir(&format!("pq-set-differ-{tag}"));
+            let conn = Connection::open_in_memory().unwrap();
+            conn.execute_batch(&format!(
+                "COPY (SELECT 1 AS id, 'x' AS name UNION ALL SELECT 2, 'z') \
+                 TO '{0}/a.parquet' (FORMAT parquet);
+                 COPY ({second}) TO '{0}/b.parquet' (FORMAT parquet);",
+                db_path(&d)
+            ))
+            .unwrap();
+            let pattern = format!("{}/*.parquet", d.to_string_lossy());
+            let e = Engine::open(&pattern, &OpenOptions::default()).unwrap();
+            assert!(!e.parquet_set_agrees(), "{tag}");
+            assert!(e.scan_expr.contains("union_by_name"), "{tag}: {}", e.scan_expr);
+            assert_eq!(e.count(&View::default()).unwrap(), 3, "{tag}");
+        }
     }
 
     #[test]
@@ -2540,9 +3475,7 @@ mod tests {
     #[test]
     fn the_pinned_read_call_keeps_a_delimiter_that_the_sniffer_found() {
         // The extension `.dat` names no delimiter, so the sniffer finds the
-        // semicolon. The pinned call must carry what the sniffer found. A file
-        // with the extension `.csv` always uses a comma, and it would not test
-        // this path.
+        // semicolon. The pinned call must carry what the sniffer found.
         let d = tmpdir("pin-semicolon");
         let p = write_csv(&d, "s.dat", "a;b;c\n1;two;3.5\n4;five;6.5\n");
         let e = Engine::open(p.to_str().unwrap(), &OpenOptions::default()).unwrap();
@@ -2633,6 +3566,54 @@ mod tests {
         ))
         .unwrap();
         p
+    }
+
+    #[test]
+    fn a_sorted_window_and_a_deep_filtered_window_read_the_correct_rows() {
+        // The engine lets DuckDB read a page of the grid in two steps: the sort
+        // column or the filter column first, and the other columns of the page
+        // rows after that. The rows and their order must not change.
+        let d = tmpdir("late-materialization");
+        let p = write_parquet(&d, "t.parquet", 20_000);
+        let e = Engine::open(p.to_str().unwrap(), &OpenOptions::default()).unwrap();
+        assert_eq!(
+            e.current_setting("late_materialization_max_rows").as_deref(),
+            Some(LATE_MATERIALIZATION_ROWS.to_string().as_str())
+        );
+        let schema = e.base_schema().clone();
+        let ids = |page: &RowPage| -> Vec<(u64, String)> {
+            (0..page.nrows)
+                .map(|r| {
+                    (
+                        page.cell(r, 0).unwrap().parse().unwrap(),
+                        page.cell(r, 1).unwrap().to_string(),
+                    )
+                })
+                .collect()
+        };
+
+        let sorted = View {
+            sort: vec![crate::query::SortKey {
+                column: "id".into(),
+                dir: crate::query::SortDir::Desc,
+            }],
+            ..Default::default()
+        };
+        let got = ids(&e.page(&sorted, &schema, 600, 100).unwrap());
+        let want: Vec<(u64, String)> =
+            (0..600).map(|k| 19_899 - k).map(|i| (i, format!("name {i}"))).collect();
+        assert_eq!(got, want, "a sorted window of 600 rows");
+
+        let filtered = View {
+            filter: Some("id % 7 = 3".into()),
+            ..Default::default()
+        };
+        let got = ids(&e.page(&filtered, &schema, 600, 1500).unwrap());
+        let want: Vec<(u64, String)> = (1500..2100)
+            .map(|k| k * 7 + 3)
+            .map(|i| (i, format!("name {i}")))
+            .collect();
+        assert_eq!(got, want, "a window deep in a filtered view");
     }
 
     #[test]
@@ -3144,6 +4125,129 @@ mod tests {
     }
 
     #[test]
+    fn a_deep_file_in_a_set_of_json_files_is_refused_and_does_not_crash() {
+        // The reader of DuckDB examines each file of a set. Before this test,
+        // the open checked the first file only, and a deep second file filled
+        // the stack and stopped the whole program with no message.
+        let d = tmpdir("deep-set");
+        write_csv(&d, "a.json", "[{\"a\": 1}]");
+        let deep = format!("[{}1{}]", "{\"a\":".repeat(100_000), "}".repeat(100_000));
+        write_csv(&d, "b.json", &deep);
+        let glob = format!("{}/*.json", d.to_string_lossy());
+        let err = Engine::open(&glob, &OpenOptions::default()).err().expect("the deep set opened");
+        let msg = err.to_string();
+        assert!(msg.contains("b.json") && msg.contains("nests deeper"), "{msg}");
+    }
+
+    #[test]
+    fn a_deep_compressed_json_file_is_refused_and_does_not_crash() {
+        // The depth test read the bytes of the file, and the bytes of a
+        // compressed file are not JSON. Before this test, a file of 77 bytes
+        // with 3000 levels filled the stack and stopped the whole program.
+        let d = tmpdir("deep-gz");
+        let conn = Connection::open_in_memory().unwrap();
+        let write = |name: &str, levels: usize| {
+            let p = db_path(&d.join(name));
+            conn.execute_batch(&format!(
+                "COPY (SELECT (repeat('{{\"a\":', {levels}) || '1' || repeat('}}', {levels}))::JSON AS j \
+                 FROM range(3)) TO {} (FORMAT json, COMPRESSION gzip)",
+                quote_str(&p)
+            ))
+            .unwrap();
+            p
+        };
+        let deep = write("deep.ndjson.gz", 3000);
+        let err = Engine::open(&deep, &OpenOptions::default()).err().expect("the deep file opened");
+        assert!(err.to_string().contains("nests deeper"), "{err}");
+
+        // A compressed file of usual depth still opens, and a deep file in a
+        // set of them is still found.
+        let flat = write("flat.ndjson.gz", 20);
+        let e = Engine::open(&flat, &OpenOptions::default()).unwrap();
+        assert_eq!(e.count(&View::default()).unwrap(), 3);
+        let glob = format!("{}/*.ndjson.gz", db_path(&d));
+        let err = Engine::open(&glob, &OpenOptions::default()).err().expect("the deep set opened");
+        assert!(err.to_string().contains("deep.ndjson.gz"), "{err}");
+    }
+
+    #[test]
+    fn the_blocks_of_a_process_that_stopped_are_removed() {
+        // A kill during a large sort left 1.5 GB below the temporary
+        // directory, and nothing removed it.
+        let d = tmpdir("temp-left");
+        for name in ["100-0", "100-1", "200-0", "300-2", "notes", "7-x"] {
+            std::fs::create_dir_all(d.join(name)).unwrap();
+            std::fs::write(d.join(name).join("duckdb_temp_storage_S256K-0.tmp"), "b").unwrap();
+        }
+        std::fs::write(d.join("400-0"), "a file and not a directory").unwrap();
+        // The process 200 is alive. This process is 300.
+        remove_dirs_of_ended_engines(&d, 300, |pid| pid == 200);
+        let mut left: Vec<String> = std::fs::read_dir(&d)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(left, ["200-0", "400-0", "7-x", "notes"]);
+
+        assert!(process_alive(std::process::id()), "this process is alive");
+    }
+
+    #[test]
+    fn two_engines_do_not_share_a_temporary_directory() {
+        // Each DuckDB names its temporary files with a counter that starts at
+        // zero, such as `duckdb_temp_storage_S256K-0.tmp`. Two engines that
+        // share one directory therefore write into the same file, and each one
+        // reads the blocks of the other. When one of them closes, it also
+        // deletes each `duckdb_temp_` file in the directory, and the other
+        // engine loses its data.
+        //
+        // The test makes both engines write to the disk, and then checks that
+        // each one reads back its own rows.
+        let d = tmpdir("temp-share");
+        let p = write_csv(&d, "s.csv", SAMPLE);
+        let opts = OpenOptions {
+            memory_limit: Some("64MB".into()),
+            threads: Some(2),
+            ..Default::default()
+        };
+        let a = Engine::open(p.to_str().unwrap(), &opts).unwrap();
+        let b = Engine::open(p.to_str().unwrap(), &opts).unwrap();
+        let dir = |e: &Engine| e.current_setting("temp_directory").unwrap();
+
+        // About 250 MB for each engine, with a limit of 64 MB: most of each
+        // table goes to the disk.
+        let fill = |e: &Engine, add: i64| {
+            e.conn
+                .execute_batch(&format!(
+                    "CREATE TABLE big AS SELECT range + {add} AS i, \
+                     repeat(md5((range + {add})::VARCHAR), 4) AS h FROM range(1500000)"
+                ))
+                .unwrap();
+        };
+        fill(&a, 0);
+        fill(&b, 10_000_000);
+        let sums = |e: &Engine| -> (i64, i64) {
+            e.conn
+                .query_row(
+                    "SELECT sum(i)::BIGINT, \
+                     count(*) FILTER (WHERE h <> repeat(md5(i::VARCHAR), 4))::BIGINT FROM big",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap()
+        };
+        let base: i64 = (0..1_500_000i64).sum();
+        assert_eq!(sums(&a), (base, 0), "the first engine read wrong rows");
+        assert_eq!(sums(&b), (base + 10_000_000 * 1_500_000, 0), "the second engine read wrong rows");
+
+        assert_ne!(dir(&a), dir(&b), "two engines share one temporary directory");
+
+        // The first engine closes. The second engine must keep its data.
+        drop(a);
+        assert_eq!(sums(&b), (base + 10_000_000 * 1_500_000, 0), "the close of one engine broke the other");
+    }
+
+    #[test]
     fn the_engine_does_not_download_an_extension() {
         // The read-only promise depends on this test.
         //
@@ -3178,9 +4282,11 @@ mod tests {
             ..Default::default()
         };
         let err = e.describe(&view).unwrap_err().to_string();
+        // The lock of `lock_down` refuses the path before DuckDB looks for an
+        // extension. Either refusal keeps the engine off the network.
         assert!(
-            err.contains("Extension") || err.contains("extension"),
-            "expected a missing extension error, got: {err}"
+            err.contains("Extension") || err.contains("extension") || err.contains("reads only"),
+            "expected a refusal, got: {err}"
         );
         assert!(
             !err.contains("HTTP"),
@@ -3275,6 +4381,163 @@ mod tests {
         // The alias is in the text that the panel shows, so the user can read
         // it there.
         assert!(e.read_expr().contains("__peruse_db"), "{}", e.read_expr());
+    }
+
+    #[test]
+    fn a_database_with_a_view_that_writes_does_not_open() {
+        // Gap 1, Layer B. A `.duckdb` file holds a view whose query calls a
+        // function that writes a file. Peruse must refuse the database before
+        // it reads the view, name the view, and never run its SQL. The
+        // sentinel beside the database must stay byte-for-byte the same.
+        let d = tmpdir("db-view-writes");
+        let sentinel = d.join("sentinel.txt");
+        std::fs::write(&sentinel, "keep me").unwrap();
+        let before = stat_file(&sentinel);
+        let out = db_path(&d.join("stolen.log"));
+        let p = write_db(
+            &d,
+            "evil.duckdb",
+            &format!(
+                "CREATE TABLE t AS SELECT 1 AS a;\n\
+                 CREATE VIEW v AS SELECT * FROM enable_logging(storage := 'file', \
+                 storage_path := '{out}');"
+            ),
+        );
+        // The view is named in the message, and the database does not open,
+        // whichever table the user asks for.
+        for opts in [OpenOptions::default(), with_table("t"), with_table("v")] {
+            let err = Engine::open(p.to_str().unwrap(), &opts)
+                .err()
+                .map(|e| format!("{e:#}"))
+                .expect("the database with a writing view opened");
+            assert!(err.contains("\"v\""), "{err}");
+            assert!(err.contains("not read-only"), "{err}");
+            assert!(err.contains("enable_logging"), "{err}");
+        }
+        assert!(!d.join("stolen.log").exists(), "the view wrote a file");
+        assert_eq!(stat_file(&sentinel), before, "the sentinel changed");
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"keep me");
+    }
+
+    #[test]
+    fn a_database_with_a_normal_view_still_opens() {
+        // Layer B must not refuse an ordinary view. A view that reads is the
+        // usual case, and the read-only test corpus keeps working.
+        let d = tmpdir("db-view-ok");
+        let p = write_db(
+            &d,
+            "shop.duckdb",
+            "CREATE TABLE t AS SELECT i AS a FROM range(3) t(i);\n\
+             CREATE VIEW v AS SELECT a, a * 2 AS b FROM t WHERE a > 0;\n\
+             CREATE MACRO plus(x) AS x + 1;",
+        );
+        let e = Engine::open(p.to_str().unwrap(), &with_table("v")).unwrap();
+        assert_eq!(e.count(&View::default()).unwrap(), 2);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_local_file_cannot_be_written_while_peruse_reads_it() {
+        // Layer D, Windows. While the engine is open on a local file, the
+        // handle that it holds must stop another program from writing the file
+        // or deleting it. When the engine closes, the write must work again.
+        use std::os::windows::fs::OpenOptionsExt;
+        let d = tmpdir("lock-in-place");
+        let p = write_csv(&d, "s.csv", SAMPLE);
+        let engine = Engine::open(p.to_str().unwrap(), &OpenOptions::default()).unwrap();
+        assert!(!engine.locks.is_empty(), "a local file is locked");
+        // A write to the file now fails, because the share mode of the lock
+        // denies write access to another handle.
+        let write_now = std::fs::OpenOptions::new().write(true).open(&p);
+        assert!(write_now.is_err(), "the file was writable while Peruse read it");
+        // DuckDB opened and read the file with the lock held.
+        assert_eq!(engine.count(&View::default()).unwrap(), 3);
+        drop(engine);
+        // With the engine closed, the file is writable again.
+        let mut w = std::fs::OpenOptions::new()
+            .write(true)
+            .share_mode(1)
+            .open(&p)
+            .expect("the lock did not release at the end of the session");
+        use std::io::Write as _;
+        w.write_all(b"x").unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_file_on_a_network_drive_is_never_locked() {
+        // The lock must never fall on a file on a network drive, or a coworker
+        // could not write it. The test uses a probe that calls one local
+        // directory a network drive.
+        struct Remote(PathBuf);
+        impl crate::remote::Probe for Remote {
+            fn is_remote(&self, path: &Path) -> bool {
+                let full =
+                    |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+                full(path).starts_with(full(&self.0))
+            }
+            fn free_bytes(&self, _dir: &Path) -> Option<u64> {
+                None
+            }
+        }
+        let d = tmpdir("lock-remote");
+        let p = write_csv(&d, "s.csv", SAMPLE);
+        let locks = read_only_locks(std::slice::from_ref(&p), false, &Remote(d.clone()));
+        assert!(locks.is_empty(), "a network file must not be locked");
+        // With no lock, another program can write the file.
+        assert!(std::fs::OpenOptions::new().write(true).open(&p).is_ok());
+    }
+
+    #[test]
+    fn the_lock_stops_a_write_to_a_file_outside_the_source() {
+        // Layer C, the backstop for gap 1. A statement that reaches the
+        // connection, past the guard, must still not write a file. This test
+        // goes around the guard and runs a `COPY ... TO` straight on the
+        // connection, in the same way as `the_read_only_flag_stops_a_write`.
+        // The lock must refuse the write, and the sentinel file beside the
+        // source must stay byte-for-byte the same, with the same time.
+        let d = tmpdir("lock-copy-out");
+        let p = write_csv(&d, "s.csv", SAMPLE);
+        let sentinel = d.join("sentinel.txt");
+        std::fs::write(&sentinel, "keep me").unwrap();
+        let before = stat_file(&sentinel);
+
+        let e = Engine::open(p.to_str().unwrap(), &OpenOptions::default()).unwrap();
+        for target in ["out.csv", "sentinel.txt"] {
+            let out = db_path(&d.join(target));
+            let err = e
+                .conn
+                .execute_batch(&format!("COPY (SELECT 1 AS a) TO '{out}' (FORMAT CSV)"))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.to_lowercase().contains("disabled by configuration")
+                    || err.to_lowercase().contains("cannot access"),
+                "COPY to {target} gave {err}"
+            );
+        }
+        assert!(!d.join("out.csv").exists(), "the engine wrote out.csv");
+        // The sentinel is byte-for-byte the same, with the same time.
+        assert_eq!(stat_file(&sentinel), before, "the sentinel changed");
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"keep me");
+    }
+
+    #[test]
+    fn a_query_that_reads_a_file_the_user_did_not_open_gets_a_clear_message() {
+        // Layer C changes what `-q` can do: a query can no longer read a file
+        // that the user did not open. The owner accepted that, so the message
+        // must say what Peruse allows and how to read the second file.
+        let d = tmpdir("q-other-file");
+        let p = write_csv(&d, "a.csv", SAMPLE);
+        let other = db_path(&write_csv(&d, "b.csv", SAMPLE));
+        let e = Engine::open(p.to_str().unwrap(), &OpenOptions::default()).unwrap();
+        let view = View {
+            base: crate::query::Base::Sql(format!("SELECT * FROM read_csv('{other}')")),
+            ..Default::default()
+        };
+        let err = e.describe(&view).unwrap_err().to_string();
+        assert!(err.contains("reads only"), "{err}");
+        assert!(err.contains("open it with"), "{err}");
     }
 
     #[test]
@@ -3740,5 +5003,497 @@ mod tests {
         assert_eq!(page.cell(0, 0), Some("[1, 2, 3]"));
         assert_eq!(page.cell(0, 1), Some("{'k': v}"));
     }
-}
 
+    // ---------------------------------------------- faults that a review found
+
+    /// Gives the cell `(row, col)` of a page as an owned text.
+    fn text_at(page: &RowPage, row: usize, col: usize) -> Option<String> {
+        page.cell(row, col).map(str::to_string)
+    }
+
+    #[test]
+    fn a_file_whose_name_holds_a_bracket_opens() {
+        // A bracket makes the name look like a glob, so the engine gives the
+        // name to the glob of DuckDB. That glob finds a file of the exact name
+        // too, and the open depends on it.
+        let d = tmpdir("bracket-name");
+        let p = write_csv(&d, "export[1].csv", "a\n1\n2\n");
+        let e = Engine::open(p.to_str().unwrap(), &OpenOptions::default()).unwrap();
+        assert_eq!(e.source.files.len(), 1);
+        assert_eq!(e.count(&View::default()).unwrap(), 2);
+    }
+
+    #[test]
+    fn a_verbatim_path_on_windows_opens() {
+        // The file chooser goes into a directory with `canonicalize`, and on
+        // Windows that gives a path that starts with `\\?\`. The `?` makes the
+        // path look like a glob, and the engine changes its separators. DuckDB
+        // still opens the file, and each file that the user chooses in a
+        // directory of the chooser depends on that.
+        if !cfg!(windows) {
+            return;
+        }
+        let d = tmpdir("verbatim");
+        let p = write_csv(&d, "t.csv", "a,b\n1,x\n");
+        let full = std::fs::canonicalize(&p).unwrap();
+        assert!(full.to_string_lossy().starts_with(r"\\?\"), "{full:?}");
+        let e = Engine::open(full.to_str().unwrap(), &OpenOptions::default()).unwrap();
+        assert_eq!(e.count(&View::default()).unwrap(), 1);
+        let rows = all_cells(&e);
+        assert_eq!(rows[0][1].as_deref(), Some("x"));
+    }
+
+    #[test]
+    fn a_csv_file_with_semicolons_gets_its_columns() {
+        // A spreadsheet program in a country that writes a decimal comma saves
+        // a `.csv` file with a semicolon between the values. The extension
+        // forced a comma, and each such file showed as one column.
+        let d = tmpdir("semicolon-csv");
+        let p = write_csv(&d, "export.csv", "id;name;amount\n1;alice;10,5\n2;bob;20,25\n");
+        let e = Engine::open(p.to_str().unwrap(), &OpenOptions::default()).unwrap();
+        let schema = e.describe(&View::default()).unwrap();
+        let names: Vec<&str> = schema.columns.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["id", "name", "amount"]);
+        assert_eq!(all_cells(&e)[1][1].as_deref(), Some("bob"));
+
+        // A plain file with commas still gets the comma.
+        let p = write_csv(&d, "plain.csv", SAMPLE);
+        let e = Engine::open(p.to_str().unwrap(), &OpenOptions::default()).unwrap();
+        assert_eq!(e.describe(&View::default()).unwrap().len(), 4);
+        // The option of the user still wins over the sniffer.
+        let opts = OpenOptions {
+            delimiter: Some(';'),
+            ..Default::default()
+        };
+        let e = Engine::open(p.to_str().unwrap(), &opts).unwrap();
+        assert_eq!(e.describe(&View::default()).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn the_footer_of_a_set_does_not_answer_for_a_column_that_one_file_lacks() {
+        // `union_by_name` fills the rows of a file that has no column `extra`
+        // with NULL. The footer of that file counts none of those NULL values,
+        // so the footer said that the column held no NULL at all.
+        let d = tmpdir("footer-set");
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(&format!(
+            "COPY (SELECT i AS id, 'x' AS extra FROM range(10) t(i)) TO '{}' (FORMAT parquet);\
+             COPY (SELECT i AS id FROM range(10) t(i)) TO '{}' (FORMAT parquet);",
+            db_path(&d.join("a.parquet")),
+            db_path(&d.join("b.parquet"))
+        ))
+        .unwrap();
+        let pattern = format!("{}/*.parquet", db_path(&d));
+        let e = Engine::open(&pattern, &OpenOptions::default()).unwrap();
+        let schema = e.describe(&View::default()).unwrap();
+        let meta = e.file_meta().unwrap();
+        let scanned = e.column_band(&View::default(), &schema.columns, false).unwrap();
+        let extra = scanned.iter().find(|b| b.column == "extra").unwrap();
+        assert_eq!(extra.null_count(), 10, "the scan is the truth");
+        if let Some(footer) = footer_briefs(&meta, &schema.columns) {
+            for (f, s) in footer.iter().zip(&scanned) {
+                assert_eq!(f.n_present, s.n_present, "column {}", f.column);
+            }
+        }
+
+        // A set of files with the same columns still gets its answer from the
+        // footer. The engine holds a read-only handle on each file while it is
+        // open (Layer D), so close it before the file is replaced, as Peruse
+        // does when the user opens another source.
+        drop(e);
+        std::fs::remove_file(d.join("a.parquet")).unwrap();
+        conn.execute_batch(&format!(
+            "COPY (SELECT i AS id FROM range(5) t(i)) TO '{}' (FORMAT parquet);",
+            db_path(&d.join("a.parquet"))
+        ))
+        .unwrap();
+        let e = Engine::open(&pattern, &OpenOptions::default()).unwrap();
+        let schema = e.describe(&View::default()).unwrap();
+        let meta = e.file_meta().unwrap();
+        let footer = footer_briefs(&meta, &schema.columns).expect("the footer answers");
+        assert_eq!(footer[0].n_total, 15);
+        assert_eq!(footer[0].null_count(), 0);
+    }
+
+    /// Reads each page of a sorted view over the column `k`, and gives the
+    /// column `id` of each row in the order of the pages.
+    fn sorted_ids(e: &Engine, rows: u64) -> Vec<i64> {
+        let view = View {
+            sort: vec![crate::query::SortKey {
+                column: "k".into(),
+                dir: crate::query::SortDir::Asc,
+            }],
+            ..Default::default()
+        };
+        let schema = e.describe(&view).unwrap();
+        let mut out = Vec::new();
+        for n in 0..rows.div_ceil(700) {
+            let page = e.page(&view, &schema, 700, n * 700).unwrap();
+            for r in 0..page.nrows {
+                out.push(page.cell(r, 0).unwrap().parse().unwrap());
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn each_kind_of_source_sorts_its_ties_in_the_order_of_the_file() {
+        // The sort ends with the position of the row in the file, where the
+        // metadata gives it: the row number of a Parquet file and of a set of
+        // them, and the row id of a table and of the index of a file of text.
+        // A file of text with no index ends its sort with each column. Each of
+        // them must give each row on one page only, and here the rows of one
+        // value in the order of the file.
+        let rows = 20_000u64;
+        let want: Vec<i64> = (0..3)
+            .flat_map(|k| (0..rows as i64).filter(move |i| i % 3 == k))
+            .collect();
+        let d = tmpdir("sort-ties-each-source");
+        let conn = Connection::open_in_memory().unwrap();
+        let body = format!("SELECT i AS id, i % 3 AS k FROM range({rows}) t(i)");
+        let half = rows / 2;
+        conn.execute_batch(&format!(
+            "COPY ({body}) TO '{0}/t.parquet' (FORMAT parquet, ROW_GROUP_SIZE 1000);
+             COPY ({body} WHERE i < {half}) TO '{0}/set-0.parquet' (FORMAT parquet, ROW_GROUP_SIZE 1000);
+             COPY ({body} WHERE i >= {half}) TO '{0}/set-1.parquet' (FORMAT parquet, ROW_GROUP_SIZE 1000);
+             COPY ({body}) TO '{0}/t.csv' (FORMAT csv, HEADER);
+             ATTACH '{0}/t.duckdb' AS out;
+             CREATE TABLE out.t AS {body};
+             DETACH out;",
+            db_path(&d)
+        ))
+        .unwrap();
+        let opts = OpenOptions {
+            threads: Some(4),
+            ..Default::default()
+        };
+        for name in ["t.parquet", "set-*.parquet", "t.csv", "t.duckdb"] {
+            let path = format!("{}/{name}", db_path(&d));
+            let mut e = Engine::open(&path, &opts).unwrap();
+            // The open operation does not pay for the view. The first sort does.
+            let views = |e: &Engine| -> i64 {
+                e.conn
+                    .query_row(
+                        &format!(
+                            "SELECT count(*) FROM duckdb_views() WHERE view_name = '{ORDER_VIEW}'"
+                        ),
+                        [],
+                        |r| r.get(0),
+                    )
+                    .unwrap()
+            };
+            assert_eq!(views(&e), 0, "{name}");
+            assert_eq!(sorted_ids(&e, rows), want, "{name}");
+            assert_eq!(e.ordered(), name != "t.csv", "{name}");
+            assert_eq!(views(&e), i64::from(name != "t.csv"), "{name}");
+            if !e.is_seekable() {
+                e.materialize().unwrap();
+                assert!(e.ordered(), "{name} with its index");
+                assert_eq!(sorted_ids(&e, rows), want, "{name} with its index");
+            }
+        }
+    }
+
+    #[test]
+    fn a_column_with_the_name_of_the_position_does_not_give_the_position() {
+        // A column of the file with the name `file_row_number` or `rowid` hides
+        // the value of DuckDB with that name. Its values can repeat, so the
+        // sort must then end with each column.
+        let rows = 3_000u64;
+        let want: Vec<i64> = (0..3)
+            .flat_map(|k| (0..rows as i64).filter(move |i| i % 3 == k))
+            .collect();
+        let d = tmpdir("sort-position-name");
+        let conn = Connection::open_in_memory().unwrap();
+        let body = |extra: &str| {
+            format!("SELECT i AS id, i % 3 AS k, 0 AS {extra} FROM range({rows}) t(i)")
+        };
+        conn.execute_batch(&format!(
+            "COPY ({1}) TO '{0}/t.parquet' (FORMAT parquet, ROW_GROUP_SIZE 500);
+             COPY ({2}) TO '{0}/t.csv' (FORMAT csv, HEADER);
+             COPY ({3}) TO '{0}/u.csv' (FORMAT csv, HEADER);",
+            db_path(&d),
+            body("File_Row_Number"),
+            body("rowid"),
+            body("__peruse_row_order"),
+        ))
+        .unwrap();
+        for name in ["t.parquet", "t.csv", "u.csv"] {
+            let path = format!("{}/{name}", db_path(&d));
+            let mut e = Engine::open(&path, &OpenOptions::default()).unwrap();
+            e.materialize().unwrap();
+            assert!(!e.ordered(), "{name}");
+            assert_eq!(sorted_ids(&e, rows), want, "{name}");
+        }
+    }
+
+    #[test]
+    fn a_column_named_id_keeps_the_position_of_a_table() {
+        // The name `id` is a part of the name `rowid`, and that must not count.
+        let d = tmpdir("sort-position-id");
+        let p = write_csv(&d, "t.csv", "id,k
+1,2
+2,1
+");
+        let mut e = Engine::open(p.to_str().unwrap(), &OpenOptions::default()).unwrap();
+        e.materialize().unwrap();
+        assert!(e.ordered());
+        assert_eq!(sorted_ids(&e, 2), vec![2, 1]);
+    }
+
+    #[test]
+    fn a_deep_sorted_window_reads_the_same_rows_through_the_table_of_positions() {
+        // Past `SORT_TABLE_ROWS`, a sorted window reads the positions of the
+        // rows from a table in the order of the view. Each window must hold
+        // the rows that the sort itself gives, in the same order: here the
+        // order of `k`, then of `j` where a second key applies, then of the
+        // file.
+        let rows: i64 = 150_000;
+        let d = tmpdir("sort-table");
+        let p = d.join("t.parquet");
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(&format!(
+            "COPY (SELECT i AS id, CASE WHEN i % 11 = 0 THEN NULL ELSE i % 7 END AS k, i % 5 AS j \
+             FROM range({rows}) t(i)) TO '{}' (FORMAT parquet, ROW_GROUP_SIZE 10000);",
+            db_path(&p)
+        ))
+        .unwrap();
+        let opts = OpenOptions {
+            threads: Some(4),
+            ..Default::default()
+        };
+        let e = Engine::open(p.to_str().unwrap(), &opts).unwrap();
+        let key = |column: &str, dir| crate::query::SortKey {
+            column: column.into(),
+            dir,
+        };
+        use crate::query::SortDir::{Asc, Desc};
+        // The value of `k` for a sort: DuckDB puts NULL last in each direction.
+        let k = |i: i64| if i % 11 == 0 { None } else { Some(i % 7) };
+        let cases: Vec<(View, Vec<i64>)> = vec![
+            (
+                View {
+                    sort: vec![key("k", Asc)],
+                    ..Default::default()
+                },
+                {
+                    let mut ids: Vec<i64> = (0..rows).collect();
+                    ids.sort_by_key(|&i| (k(i).is_none(), k(i), i));
+                    ids
+                },
+            ),
+            (
+                View {
+                    sort: vec![key("k", Desc), key("j", Asc)],
+                    filter: Some("id % 3 <> 0".into()),
+                    ..Default::default()
+                },
+                {
+                    let mut ids: Vec<i64> = (0..rows).filter(|i| i % 3 != 0).collect();
+                    ids.sort_by_key(|&i| (k(i).is_none(), std::cmp::Reverse(k(i)), i % 5, i));
+                    ids
+                },
+            ),
+        ];
+        for (view, want) in &cases {
+            let schema = e.describe(view).unwrap();
+            let n = want.len() as u64;
+            let held = || {
+                let key = view.select(&quote_ident(ORDER_COLUMN));
+                e.sort_table.lock().unwrap().as_deref() == Some(key.as_str())
+            };
+            // A shallow window of a new view does not fill the table.
+            let _ = e.page(view, &schema, 50, 0).unwrap();
+            assert!(!held(), "{view:?}");
+            for offset in [n - 40, 0, 99_990, SORT_TABLE_ROWS - 3, 5, n / 2, n - 1] {
+                let page = e.page(view, &schema, 700, offset).unwrap();
+                let got: Vec<i64> = (0..page.nrows)
+                    .map(|r| page.cell(r, 0).unwrap().parse().unwrap())
+                    .collect();
+                let end = (offset as usize + 700).min(want.len());
+                assert_eq!(got, want[offset as usize..end], "{view:?} at {offset}");
+                // The first window is deep, so each window reads the table.
+                assert!(held(), "{view:?} at {offset}");
+            }
+            // The cell inspector and the record view read the same rows.
+            let deep = n - 7;
+            let id = want[deep as usize];
+            assert_eq!(e.cell(view, "id", deep).unwrap(), Some(id.to_string()));
+            let json = e.row_json(view, &schema, deep).unwrap().unwrap();
+            assert!(json.contains(&format!("\"id\":{id},")), "{json}");
+        }
+        // The last view filled the table, and the first view fills it again.
+        let (view, want) = &cases[0];
+        let schema = e.describe(view).unwrap();
+        let page = e.page(view, &schema, 3, 140_000).unwrap();
+        assert_eq!(text_at(&page, 0, 0), Some(want[140_000].to_string()));
+    }
+
+    #[test]
+    fn a_sorted_view_gives_each_row_on_one_page_only() {
+        // The sort of DuckDB is not stable. On a column with repeated values,
+        // each page statement put the rows of one value in its own order, so
+        // a row came on two pages and another row on none. The same page also
+        // changed from one read to the next.
+        let d = tmpdir("sort-ties");
+        let p = d.join("t.parquet");
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(&format!(
+            "COPY (SELECT i AS id, i % 3 AS k FROM range(100000) t(i)) TO '{}' \
+             (FORMAT parquet, ROW_GROUP_SIZE 5000);",
+            db_path(&p)
+        ))
+        .unwrap();
+        let opts = OpenOptions {
+            threads: Some(4),
+            ..Default::default()
+        };
+        let e = Engine::open(p.to_str().unwrap(), &opts).unwrap();
+        let view = View {
+            sort: vec![crate::query::SortKey {
+                column: "k".into(),
+                dir: crate::query::SortDir::Asc,
+            }],
+            ..Default::default()
+        };
+        let schema = e.describe(&view).unwrap();
+        let mut seen = std::collections::HashSet::new();
+        for n in 0..60u64 {
+            let page = e.page(&view, &schema, 50, 20_000 + n * 50).unwrap();
+            assert_eq!(page.nrows, 50);
+            for r in 0..page.nrows {
+                let id = text_at(&page, r, 0).unwrap();
+                assert!(seen.insert(id.clone()), "row {id} came on two pages");
+            }
+        }
+        // The rows of one value come in the order of the other values, which
+        // is the order of the file here.
+        let page = e.page(&view, &schema, 3, 0).unwrap();
+        assert_eq!(text_at(&page, 0, 0).as_deref(), Some("0"));
+        assert_eq!(text_at(&page, 2, 0).as_deref(), Some("6"));
+
+        // The cell inspector, the record view and the search read the same
+        // order.
+        assert_eq!(e.cell(&view, "id", 2).unwrap().as_deref(), Some("6"));
+        let json = e.row_json(&view, &schema, 2).unwrap().unwrap();
+        assert!(json.contains("\"id\":6"), "{json}");
+        let hits = e.search(&view, &schema, "99999", 0, 100_000, 10).unwrap();
+        let page = e.page(&view, &schema, 1, hits[0]).unwrap();
+        assert_eq!(text_at(&page, 0, 0).as_deref(), Some("99999"));
+    }
+
+    #[test]
+    fn a_column_of_uuid_values_has_a_record_view_and_a_search() {
+        // The grid shows a UUID, a BIGNUM and an ENUM as text, and the
+        // statements for the record view and the search used the column as
+        // VARCHAR. `substr` and `lower` read VARCHAR only, so each of the two
+        // failed for the whole row, and the search failed for the whole file.
+        let d = tmpdir("uuid");
+        let p = d.join("t.parquet");
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(&format!(
+            "COPY (SELECT 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::UUID AS id, 'x' AS name) \
+             TO '{}' (FORMAT parquet);",
+            db_path(&p)
+        ))
+        .unwrap();
+        let e = Engine::open(p.to_str().unwrap(), &OpenOptions::default()).unwrap();
+        let view = View::default();
+        let schema = e.describe(&view).unwrap();
+        assert_eq!(schema.columns[0].sql_type, "UUID");
+        let json = e.row_json(&view, &schema, 0).unwrap().unwrap();
+        assert!(json.contains("a0eebc99"), "{json}");
+        assert_eq!(e.search(&view, &schema, "6BB9", 0, 10, 10).unwrap(), vec![0]);
+
+        for sql in [
+            "SELECT 12345678901234567890123::BIGNUM AS b",
+            "SELECT 'ok'::ENUM('ok', 'no') AS e",
+        ] {
+            let view = View {
+                base: crate::query::Base::Sql(sql.into()),
+                ..Default::default()
+            };
+            let schema = e.describe(&view).unwrap();
+            assert!(e.row_json(&view, &schema, 0).unwrap().is_some(), "{sql}");
+            assert!(e.search(&view, &schema, "zz", 0, 10, 10).is_ok(), "{sql}");
+        }
+    }
+
+    #[test]
+    fn the_statistics_of_a_column_with_nan_or_a_huge_integer_arrive() {
+        // A writer such as pandas stores a missing floating-point value as
+        // NaN. One NaN made `stddev_samp` fail with "out of range", and the
+        // column inspector showed no statistics at all. A HUGEINT column with
+        // large values made `avg` fail with an overflow in the same way.
+        let d = tmpdir("stats-nan");
+        let p = write_csv(&d, "t.csv", "a\n1\n");
+        let e = Engine::open(p.to_str().unwrap(), &OpenOptions::default()).unwrap();
+        let view = View {
+            base: crate::query::Base::Sql(
+                "SELECT * FROM (VALUES \
+                 (1.0::DOUBLE, 170141183460469231731687303715884105727::HUGEINT), \
+                 ('nan'::DOUBLE, 170141183460469231731687303715884105727::HUGEINT), \
+                 (3.0::DOUBLE, 170141183460469231731687303715884105727::HUGEINT)) v(x, h)"
+                    .into(),
+            ),
+            ..Default::default()
+        };
+        let schema = e.describe(&view).unwrap();
+        let x = e.column_stats(&view, &schema.columns[0], 5).unwrap();
+        assert_eq!(x.n_present, 3);
+        assert_eq!(x.min.as_deref(), Some("1.0"));
+        // The deviation leaves the NaN out, and the mean keeps it.
+        let std: f64 = x.std.as_deref().unwrap().parse().unwrap();
+        assert!((std - 2f64.sqrt()).abs() < 1e-9, "{std}");
+        assert_eq!(x.avg.as_deref(), Some("nan"));
+
+        let h = e.column_stats(&view, &schema.columns[1], 5).unwrap();
+        assert_eq!(h.n_present, 3);
+        assert!(h.avg.is_some());
+    }
+
+    #[test]
+    fn a_json_list_behind_a_byte_order_mark_gives_one_row_for_each_object() {
+        // PowerShell 5 writes a byte order mark in front of each UTF-8 file.
+        // The JSON reader of DuckDB then does not see the list, and it read the
+        // whole file as one row with one column `json`.
+        let d = tmpdir("json-bom");
+        let p = d.join("rows.json");
+        std::fs::write(
+            &p,
+            b"\xEF\xBB\xBF[\r\n {\"a\": 1, \"b\": \"x\"},\r\n {\"a\": 2, \"b\": \"y\"}\r\n]\r\n",
+        )
+        .unwrap();
+        let e = Engine::open(p.to_str().unwrap(), &OpenOptions::default()).unwrap();
+        let schema = e.describe(&View::default()).unwrap();
+        let names: Vec<&str> = schema.columns.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["a", "b"]);
+        assert_eq!(e.count(&View::default()).unwrap(), 2);
+        assert_eq!(all_cells(&e)[1][1].as_deref(), Some("y"));
+
+        // A file of one object on each line with the same mark keeps its form.
+        let p = d.join("rows.ndjson");
+        std::fs::write(&p, b"\xEF\xBB\xBF{\"a\": 1}\n{\"a\": 2}\n").unwrap();
+        let e = Engine::open(p.to_str().unwrap(), &OpenOptions::default()).unwrap();
+        assert_eq!(e.count(&View::default()).unwrap(), 2);
+    }
+
+    #[test]
+    fn a_deep_file_in_a_glob_is_refused_and_does_not_stop_the_program() {
+        // The test of the depth looked at the first file of a set only. The
+        // reader examines each file of a set, so a deep second file filled the
+        // stack and stopped the whole program.
+        let d = tmpdir("json-deep-glob");
+        write_csv(&d, "a.json", "[{\"a\": 1}]");
+        let deep = format!("[{}1{}]", "{\"a\":".repeat(3000), "}".repeat(3000));
+        write_csv(&d, "b.json", &deep);
+        let pattern = format!("{}/*.json", db_path(&d));
+        let err = Engine::open(&pattern, &OpenOptions::default())
+            .map(|_| ())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("b.json"), "the message names the deep file: {err}");
+        assert!(err.contains("nests deeper"), "{err}");
+    }
+
+}

@@ -66,6 +66,13 @@ impl Color {
 /// optional.
 fn parse_hex(s: &str) -> Option<Color> {
     let s = s.trim().trim_start_matches('#');
+    // Each character must be a hexadecimal digit. Without this test,
+    // `u32::from_str_radix` would accept a leading sign, so `+ff800` would read
+    // as a color and a typo in a theme file would pass in silence instead of
+    // giving the message "not a hex colour".
+    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
     match s.len() {
         6 => u32::from_str_radix(s, 16).ok().map(rgb),
         3 => {
@@ -822,6 +829,11 @@ mod tests {
         assert_eq!(parse_hex("#f80"), Some(rgb(0xff8800)));
         assert_eq!(parse_hex("nope"), None);
         assert_eq!(parse_hex("#ff80"), None);
+        // A leading sign is not a hex colour. Without the digit test,
+        // `from_str_radix` would accept `+ff800` as a number.
+        assert_eq!(parse_hex("+ff800"), None);
+        assert_eq!(parse_hex("+f8"), None);
+        assert_eq!(parse_hex(""), None);
     }
 
     #[test]
