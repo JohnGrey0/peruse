@@ -371,10 +371,10 @@ mod tests {
 
     #[test]
     fn a_path_to_a_share_is_on_the_network() {
-        assert!(is_unc(r"\\porsche\apps\data.parquet"));
-        assert!(is_unc("//porsche/apps/data.parquet"));
-        assert!(is_unc(r"\\?\UNC\porsche\apps\data.parquet"));
-        assert!(is_unc(r"\\?\unc\porsche\apps"));
+        assert!(is_unc(r"\\server\share\data.parquet"));
+        assert!(is_unc("//server/share/data.parquet"));
+        assert!(is_unc(r"\\?\UNC\server\share\data.parquet"));
+        assert!(is_unc(r"\\?\unc\server\share"));
         // A local disk in the long form, and a device, are not shares.
         assert!(!is_unc(r"\\?\C:\data\x.parquet"));
         assert!(!is_unc(r"\\.\PhysicalDrive0"));

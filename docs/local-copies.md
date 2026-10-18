@@ -215,7 +215,7 @@ Peruse can also make a file fast with a table in memory, and it does that for a
 file of text already. See [engine.md](engine.md#the-index-of-a-file-of-text).
 The measurements below decided the design.
 
-**How the numbers were measured.** The share is `\\porsche\apps`, on a
+**How the numbers were measured.** The share is `\\server\share`, on a
 network of 10 gigabits, with a round trip of less than 1 millisecond. The
 example `netcache-bench` made the files. Before each run, a copy on the server
 side made a new file that this machine did not hold in its memory. The bytes

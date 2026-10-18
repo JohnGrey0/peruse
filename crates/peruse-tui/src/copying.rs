@@ -395,7 +395,7 @@ mod tests {
 
     fn view(done: u64, secs: u64) -> CopyView {
         CopyView {
-            origin: r"\\porsche\apps\data\sales.parquet".into(),
+            origin: r"\\server\share\data\sales.parquet".into(),
             dir: r"C:\Users\me\AppData\Local\peruse\cache\copies\0123\data".into(),
             files: 1,
             progress: Progress {
@@ -413,7 +413,7 @@ mod tests {
         let s = screen(&view(250 << 20, 5));
         assert!(s.contains("sales.parquet"), "{s}");
         assert!(
-            s.contains(r"from  \\porsche\apps\data\sales.parquet"),
+            s.contains(r"from  \\server\share\data\sales.parquet"),
             "{s}"
         );
         assert!(s.contains(" 25%"), "{s}");
