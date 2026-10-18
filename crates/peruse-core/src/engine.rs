@@ -472,13 +472,17 @@ impl Engine {
     /// therefore gives an error here, and not at the first page request.
     pub fn open(input: &str, opts: &OpenOptions) -> Result<Engine> {
         let conn = Connection::open_in_memory().context("starting DuckDB")?;
-        configure(&conn, opts)?;
+        let tmp = configure(&conn, opts)?;
 
         let files = resolve_files(&conn, input)?;
         if files.is_empty() {
             bail!("no files matched {input:?}");
         }
         let (format, ext_delim, compressed) = source::detect(&files[0]);
+        // From here, the connection can reach these files and its own
+        // temporary directory, and nothing else. The function `glob()` stops
+        // when the lock is on, so the lock comes after `resolve_files`.
+        lock_down(&conn, &files, format == Format::DuckDb, &tmp)?;
         let bytes = files
             .iter()
             .filter_map(|f| std::fs::metadata(f).ok())
@@ -844,6 +848,10 @@ impl Engine {
 
     /// Reads the name and the type of each column from the database.
     fn read_schema(&self, view: &View) -> Result<Schema> {
+        self.read_schema_inner(view).map_err(explain_lock)
+    }
+
+    fn read_schema_inner(&self, view: &View) -> Result<Schema> {
         let sql = view.describe_sql();
         let mut stmt = self.conn.prepare(&sql)?;
         let mut rows = stmt.query([])?;
@@ -1708,7 +1716,10 @@ impl Engine {
 }
 
 /// Applies the options to the connection before the engine reads any data.
-fn configure(conn: &Connection, opts: &OpenOptions) -> Result<()> {
+///
+/// The function gives the temporary directory that it chose, because
+/// [`lock_down`] must let DuckDB write there and nowhere else.
+fn configure(conn: &Connection, opts: &OpenOptions) -> Result<PathBuf> {
     let threads = opts.threads.unwrap_or_else(|| {
         std::thread::available_parallelism()
             .map(|n| n.get())
@@ -1752,7 +1763,104 @@ fn configure(conn: &Connection, opts: &OpenOptions) -> Result<()> {
     // Peruse builds against. A build without it must still open a file, so a
     // failure here is not an error.
     let _ = conn.execute_batch("SET parquet_metadata_cache = true;");
-    Ok(())
+    Ok(tmp)
+}
+
+/// The settings that the settings page of Peruse changes while the engine runs.
+///
+/// After [`lock_down`], DuckDB refuses a change to each other setting. Refer to
+/// [`Engine::apply_settings`].
+const ALLOWED_CONFIGS: &str = "['threads', 'memory_limit']";
+
+/// Gives the files that DuckDB can read for a source: each file, and the
+/// write-ahead log of a database.
+///
+/// DuckDB looks for the log of a database when it attaches the database, also
+/// when the log does not exist, so the path must be in the list in both cases.
+/// The attach is read-only, so DuckDB reads the log and never makes it.
+fn allowed_files(files: &[PathBuf], database: bool) -> Vec<PathBuf> {
+    let mut out = Vec::with_capacity(files.len() * 2);
+    for f in files {
+        out.push(f.clone());
+        if database {
+            out.push(PathBuf::from(format!("{}.wal", f.to_string_lossy())));
+        }
+    }
+    out
+}
+
+/// Locks the connection, so that it can read the source files and nothing else.
+///
+/// This is the layer of the read-only promise that does not depend on the words
+/// of a statement. Refer to `docs/read-only-guard.md`. The function sets, in
+/// this order:
+///
+/// 1. `allowed_paths`: the source files, and the log of a database.
+/// 2. `allowed_directories`: the temporary directory of this engine, where
+///    DuckDB puts the rows of a large sort.
+/// 3. `allowed_configs`: the two settings of the settings page.
+/// 4. `enable_external_access = false`. DuckDB then refuses each file outside
+///    the two lists above, for a read and for a write. It also refuses each
+///    function that writes a file of its own, such as a log or a profile, and
+///    each `ATTACH` of a second database.
+/// 5. `lock_configuration = true`. No statement can then change a setting
+///    that is not in the list of step 3, so no statement can undo steps 1 to 4.
+///
+/// The function `glob()` stops after this lock, so the caller must find the
+/// files first.
+fn lock_down(conn: &Connection, files: &[PathBuf], database: bool, tmp: &Path) -> Result<()> {
+    let paths: Vec<String> = allowed_files(files, database)
+        .iter()
+        .map(|f| quote_str(&db_path(f)))
+        .collect();
+    let mut dir = db_path(tmp);
+    if !dir.ends_with('/') {
+        dir.push('/');
+    }
+    let sql = format!(
+        "SET allowed_paths = [{}];\n\
+         SET allowed_directories = [{}];\n\
+         SET allowed_configs = {ALLOWED_CONFIGS};\n\
+         SET enable_external_access = false;\n\
+         SET lock_configuration = true;\n",
+        paths.join(", "),
+        quote_str(&dir)
+    );
+    conn.execute_batch(&sql)
+        .context("locking DuckDB to the files that Peruse reads")
+}
+
+/// Gives `true` when a message from DuckDB says that the lock of [`lock_down`]
+/// refused a file or a setting.
+fn refused_by_the_lock(message: &str) -> bool {
+    let m = message.to_ascii_lowercase();
+    m.contains("disabled by configuration")
+        || m.contains("enable_external_access")
+        || m.contains("cannot access file")
+        || m.contains("cannot access directory")
+        || m.contains("configuration has been locked")
+        || m.contains("lock_configuration")
+}
+
+/// Turns a refusal of the lock into a message that says what Peruse allows.
+///
+/// A statement in the SQL prompt or in `--query` can read the source, and the
+/// tables of an open database. It cannot read another file, because Peruse
+/// locks DuckDB to the files that the user opened. The words of DuckDB alone
+/// name a setting that the user never wrote.
+fn explain_lock(e: anyhow::Error) -> anyhow::Error {
+    let text = format!("{e:#}");
+    if !refused_by_the_lock(&text) {
+        return e;
+    }
+    anyhow::anyhow!(
+        "Peruse reads only the file that you opened, as the view `src`. \
+         A query cannot read, write or attach any other file, and it cannot \
+         change a setting of DuckDB. To read a second file, open it with \
+         Peruse, or name it in the glob that you open.\n\
+         DuckDB said: {}",
+        first_lines(&text, 2)
+    )
 }
 
 /// Gives a temporary directory that belongs to one engine only.
@@ -1871,7 +1979,8 @@ fn resolve_files(conn: &Connection, input: &str) -> Result<Vec<PathBuf>> {
 /// stop.
 pub fn database_tables(path: &Path, opts: &OpenOptions) -> Result<Vec<DbTable>> {
     let conn = Connection::open_in_memory().context("starting DuckDB")?;
-    configure(&conn, opts)?;
+    let tmp = configure(&conn, opts)?;
+    lock_down(&conn, &[path.to_path_buf()], true, &tmp)?;
     let label = path
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
@@ -2300,6 +2409,13 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    /// Gives the size and the time of the last change of a file, so a test can
+    /// assert that a sentinel did not change.
+    fn stat_file(p: &Path) -> (u64, std::time::SystemTime) {
+        let m = std::fs::metadata(p).unwrap();
+        (m.len(), m.modified().unwrap())
     }
 
     fn write_csv(dir: &Path, name: &str, body: &str) -> PathBuf {
@@ -3462,9 +3578,11 @@ mod tests {
             ..Default::default()
         };
         let err = e.describe(&view).unwrap_err().to_string();
+        // The lock of `lock_down` refuses the path before DuckDB looks for an
+        // extension. Either refusal keeps the engine off the network.
         assert!(
-            err.contains("Extension") || err.contains("extension"),
-            "expected a missing extension error, got: {err}"
+            err.contains("Extension") || err.contains("extension") || err.contains("reads only"),
+            "expected a refusal, got: {err}"
         );
         assert!(
             !err.contains("HTTP"),
@@ -3559,6 +3677,58 @@ mod tests {
         // The alias is in the text that the panel shows, so the user can read
         // it there.
         assert!(e.read_expr().contains("__peruse_db"), "{}", e.read_expr());
+    }
+
+    #[test]
+    fn the_lock_stops_a_write_to_a_file_outside_the_source() {
+        // Layer C, the backstop for gap 1. A statement that reaches the
+        // connection, past the guard, must still not write a file. This test
+        // goes around the guard and runs a `COPY ... TO` straight on the
+        // connection, in the same way as `the_read_only_flag_stops_a_write`.
+        // The lock must refuse the write, and the sentinel file beside the
+        // source must stay byte-for-byte the same, with the same time.
+        let d = tmpdir("lock-copy-out");
+        let p = write_csv(&d, "s.csv", SAMPLE);
+        let sentinel = d.join("sentinel.txt");
+        std::fs::write(&sentinel, "keep me").unwrap();
+        let before = stat_file(&sentinel);
+
+        let e = Engine::open(p.to_str().unwrap(), &OpenOptions::default()).unwrap();
+        for target in ["out.csv", "sentinel.txt"] {
+            let out = db_path(&d.join(target));
+            let err = e
+                .conn
+                .execute_batch(&format!("COPY (SELECT 1 AS a) TO '{out}' (FORMAT CSV)"))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.to_lowercase().contains("disabled by configuration")
+                    || err.to_lowercase().contains("cannot access"),
+                "COPY to {target} gave {err}"
+            );
+        }
+        assert!(!d.join("out.csv").exists(), "the engine wrote out.csv");
+        // The sentinel is byte-for-byte the same, with the same time.
+        assert_eq!(stat_file(&sentinel), before, "the sentinel changed");
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"keep me");
+    }
+
+    #[test]
+    fn a_query_that_reads_a_file_the_user_did_not_open_gets_a_clear_message() {
+        // Layer C changes what `-q` can do: a query can no longer read a file
+        // that the user did not open. The owner accepted that, so the message
+        // must say what Peruse allows and how to read the second file.
+        let d = tmpdir("q-other-file");
+        let p = write_csv(&d, "a.csv", SAMPLE);
+        let other = db_path(&write_csv(&d, "b.csv", SAMPLE));
+        let e = Engine::open(p.to_str().unwrap(), &OpenOptions::default()).unwrap();
+        let view = View {
+            base: crate::query::Base::Sql(format!("SELECT * FROM read_csv('{other}')")),
+            ..Default::default()
+        };
+        let err = e.describe(&view).unwrap_err().to_string();
+        assert!(err.contains("reads only"), "{err}");
+        assert!(err.contains("open it with"), "{err}");
     }
 
     #[test]
