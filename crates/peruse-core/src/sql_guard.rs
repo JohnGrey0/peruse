@@ -1,20 +1,22 @@
 //! Makes sure that SQL from the user can read but cannot write.
 //!
-//! Peruse gives the user a promise: it does not change the data. Two layers
-//! keep that promise, and each layer works alone:
+//! Peruse gives the user a promise: it does not change the data. Five layers
+//! keep that promise, and each layer works alone. This module is Layer A, the
+//! guard on the words of a statement from the user. The other layers are in
+//! `engine.rs` and `cache.rs`. Refer to `docs/read-only-guard.md`.
 //!
-//! 1. The structure of the connection. The database is always in memory. The
-//!    engine reads the user's files only through the table functions
-//!    `read_parquet` and `read_csv`. These two functions can read but cannot
-//!    write, and DuckDB never opens the files for write access.
-//! 2. The words of the statement. This module does that work. It rejects each
-//!    statement that is not a plain query. The statements that can still write
-//!    to the disk are `COPY ... TO`, `EXPORT DATABASE`, `ATTACH` and `INSTALL`.
-//!    None of them reaches the engine.
+//! The guard rejects each statement that is not a plain query. It rejects the
+//! statements that write, such as `COPY ... TO`, `EXPORT DATABASE`, `ATTACH`
+//! and `INSTALL`, and it rejects a call to a function that writes a file,
+//! changes the state, or runs SQL from a text value, such as `enable_logging`,
+//! `enable_profiling` or `query`.
 //!
 //! This module removes the comments, the values in quotation marks and the
 //! identifiers in quotation marks before it looks for a keyword. A column with
-//! the true name `"update"`, or a value `'drop table'`, is therefore safe.
+//! the true name `"update"`, or a value `'drop table'`, is therefore safe. The
+//! clean-up agrees with the scanner of DuckDB for an escape string `E'...'` and
+//! for a dollar value `$tag$ ... $tag$`, so a statement break cannot hide from
+//! the guard.
 
 use std::fmt;
 

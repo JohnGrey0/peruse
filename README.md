@@ -1197,51 +1197,73 @@ peruse data.parquet --theme ~/.config/peruse/themes/midnight.toml
 
 ## Peruse only reads
 
-Peruse gives you one promise: it does not change your data. Two layers keep
-that promise.
+Peruse gives you one promise: it does not change your data. Five layers keep
+that promise. Each layer stops a write on its own, and the layers do not
+depend on each other.
 
-**The structure of the connection.** The database is always in memory. Peruse
-reaches your data files only through the table functions `read_parquet`,
-`read_csv`, `read_json` and `read_json_auto`. These functions read, and they
-cannot write.
-Peruse never opens a data file for write access, and it never installs or loads
-an extension, so it cannot reach the network. A file on a network drive gets a
-[local copy](#files-on-a-network-drive): Peruse opens the source for reading
-only, and it writes the copy into its own cache directory.
+**The lock on the connection.** After Peruse finds the files that you open, it
+locks DuckDB to those files. The lock allows a read of the files that you
+opened and of the engine's own temporary directory, and nothing else. It then
+sets `enable_external_access = false` and `lock_configuration = true`. DuckDB
+then refuses each read and each write of any other file, each new attached
+database, and each function that writes a file of its own. No statement can
+change this, because the configuration is locked.
 
-A DuckDB database is the one file that DuckDB itself opens, and Peruse attaches
-it with `ATTACH … (READ_ONLY)`. The promise is stronger there than anywhere
-else: the storage engine refuses the write, so the promise does not rest on the
-words of a statement at all. A test writes through the connection, past the
-guard, and the database refuses it.
+**The guard on the words of the statement.** A statement from you must be one
+statement. It must start with a word that only reads, and it must hold no word
+that writes, at any position. This stops `WITH … INSERT`, `EXPLAIN COPY …`,
+`COPY … TO`, `ATTACH`, `EXPORT DATABASE` and `INSTALL`. The guard also refuses
+a call to a function that writes a file, changes the state, or runs SQL from a
+text value, such as `enable_logging(…)`, `enable_profiling(…)` or `query(…)`.
+It matches a function name only when a `(` follows it, so a column named
+`query` still works. Peruse removes the comments, the values in quotation marks
+and the identifiers in quotation marks before it looks, so a column with the
+real name `"update"`, or a value `'drop table'`, still works. A test reads the
+catalogue of DuckDB and fails when a new version adds a function that writes
+and this list does not classify it.
 
-**The words of the statement.** A statement from you must be one statement. It
-must start with a word that only reads, and it must hold no word that writes,
-at any position. This second rule is what stops `WITH … INSERT`,
-`EXPLAIN COPY …`, `COPY … TO`, `ATTACH`, `EXPORT DATABASE` and `INSTALL`.
-Peruse removes the comments, the values in quotation marks and the identifiers
-in quotation marks before it looks for a word, so a column with the real name
-`"update"`, or a value `'drop table'`, still works.
+**The check on a stored view or macro.** A DuckDB database file can hold a view
+or a macro whose SQL writes a file. Before Peruse reads any view or macro of a
+database, it runs the stored SQL through the guard. A database with a view or a
+macro that writes does not open, and the message names the object.
+
+**The read-only handle (Windows).** While Peruse shows a file from a local
+disk, it holds the file open with a share mode that lets another program read
+the file but not write it and not delete it. Your data cannot change while you
+look at it. Peruse never takes this handle on a file on a network drive, so a
+coworker can still write that file. The handle releases when you close the file
+or quit. Linux and macOS have no equivalent share mode, so this layer is empty
+there, and the promise rests on the other four layers.
+
+**The guard on the writes of Peruse.** Peruse writes only its settings file,
+its themes directory, its cache of local copies, and its own temporary
+directory. The function that removes an old local copy deletes a directory tree,
+so it deletes a directory only when the directory holds a marker file that
+Peruse wrote, is a true directory and not a link, and sits inside the cache. It
+never follows a link or a junction out of the cache.
+
+A DuckDB database is a file that DuckDB itself opens, and Peruse attaches it
+with `ATTACH … (READ_ONLY)`. The storage engine then refuses each write to the
+file, so the promise there does not rest on the words of a statement. A test
+writes through the connection, past the guard, and the database refuses it.
 
 A `WHERE` expression gets one more test: its parentheses must balance. Without
 that test, an expression could close the condition that Peruse builds and
-change the rest of the statement.
+change the rest of the statement. The filter builder writes its own SQL, with a
+quoting function for each name and each value, so a value that you type cannot
+change the shape of the statement.
 
 ```
 $ peruse data.parquet -q "COPY src TO 'out.csv'"
 Error: --query: `COPY` is not a query — Peruse is read-only, start with SELECT / WITH / FROM / DESCRIBE / SUMMARIZE
 ```
 
-The filter builder writes its own SQL. Each column name and each value goes
-through a quoting function, and the parentheses always balance, so a value that
-you type cannot change the shape of the statement. A test feeds injection
-strings through every operator and every type to prove it.
-
-**One thing to know.** The promise is about writing. A statement that you type
-yourself can still *read* another file on your machine, for example with
-`read_csv('/etc/passwd')` inside a subquery. Peruse runs your SQL with your own
-permissions. That matters only if you paste a statement that somebody else
-wrote.
+**One thing to know.** The lock keeps a statement to the files that you opened.
+A statement from `-q` can therefore no longer read a file that you did not
+open, such as `read_csv('/etc/passwd')`. This is a change from earlier
+versions. To read a second file, open it with Peruse, or name it in the glob
+that you open. Peruse runs your SQL with your own permissions, but only on the
+files that you chose.
 
 ---
 
