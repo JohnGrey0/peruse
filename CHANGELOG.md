@@ -6,7 +6,42 @@ settings. Each such change is in this file.
 
 ## 0.3.0
 
-<!-- readonly section goes here -->
+### Peruse only reads
+
+Peruse promises that it never changes a file that it reads. Version 0.3.0
+holds that promise in five layers, so a fault in one layer does not break it.
+A test proves each layer alone.
+
+- **The connection.** After Peruse finds the files, it locks DuckDB to those
+  files, the write-ahead log of a database, and its own temporary directory.
+  DuckDB then refuses each other file, and each change of a setting other than
+  `threads` and `memory_limit`.
+- **The guard.** The guard now rejects each function that writes a file,
+  changes stored state or runs SQL from a text value: for example
+  `enable_logging`, `enable_profiling`, `write_log`, `query` and
+  `json_execute_serialized_sql`. A column with one of those names still works.
+  A test reads the catalog of DuckDB and fails when a new version adds a
+  function that the guard does not classify.
+- **Views and macros in a database.** Peruse checks the SQL of each view and
+  each macro of a `.duckdb` file with the guard before it reads the database.
+  A view that can write stops the open, and the message names the view. Before
+  this change, a database with one view could write a file when it opened.
+- **A lock on Windows.** On a local disk, Peruse holds each source file open
+  for the session with a share mode that lets another program read the file but
+  not write it or delete it. Peruse never takes this lock on a network drive, so
+  a program of a coworker can still write the file there. Linux and macOS have
+  no equivalent of this share mode.
+- **The writes of Peruse itself.** The local copies are removed only when the
+  directory holds the mark that Peruse wrote, and the removal never follows a
+  link.
+- The guard now reads two forms of text as DuckDB reads them: a backslash in
+  an `E'...'` text, and the `$` of a quoted text such as `$tag$...$tag$`.
+  Before this change, either form could hide a second statement from the guard.
+
+**Changed:** a query in the SQL prompt or in `--query` can read only the files
+that you opened, as the view `src`, and the tables of an open database. It can
+no longer read another file. The message tells you to open the second file
+with Peruse, or to name it in the glob that you open.
 
 ### New
 
