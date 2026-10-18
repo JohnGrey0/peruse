@@ -66,7 +66,20 @@ function Get-Checksum {
     else {
         $url = "$base/$Name.sha256"
         try {
-            $body = (Invoke-WebRequest -Uri $url -UseBasicParsing).Content
+            # GitHub serves a release asset as `application/octet-stream`, so
+            # `Invoke-WebRequest` gives the body as an array of bytes and not as
+            # text. A split of that array finds no line and no word, and the
+            # checksum that reached the manifests was not a checksum. The bytes
+            # therefore become text here. A byte order mark would make the first
+            # word 65 characters long, so it goes as well.
+            $res = Invoke-WebRequest -Uri $url -UseBasicParsing
+            $body = if ($res.Content -is [byte[]]) {
+                [System.Text.Encoding]::UTF8.GetString($res.Content)
+            }
+            else {
+                [string] $res.Content
+            }
+            $body = $body.TrimStart([char] 0xFEFF)
         }
         catch {
             Write-Host ''

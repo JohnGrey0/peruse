@@ -512,6 +512,28 @@ function Test-ReleaseFile {
     }
 }
 
+# Reads a small text file from a URL and gives it as text.
+#
+# GitHub serves a release asset as `application/octet-stream`. `Invoke-WebRequest`
+# then gives the body as an array of bytes and not as text, and a split of that
+# array finds no line and no word. Every check on the text below therefore
+# failed, and the message said that a good checksum file was not one.
+#
+# The function turns the bytes into text itself. It also drops a byte order mark:
+# a mark at the start would make the first word of the file 65 characters long.
+function Get-UrlText {
+    param([string] $Url)
+
+    $res = Invoke-WebRequest -Uri $Url -UseBasicParsing -TimeoutSec 60
+    $text = if ($res.Content -is [byte[]]) {
+        [System.Text.Encoding]::UTF8.GetString($res.Content)
+    }
+    else {
+        [string] $res.Content
+    }
+    return $text.TrimStart([char] 0xFEFF)
+}
+
 # Reads one .sha256 file from the release and checks what it holds.
 #
 # A file of the right name can still hold the wrong thing: an upload that
@@ -529,7 +551,7 @@ function Test-ReleaseChecksum {
 
     $url = "https://github.com/$repoName/releases/download/v$Ver/$Archive.sha256"
     try {
-        $body = (Invoke-WebRequest -Uri $url -UseBasicParsing -TimeoutSec 60).Content
+        $body = Get-UrlText $url
     }
     catch {
         return "could not read $Archive.sha256"
